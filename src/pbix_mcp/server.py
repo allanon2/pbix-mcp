@@ -3627,8 +3627,31 @@ def pbix_format_visual(
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
 
+        # Name the BUCKET each card landed in. Power BI splits visual
+        # formatting across two: container-level cards (title, background,
+        # border, padding, visualHeader) live in `vcObjects`, data-level ones
+        # (labels, categoryLabels, dataColors, axes) in `objects`. Measured
+        # across 167 corpus reports: title 876/0 and background 935/1 in
+        # favour of vcObjects, labels 0/167 and categoryLabels 0/176 the
+        # other way — so the split is Desktop's, not ours.
+        #
+        # The old message named the cards without saying where, and a caller
+        # verifying against `singleVisual.objects` alone saw an empty dict
+        # and reasonably concluded the write had been dropped (issue #66).
+        # Saying which bucket makes the claim checkable.
+        _obj = [c for c in new_objects]
+        _vc = [c for c in new_vc_objects]
+        _where = []
+        if _obj:
+            _where.append(f"objects: {', '.join(_obj)}")
+        if _vc:
+            _where.append(f"vcObjects: {', '.join(_vc)}")
         return ToolResponse.ok(
-            f"Formatted visual {visual_index} on page {page_index}: {', '.join(applied)}"
+            f"Formatted visual {visual_index} on page {page_index}: "
+            f"{', '.join(applied)} ({'; '.join(_where)})",
+            data={"visual_index": visual_index, "page_index": page_index,
+                  "applied": list(applied),
+                  "objects": _obj, "vcObjects": _vc},
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()

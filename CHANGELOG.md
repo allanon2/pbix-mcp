@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.104] - 2026-08-23
+
+### Changed — `pbix_format_visual` says which bucket each card was written to (issue #66)
+
+- The reported symptom was that `title` / `background` / `border` / `padding`
+  "never reach the saved file". **They do** — they reach
+  `singleVisual.vcObjects`, which is where Power BI keeps container-level
+  formatting. Verifying against `singleVisual.objects` alone shows an empty
+  dict and reads as a silent drop.
+- The split is Desktop's, not this engine's. Censused across 167 corpus
+  reports:
+
+  | card | `objects` | `vcObjects` |
+  |---|---|---|
+  | title | 0 | 876 |
+  | background | 1 | 935 |
+  | border | 0 | 265 |
+  | padding | 83 | 276 |
+  | labels | 167 | 0 |
+  | categoryLabels | 176 | 0 |
+  | visualHeader | 0 | 350 |
+
+- **The real defect was that the success claim could not be checked.** The
+  message named the cards without saying where they went, so a caller had no
+  way to confirm it short of knowing the bucket split in advance. The
+  response now reports both:
+
+      Formatted visual 0 on page 0: title, background, border, padding
+      (vcObjects: title, background, border, padding)
+
+  and `data` carries `{"applied": [...], "objects": [...], "vcObjects": [...]}`
+  so the claim is verifiable programmatically.
+- No change to placement, which was already correct, and none to which cards
+  are written — this only makes the existing behaviour legible.
+- Pinned by `tests/test_issue66_format_visual_reports_bucket.py` (7 tests).
+  Four assert every reported card really is written across both buckets and
+  **pass on 0.9.103**, which is the evidence the reported drop does not
+  exist; three assert the response names the bucket and fail on 0.9.103.
+
 ## [0.9.103] - 2026-08-22
 
 ### Fixed — `title.alignment` is written lowercase (issue #65)
