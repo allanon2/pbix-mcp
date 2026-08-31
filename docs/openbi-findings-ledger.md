@@ -5,15 +5,47 @@ Every engine issue OpenBI has reported lives in that project's
 of them, so an item cannot quietly sit unimplemented -- which is exactly what
 happened to findings #18 (fixed in 0.9.59, after being live for four releases).
 
-**Audited 2026-07-30 against 0.9.59.** 132 actionable items across docs 1-19:
-**85 implemented**, 27 not actionable (pure
-confirmation, nothing to do), **17 still open**. A second,
-adversarial pass refuted 3 of the 20 items the first pass
-flagged, so the open list is verified rather than merely suspected. Docs #18/#19
-were audited unlabelled as a control and correctly came back closed.
+**Audited 2026-09-01 against 0.9.104. Docs 1-43 and GitHub #1-#66 are all
+closed — both queues are empty.** Docs 20-43 were worked through GitHub issues
+(#23-#66) across 0.9.73-0.9.104; docs 28/29/30/39/41/42/43 carry OpenBI's own
+CLOSED banners, and the rest map to issues that are closed.
+
+That paperwork was not taken on trust. A re-verification sweep ran the reported
+repro for every silently-wrong-output and typing item in docs 25-43 against the
+live 0.9.104 engine: **18 of 19 checks reproduced the fixed behaviour** —
+KEEPFILTERS intersects (BLANK under a disjoint outer filter, not the 20 an
+override gives), `CALCULATE(T[Col]=v)` sugar, bare `REMOVEFILTERS()` and
+`ALLEXCEPT`, count aggregations typed Int64 (DIVIDE still Double),
+case-colliding column names refused, Int64 past signed-32 round-tripping,
+a data column named RowNumber surviving, trailing-backslash literals,
+`title.alignment` written lowercase, and a visual background image refused by
+name with its colour control still working. The 19th was the sweep's own wrong
+expectation, not an engine defect — see below.
 
 Re-run the audit before claiming the queue is clear. `gh issue list` covers only
 the GitHub tracker; these docs are a separate stream.
+
+## Audit note: the #43 case-fold is correct, and now visible
+
+The sweep flagged that `'abc'`/`'ABC'`/`'Abc'` all read back as `'abc'` with
+`DISTINCTCOUNT` = 1. That is **not** a regression: VertiPaq's string store is
+case-insensitive, and folding onto one dictionary entry keeping the first
+spelling seen is exactly what issues-32/#43 asked for and what Power BI itself
+does on import — without it Desktop refuses the whole model ("A duplicate value
+has been detected in the Unique Value store"). The fold stays.
+
+What was missing is that the fold **rewrites the caller's supplied values in
+silence**. The pre-build checks already treat the same collision one level up
+(case-colliding column NAMES, #53) as CRITICAL, and the project's warning
+channel exists precisely so a lossy transformation is never reported as an
+unqualified success. So the build now emits, for each affected column, a
+`PBIX pre-build: WARNING:` naming the column, how many values collided, and an
+example pair, and stating that they store as one value using the first spelling.
+Behaviour is unchanged; only the silence is. Regression:
+`tests/test_case_fold_warning.py` (incl. a negative control and a
+non-string-column control). The `pbix_doctor` DBCC-style validator that the same
+report asked for is present (`check_string_dictionaries`,
+`check_name_collisions`, `check_dictionary_widths`).
 
 ## Open: silently wrong output
 

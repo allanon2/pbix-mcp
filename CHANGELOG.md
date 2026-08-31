@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.105] - 2026-09-01
+
+### Changed — the #43 case-fold is no longer silent
+
+VertiPaq's string store is case-insensitive, so the encoder folds values that
+differ only by case onto one dictionary entry, keeping the first spelling seen
+(issue #43 — without the fold Desktop refuses the whole model: *"A duplicate
+value has been detected in the Unique Value store"*). That fold is correct and
+matches Power BI's own import behaviour, and it is unchanged here.
+
+What changed is that it **rewrites caller-supplied values in silence**: three
+rows of `'abc'` / `'ABC'` / `'Abc'` all read back as `'abc'`, and
+`DISTINCTCOUNT` reports 1. The pre-build checks already treat the same collision
+one level up (case-colliding column *names*, #53) as CRITICAL, and this
+project's warning channel exists so a lossy transformation is never reported as
+an unqualified success. The build now emits, per affected column:
+
+```
+PBIX pre-build: WARNING: Table 'Players' column 'Player Name' has 1 value(s)
+differing only by case ('VAN DER SAR' / 'van der SAR'). VertiPaq's string store
+is case-insensitive, so these are stored as ONE value using the first spelling
+seen (as Power BI does on import) — distinct counts and grouping will reflect
+the folded value.
+```
+
+Behaviour is otherwise unchanged. Regression:
+`tests/test_case_fold_warning.py` (4 cases, incl. a no-collision negative
+control and a non-string-column control).
+
+### Audit — findings docs 1-43 and GitHub #1-#66 re-verified, both queues empty
+
+`docs/openbi-findings-ledger.md` was stale (last audited 2026-07-30 against
+0.9.59) while docs 20-43 were worked through GitHub issues. Re-audited against
+0.9.104 by **execution**, not paperwork: the reported repro for every
+silently-wrong-output and typing item in docs 25-43 was replayed against the
+live engine — 18 of 19 checks reproduced the fixed behaviour (KEEPFILTERS
+intersecting, `CALCULATE(T[Col]=v)` sugar, bare `REMOVEFILTERS()`/`ALLEXCEPT`,
+Int64 typing of counts, case-colliding column names refused, Int64 past
+signed-32, a data column named `RowNumber` surviving, trailing-backslash
+literals, lowercase `title.alignment`, visual background image refused by name).
+The 19th was the sweep's own wrong expectation about the #43 fold, which is the
+change above. Ledger updated with the evidence.
+
 ## [0.9.104] - 2026-08-23
 
 ### Changed — `pbix_format_visual` says which bucket each card was written to (issue #66)

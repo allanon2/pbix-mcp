@@ -1289,6 +1289,48 @@ class PBIXBuilder:
                         f"one of them."
                     )
 
+            # Values that collide CASE-INSENSITIVELY in one column (issue #43).
+            # VertiPaq's string store is case-insensitive, so the encoder MUST
+            # fold them onto one dictionary entry keeping the first spelling
+            # seen (without the fold Desktop refuses the whole model: "A
+            # duplicate value has been detected in the Unique Value store").
+            # The fold is correct and matches Desktop's own import — but it
+            # REWRITES the caller's data: 'VAN DER SAR' / 'van der SAR' both
+            # store as the first spelling, and DISTINCTCOUNT drops accordingly.
+            # Silently altering supplied values is the one thing this project
+            # does not do, so say so here rather than let the caller discover it
+            # in a readback.
+            for c in t["columns"]:
+                if str(c.get("data_type", "String")) != "String":
+                    continue
+                cname = c["name"]
+                first_by_key: dict[str, str] = {}
+                collisions: dict[str, set] = {}
+                for row in t.get("rows", []):
+                    v = row.get(cname)
+                    if not isinstance(v, str):
+                        continue
+                    key = v.casefold()
+                    prev = first_by_key.get(key)
+                    if prev is None:
+                        first_by_key[key] = v
+                    elif prev != v:
+                        collisions.setdefault(key, {prev}).add(v)
+                if collisions:
+                    examples = "; ".join(
+                        " / ".join(repr(s) for s in sorted(v)[:3])
+                        for _k, v in list(collisions.items())[:3]
+                    )
+                    issues.append(
+                        f"WARNING: Table '{t['name']}' column '{cname}' has "
+                        f"{len(collisions)} value(s) differing only by case "
+                        f"({examples}). VertiPaq's string store is "
+                        f"case-insensitive, so these are stored as ONE value "
+                        f"using the first spelling seen (as Power BI does on "
+                        f"import) — distinct counts and grouping will reflect "
+                        f"the folded value."
+                    )
+
             # Check row data matches column definitions
             col_names = {c["name"] for c in t["columns"]}
             for i, row in enumerate(t.get("rows", [])):
