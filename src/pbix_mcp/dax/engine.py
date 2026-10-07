@@ -2666,12 +2666,17 @@ class DAXEngine:
             # predicate). Dicts are unhashable, so serialize them
             # deterministically instead of letting the cache key blow up —
             # an exception here used to surface as a null measure result.
+            # A tagged value (GroupByValues & co.) answers ISINSCOPE differently
+            # from a plain list with the same members, so the tag is part of
+            # the key -- without it, a measure cached under a plain filter was
+            # returned for the grouped row with the same value.
             def _fc_part(v):
+                tag = type(v).__name__ if type(v) not in (list, dict) else ''
                 if isinstance(v, list):
-                    return tuple(v)
+                    return (tag, tuple(v)) if tag else tuple(v)
                 if isinstance(v, dict):
-                    return ("__pred__", json.dumps(v, sort_keys=True,
-                                                   default=str))
+                    return ("__pred__" + tag, json.dumps(v, sort_keys=True,
+                                                         default=str))
                 return v
             fc_key = tuple(sorted(
                 (k, _fc_part(v)) for k, v in ctx.filter_context.items()
