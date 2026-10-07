@@ -26,6 +26,9 @@ TABLES = {"Date": {"columns": ["Date", "Year", "Month", "v"], "rows": ROWS}}
 
 def _ev(expr, filters):
     ctx = de.DAXContext(TABLES, {"M": expr}, None, None, filters, [])
+    # Marked as a date table, like Corporate Spend's 'Date' (see #78: only a
+    # marked table or a DateTime relationship column clears the other filters).
+    ctx.date_tables = {"Date": "Date"}
     return de.DAXEngine().evaluate_measure("M", ctx)
 
 

@@ -14433,7 +14433,8 @@ def pbix_evaluate_dax_grouped(
                     vals = dax_engine.evaluate_measures_batch(
                         slow, ctx['tables'], ctx['measure_defs'], fc,
                         ctx['date_table'], ctx['date_column'], rels,
-                        group_keys={ref}, selected_filters=base_fc)
+                        group_keys={ref}, selected_filters=base_fc,
+                        date_tables=ctx.get('date_tables'))
                 results.append({
                     "key": {dim_col: val},
                     "values": {m: (fast[m].get(val) if m in fast else
@@ -14447,7 +14448,8 @@ def pbix_evaluate_dax_grouped(
                 vals = dax_engine.evaluate_measures_batch(
                     measure_names, ctx['tables'], ctx['measure_defs'], fc,
                     ctx['date_table'], ctx['date_column'], rels,
-                    group_keys={k[0] for k in keys}, selected_filters=base_fc)
+                    group_keys={k[0] for k in keys}, selected_filters=base_fc,
+                    date_tables=ctx.get('date_tables'))
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},
                     "values": {m: vals.get(m) for m in measure_names},

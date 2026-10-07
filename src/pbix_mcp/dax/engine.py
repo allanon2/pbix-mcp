@@ -1389,6 +1389,25 @@ class RowContextValues(list):
     """
 
 
+class RowContextPredicate(dict):
+    """The RowContextValues tag for a predicate-form filter: KEEPFILTERS on an
+    iterated column INTERSECTS the row's filter, and the column stays in scope
+    for ISINSCOPE (issue #80). Desktop 2.152: SUMX(VALUES(S[Region]),
+    CALCULATE(IF(ISINSCOPE(S[Region]), 1, 0), KEEPFILTERS(S[Region] = "West")))
+    is 1 for every region, 4 at the total."""
+
+
+def _keep_scope_tag(outer, value):
+    """KEEPFILTERS intersects the outer filter; the intersection keeps the
+    outer filter's scope tag (grouping, or an iterated row), so ISINSCOPE
+    answers as Desktop does (issues #69, #80)."""
+    if isinstance(outer, (GroupByValues, GroupByPredicate)):
+        return GroupByPredicate(value)
+    if isinstance(outer, (RowContextValues, RowContextPredicate)):
+        return RowContextPredicate(value)
+    return value
+
+
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
 
@@ -2738,6 +2757,7 @@ class DAXEngine:
             self._query_filters = dict(ctx.filter_context)
             self._group_keys = set(getattr(ctx, 'group_keys', ()) or ())
             self._date_tables = dict(getattr(ctx, 'date_tables', None) or {})
+            self._clearing_cache: tuple | None = None
             self._selected_base = getattr(ctx, 'selected_filters', None)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
@@ -4421,8 +4441,11 @@ class DAXEngine:
                         col_name = first['__column__']
                         date_vals = [r['__value__'] for r in result]
                         new_filters = dict(new_ctx.filter_context)
-                        # Remove existing date table filters
-                        keys_to_remove = [k for k in new_filters if k.startswith(f"{tbl_name}.")]
+                        # Remove the date table's other filters -- only where
+                        # Power BI does (issue #78); elsewhere they intersect.
+                        keys_to_remove = ([k for k in new_filters if k.startswith(f"{tbl_name}.")]
+                                          if (tbl_name, col_name) in self._clearing_date_columns(ctx)
+                                          else [])
                         for k in keys_to_remove:
                             del new_filters[k]
                         new_filters[f"{tbl_name}.{col_name}"] = date_vals
@@ -4520,7 +4543,7 @@ class DAXEngine:
                             for key, vals in list(groups.items()):
                                 outer = ctx.filter_context.get(key)
                                 if outer is not None:
-                                    groups[key] = {"all": [outer, vals]}
+                                    groups[key] = _keep_scope_tag(outer, {"all": [outer, vals]})
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 
@@ -4539,12 +4562,11 @@ class DAXEngine:
                     # indistinguishable from not writing KEEPFILTERS at all).
                     outer = ctx.filter_context.get(key)
                     if outer is not None:
-                        value = {"all": [outer, value]}
-                        if isinstance(outer, (GroupByValues, GroupByPredicate)):
-                            # Intersecting keeps the grouping in scope: Desktop
-                            # answers CALCULATE(ISINSCOPE(c), KEEPFILTERS(c = v))
-                            # TRUE on every grouped row (replacing it: FALSE).
-                            value = GroupByPredicate(value)
+                        # Intersecting keeps the grouping -- or the iterated
+                        # row -- in scope: Desktop answers CALCULATE(ISINSCOPE(c),
+                        # KEEPFILTERS(c = v)) TRUE on every grouped row and every
+                        # transitioned row (replacing it: FALSE). #69, #80.
+                        value = _keep_scope_tag(outer, {"all": [outer, value]})
                 if key in applied_here:
                     value = {"all": [applied_here[key], value]}
                 applied_here[key] = value
@@ -4587,6 +4609,49 @@ class DAXEngine:
         b, a = before.filter_context, after.filter_context
         return {k for k, v in a.items() if k not in b or b[k] is not v}
 
+    def _clearing_date_columns(self, ctx: DAXContext) -> frozenset:
+        """The (table, column) pairs whose filter makes Power BI clear the rest
+        of that table's filters (issue #78).
+
+        Desktop adds ALL(<table>) to a date-column filter only when the column
+        is a MARKED date table's date column, or a DateTime column used in a
+        relationship. On any other table the dates INTERSECT with the table's
+        other filters (the classic "YTD equals the month until you mark the
+        date table"). Measured on Power BI Desktop 2.152 over ADOMD with a
+        marked daily table, a marked month-grain table, an unmarked copy, a
+        sparse unmarked table and a table related on its DateTime column:
+        applied at every place that clears date-table filters, all 4,896 cells
+        compared through pbix_evaluate_dax match Desktop.
+
+        Computed once per evaluation (relationships only change identity under
+        USERELATIONSHIP, which builds a new list).
+        """
+        rels = ctx.relationships or []
+        key = (id(ctx.tables), id(rels))
+        cache = getattr(self, '_clearing_cache', None)
+        if cache is not None and cache[0] == key:
+            cached: frozenset = cache[1]
+            return cached
+        out = {(t, c) for t, c in (getattr(self, '_date_tables', None) or {}).items() if c}
+        for rel in rels:
+            for t, c in ((rel.get('FromTable'), rel.get('FromColumn')),
+                         (rel.get('ToTable'), rel.get('ToColumn'))):
+                if (t, c) not in out and self._column_is_datetime(ctx, t, c):
+                    out.add((t, c))
+        result = frozenset(out)
+        self._clearing_cache = (key, result)
+        return result
+
+    @staticmethod
+    def _column_is_datetime(ctx: DAXContext, table, column) -> bool:
+        tbl = (ctx.tables or {}).get(table) or {}
+        cols = tbl.get('columns') or []
+        if column not in cols:
+            return False
+        i = cols.index(column)
+        v = next((r[i] for r in (tbl.get('rows') or []) if r[i] is not None), None)
+        return isinstance(v, (datetime, date))
+
     def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
                                         keep_keys: set | frozenset = frozenset()) -> DAXContext:
         """A filter on a MARKED date table's date column removes the table's
@@ -4607,16 +4672,15 @@ class DAXEngine:
         "Written here" is identity: with_filters copies the outer dict, so a
         filter this CALCULATE did not touch is the same object as outside.
         """
-        marked = getattr(self, '_date_tables', None)
-        if not marked:
+        clearing = self._clearing_date_columns(outer)
+        if not clearing:
             return new_ctx
         before, after = outer.filter_context, new_ctx.filter_context
         written = {k for k, v in after.items() if k not in before or before[k] is not v}
         drop = set()
         triggers = written - set(keep_keys)
-        for table, date_col in marked.items():
-            if not date_col:
-                continue
+        # Marked date columns and DateTime relationship columns alike (#78).
+        for table, date_col in sorted(clearing):
             key = f"{table}.{date_col}"
             value = after.get(key)
             if key not in triggers or (isinstance(value, dict) and 'all' in value):
@@ -5830,7 +5894,7 @@ class DAXEngine:
         if isinstance(value, (GroupByValues, GroupByPredicate)):
             return True
         outer = getattr(ctx, '_outer_ctx', None)
-        if isinstance(value, RowContextValues):
+        if isinstance(value, (RowContextValues, RowContextPredicate)):
             # The iteration's row: in scope once CALCULATE / a measure reference
             # made it a filter; before that, only what was in scope outside.
             return True if outer is None else self._in_scope(key, outer)
@@ -10690,6 +10754,11 @@ class DAXEngine:
         """
         if dates and isinstance(dates, list) and isinstance(dates[0], dict) and '__table__' in dates[0]:
             tbl_name, col_name = dates[0]['__table__'], dates[0]['__column__']
+            if (tbl_name, col_name) not in self._clearing_date_columns(ctx):
+                # Not a marked date column nor a DateTime relationship column:
+                # Power BI intersects the dates with the table's filters (#78).
+                return self._eval_expr(expr, ctx.with_filters(
+                    {f"{tbl_name}.{col_name}": [item['__value__'] for item in dates]}))
             new_filters = {k: v for k, v in ctx.filter_context.items()
                            if not k.startswith(f"{tbl_name}.")}
             new_filters[f"{tbl_name}.{col_name}"] = [item['__value__'] for item in dates]
@@ -11214,7 +11283,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             relationships: list | None = None,
                             group_keys: set | None = None,
                             selected_filters: dict | None = None,
-                            culture: str | None = None) -> dict:
+                            culture: str | None = None,
+                            date_tables: dict | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }.
 
     ``group_keys`` names the filter_context keys that came from GROUPED
@@ -11223,7 +11293,15 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     base filter_context BEFORE the group key was merged in) — together they
     are what ALLSELECTED restores (see DAXContext.group_keys).
     """
+    if group_keys:
+        # The grouping values carry the ISINSCOPE tag, as in
+        # evaluate_measures_smart's group_by (issue #79).
+        filter_context = {k: (_tag_group_by(v) if k in group_keys else v)
+                          for k, v in (filter_context or {}).items()}
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    # Marked date tables (issue #79): the grouped tool applies the same
+    # date-table rule as pbix_evaluate_dax.
+    ctx.date_tables = date_tables or {}
     if group_keys:
         ctx.group_keys = set(group_keys)
     if selected_filters is not None:

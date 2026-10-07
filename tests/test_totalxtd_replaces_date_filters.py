@@ -39,6 +39,10 @@ TABLES = {
 
 def _ev(expr, filters):
     ctx = de.DAXContext(TABLES, {"M": expr}, None, None, filters, [])
+    # Marked as a date table, like Corporate Spend's 'Date'. Power BI clears the
+    # date table's other filters only for a marked table or a DateTime
+    # relationship column; an unmarked, unrelated table intersects (#78).
+    ctx.date_tables = {"Date": "Date"}
     return de.DAXEngine().evaluate_measure("M", ctx)
 
 
@@ -69,4 +73,5 @@ def test_filters_on_other_tables_are_kept():
     tables = dict(TABLES, Other={"columns": ["k"], "rows": [[1]]})
     ctx = de.DAXContext(tables, {"M": "TOTALYTD(SUM('Date'[v]), 'Date'[Date])"}, None, None,
                         {**MARCH, "Other.k": [1]}, [])
+    ctx.date_tables = {"Date": "Date"}
     assert de.DAXEngine().evaluate_measure("M", ctx) == 15

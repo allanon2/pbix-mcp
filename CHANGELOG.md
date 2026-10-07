@@ -5,6 +5,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.112] - 2026-10-07
+
+### Fixed — a date filter clears the date table's other filters only where Power BI does (issue #78; PRs #68, #72 by @allanon2)
+
+- **The rule, measured in Power BI Desktop:** Desktop adds `ALL(<date table>)`
+  to a filter on a date column only when the column is a **marked date
+  table's date column**, or a **DateTime column used in a relationship —
+  active or inactive**. On any other table, the dates intersect with the
+  table's Year / Month / Day filters. That includes a date table related only
+  by an integer key, and it is the classic "YTD equals the month until you
+  mark the date table".
+- The engine had that rule in pieces, each half wrong:
+  - `CALCULATE` with a time-intelligence filter cleared always;
+  - `TOTALYTD/QTD/MTD`, `STARTOF*` / `ENDOF*` and the balances never cleared;
+  - the direct-filter rule from #73 covered marked tables only.
+
+  All of them now use one predicate.
+- **PRs #68 and #72 are merged** with the change requested in review applied
+  on top:
+  - `TOTALxTD` replaces the date table's filters (#68);
+  - `START/ENDOF*` return dates that exist in the column (#72);
+  - `CLOSINGBALANCE*` evaluates at `ENDOF*` (#72);
+  - `OPENINGBALANCE*` evaluates at the last existing date before the period
+    (#72).
+
+  Their tests now mark their date table, as Corporate Spend's is.
+- Verified cell by cell against Power BI Desktop (2.152, ADOMD) on a model
+  with marked daily and month-grain tables, an unmarked copy, a sparse
+  unmarked table, and date tables related by an active DateTime column, an
+  inactive DateTime column, and an integer key: **5,947 of 5,949 cells match
+  through `pbix_evaluate_dax` (2,224 fixed, 0 broken)**. The two remaining
+  cells are #81, a builder bug, not the engine.
+
+### Fixed — `pbix_evaluate_dax_grouped` applies the marked-date-table rule and ISINSCOPE (issue #79)
+
+- The grouped tool evaluates through `evaluate_measures_batch`. That path
+  received neither the model's date-table marking (#73) nor the grouping tag
+  ISINSCOPE reads (#69), so both answered as before there. Now it receives
+  both: **5,884 of 5,885 cells match Desktop through the grouped tool (2,904
+  fixed, 0 broken)**.
+
+### Fixed — KEEPFILTERS keeps the column in scope in every form (issue #80)
+
+- `KEEPFILTERS` intersects, and Power BI keeps the column in scope whether the
+  outer filter is the query's grouping or an iterated row after a context
+  transition, and for `KEEPFILTERS(FILTER(...))` as for a plain predicate.
+  The intersection is now tagged for both cases. Measured in Desktop:
+  `SUMX(VALUES(S[Region]), CALCULATE(IF(ISINSCOPE(S[Region]), 1, 0),
+  KEEPFILTERS(S[Region] = "West")))` is 1 per region, 4 at the total; it was 0.
+
+- Pinned by `tests/test_issue78_date_table_rule.py`,
+  `tests/test_issue79_grouped_tool.py` and
+  `tests/test_issue80_keepfilters_scope.py` (40 tests; 19 fail on 0.9.111).
+  The 21 that pass on 0.9.111 are the cells it already had right — mostly the
+  intersecting ones — which #68 / #72 alone would have broken; they pin that
+  half of the rule.
+
+### Known issue — tracked
+
+- **#81** — the builder joins a fact key that is missing from the dimension
+  to the dimension's first row instead of the blank member.
+
 ## [0.9.111] - 2026-10-07
 
 ### Fixed — `ISINSCOPE` through a context transition (PR #77, by @allanon2)
