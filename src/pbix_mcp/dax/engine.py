@@ -2712,6 +2712,7 @@ class DAXEngine:
             # ALL under a grouped query (issues #25 r23#2 / #26 r24).
             self._query_filters = dict(ctx.filter_context)
             self._group_keys = set(getattr(ctx, 'group_keys', ()) or ())
+            self._date_tables = dict(getattr(ctx, 'date_tables', None) or {})
             self._selected_base = getattr(ctx, 'selected_filters', None)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
@@ -4516,6 +4517,8 @@ class DAXEngine:
                     new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
                 continue
 
+        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx)
+
         # CALCULATE performs the row->filter context transition: inside its
         # expression the iteration row's filters are real filters, plain
         # aggregates must NOT step back to the pre-transition outer context, and
@@ -4531,6 +4534,38 @@ class DAXEngine:
         finally:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
+
+    def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext) -> DAXContext:
+        """A filter on a MARKED date table's date column removes the table's
+        other filters.
+
+        When a table is marked as a date table, Desktop adds ALL(table) to a
+        CALCULATE that filters its date column. Measured on Power BI Desktop
+        2.157 (Microsoft's MIT Corporate Spend sample, 'Date' marked): the
+        running total CALCULATE(SUM(..), FILTER(ALL('Date'[Date]), 'Date'[Date]
+        <= MAX('Date'[Date]))) under Year x Period is the cumulative value, not
+        the period's; CALCULATE(SUM(..), 'Date'[Date] <= DATE(2014, 6, 30)) under
+        Year is the same for every year. Filters this CALCULATE wrote itself are
+        kept; KEEPFILTERS intersections are left alone (not measured).
+
+        "Written here" is identity: with_filters copies the outer dict, so a
+        filter this CALCULATE did not touch is the same object as outside.
+        """
+        marked = getattr(self, '_date_tables', None)
+        if not marked:
+            return new_ctx
+        before, after = outer.filter_context, new_ctx.filter_context
+        written = {k for k, v in after.items() if k not in before or before[k] is not v}
+        drop = set()
+        for table, date_col in marked.items():
+            if not date_col:
+                continue
+            key = f"{table}.{date_col}"
+            value = after.get(key)
+            if key not in written or (isinstance(value, dict) and 'all' in value):
+                continue
+            drop |= {k for k in after if k.split('.', 1)[0] == table and k not in written}
+        return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
@@ -11341,7 +11376,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             model_columns: dict | None = None,
                             culture: str | None = None,
                             group_by: set | None = None,
-                            selected_filters: dict | None = None) -> dict:
+                            selected_filters: dict | None = None,
+                            date_tables: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     ``group_by`` names the filter_context keys that are the query's GROUPING
@@ -11352,6 +11388,9 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     grouping keys were merged in. It matters when a grouped column is also
     sliced -- ``IT Area IN {A, B}`` grouped by IT Area becomes ``IT Area = [A]``
     in filter_context, and ALLSELECTED must restore {A, B}, not drop the slicer.
+    ``date_tables`` maps each table MARKED as a date table to its date column
+    (ModelReader.date_tables): a CALCULATE filter on that column removes the
+    table's other filters, as Desktop does.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
     parameter table, this tries evaluating with each possible value to find
@@ -11374,6 +11413,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
         ctx.group_keys = set(group_by)
         ctx.selected_filters = (dict(selected_filters) if selected_filters is not None else
                                 {key: v for key, v in filter_context.items() if key not in group_by})
+    ctx.date_tables = date_tables or {}
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}

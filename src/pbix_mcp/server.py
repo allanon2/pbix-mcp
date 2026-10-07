@@ -13193,6 +13193,9 @@ def _get_dax_context(alias: str) -> dict:
         'model_columns': model.all_column_names,
         'date_table': date_table,
         'date_column': date_column,
+        # Tables MARKED as date tables ({table: date column}): a filter on that
+        # column inside CALCULATE removes the table's other filters.
+        'date_tables': model.date_tables,
         'relationships': relationships,
         'default_filters': default_filters,
         'work_dir': info["work_dir"],
@@ -13564,6 +13567,7 @@ def pbix_evaluate_dax(
             culture=ctx.get('culture'),
             group_by=group_keys or None,
             selected_filters=selected,
+            date_tables=ctx.get('date_tables'),
         )
 
         # Build structured response with DAXResult objects
