@@ -11440,6 +11440,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             model_columns: dict | None = None,
                             culture: str | None = None,
                             group_by: set | None = None,
+                            selected_filters: dict | None = None,
                             date_tables: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
@@ -11447,6 +11448,10 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     (one SUMMARIZECOLUMNS / visual row), as opposed to slicer filters: their
     values are tagged GroupByValues for ISINSCOPE, and they become the context's
     group_keys (with the rest as selected_filters) as in grouped evaluation.
+    ``selected_filters`` overrides that "rest": the query's own filters BEFORE the
+    grouping keys were merged in. It matters when a grouped column is also
+    sliced -- ``IT Area IN {A, B}`` grouped by IT Area becomes ``IT Area = [A]``
+    in filter_context, and ALLSELECTED must restore {A, B}, not drop the slicer.
 
     ``date_tables`` maps each table MARKED as a date table to its date column
     (ModelReader.date_tables): a CALCULATE filter on that column removes the
@@ -11472,7 +11477,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     ctx.date_tables = date_tables or {}
     if group_by:
         ctx.group_keys = set(group_by)
-        ctx.selected_filters = {key: v for key, v in filter_context.items() if key not in group_by}
+        ctx.selected_filters = (dict(selected_filters) if selected_filters is not None else
+                                {key: v for key, v in filter_context.items() if key not in group_by})
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
