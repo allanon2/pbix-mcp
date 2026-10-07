@@ -7,7 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.107] - 2026-10-07
 
-### Fixed — `outline` was written where Power BI never reads it
+### Fixed — `outline` was written where Power BI never reads it (issue #74)
+
+Flagged while closing #67; tracked and documented in #74.
 
 - **On the seven visuals that have an outline card, the stroke never
   applied.** The mapper wrote one selector-less entry: `outline.color` on
