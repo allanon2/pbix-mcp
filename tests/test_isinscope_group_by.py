@@ -85,3 +85,12 @@ def test_grouping_does_not_change_values():
 
 def test_blank_group_key_predicate_is_in_scope():
     assert _ev("ISINSCOPE('Other'[k])", {"Other.k": {"is_blank": True}}, {"Other.k"}) is True
+
+
+def test_a_measure_cached_under_a_plain_filter_is_not_reused_for_the_grouped_row():
+    """Same value, different provenance: the measure cache must tell them apart."""
+    measures = {"IS": "ISINSCOPE('Area'[Area])",
+                "M": "CALCULATE([IS], 'Area'[Area] = \"A\") + 0 * [IS]"}   # caches [IS] under a plain filter first
+    out = de.evaluate_measures_smart(["M", "IS"], TABLES, measures, {"Area.Area": ["A"]},
+                                     simulate_row_context=False, group_by={"Area.Area"})
+    assert out["IS"] is True
