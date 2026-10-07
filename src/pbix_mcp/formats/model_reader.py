@@ -227,6 +227,41 @@ class ModelReader:
         return rows
 
     @property
+    def date_tables(self) -> dict:
+        """Tables marked as date tables, ``{table name: date column name or None}``.
+
+        A table is marked when its DataCategory is 'Time'. Its date column is the
+        key column (IsKey), else its only DateTime column, else unknown (None):
+        a calculated date table marked in Desktop need not carry IsKey, and its
+        columns' ExplicitDataType is 1 (Automatic) with the real type in
+        InferredDataType. The RowNumber column (Type 3) is never the date column.
+        """
+        if "date_tables" in self._metadata_cache:
+            return dict(self._metadata_cache["date_tables"])
+        try:
+            rows = self._query_metadata("""
+                SELECT t.Name AS TableName,
+                       COALESCE(c.ExplicitName, c.InferredName) AS ColumnName,
+                       c.IsKey,
+                       CASE WHEN c.ExplicitDataType IS NULL OR c.ExplicitDataType = 1
+                            THEN c.InferredDataType ELSE c.ExplicitDataType END AS DataType
+                FROM [Table] t JOIN [Column] c ON c.TableID = t.ID
+                WHERE t.DataCategory = 'Time' AND c.Type != 3
+            """)
+        except Exception:
+            rows = []          # unreadable metadata: no table is treated as marked
+        by_table: dict = {}
+        for r in rows:
+            by_table.setdefault(r["TableName"], []).append(r)
+        out = {}
+        for table, cols in by_table.items():
+            keys = [c["ColumnName"] for c in cols if c["IsKey"]]
+            dates = [c["ColumnName"] for c in cols if c["DataType"] == 9]   # AMO DataType.DateTime
+            out[table] = keys[0] if len(keys) == 1 else (dates[0] if len(dates) == 1 else None)
+        self._metadata_cache["date_tables"] = out
+        return dict(out)
+
+    @property
     def power_query(self) -> list[dict]:
         """
         Get Power Query (M) expressions from the data model.
