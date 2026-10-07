@@ -13740,6 +13740,7 @@ def pbix_evaluate_dax(
     apply_default_filters: bool = True,
     page_index: int = -1,
     group_by: str = "",
+    selected_filter_context: str = "",
 ) -> str:
     """Evaluate one or more DAX measures against the data model.
 
@@ -13770,6 +13771,11 @@ def pbix_evaluate_dax(
             evaluating one row of a visual grouped by State. ISINSCOPE answers
             TRUE only for these (Desktop: a filtered-but-not-grouped column is
             not in scope). Every key must also be in filter_context.
+        selected_filter_context: Optional JSON filter context: the query's own
+            filters BEFORE the group_by keys were merged in, which ALLSELECTED
+            restores. Needed only when a grouped column is also filtered (a
+            slicer on the axis column); by default it is filter_context minus
+            the group_by keys. Ignored without group_by.
     """
     try:
         info = _ensure_open(alias)
@@ -13825,6 +13831,17 @@ def pbix_evaluate_dax(
                     f"group_by keys must also be in filter_context: {missing}",
                     "INVALID_INPUT").to_text()
             group_keys = set(parsed_gb)
+        selected = None
+        if group_keys and selected_filter_context:
+            try:
+                parsed_sel = json.loads(selected_filter_context)
+            except (json.JSONDecodeError, TypeError):
+                parsed_sel = None
+            if not isinstance(parsed_sel, dict):
+                return ToolResponse.error(
+                    "selected_filter_context must be a JSON object like filter_context",
+                    "INVALID_INPUT").to_text()
+            selected = parsed_sel
 
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
@@ -13834,6 +13851,7 @@ def pbix_evaluate_dax(
             model_columns=ctx.get('model_columns'),
             culture=ctx.get('culture'),
             group_by=group_keys or None,
+            selected_filters=selected,
         )
 
         # Build structured response with DAXResult objects
