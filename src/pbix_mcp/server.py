@@ -14293,7 +14293,9 @@ def pbix_evaluate_dax_per_dimension(
                     ctx.get('relationships'), group_keys={dimension},
                     selected_filters=base_fc,
                     # the marked date tables, as the grouped tool (#79, #86)
-                    date_tables=ctx.get('date_tables')
+                    date_tables=ctx.get('date_tables'),
+                    measure_tables=ctx.get('measure_tables'),
+                    model_columns=ctx.get('model_columns'),
                 )
             else:
                 fb = {}
@@ -14466,7 +14468,9 @@ def pbix_evaluate_dax_grouped(
                         slow, ctx['tables'], ctx['measure_defs'], fc,
                         ctx['date_table'], ctx['date_column'], rels,
                         group_keys={ref}, selected_filters=base_fc,
-                        date_tables=ctx.get('date_tables'))
+                        date_tables=ctx.get('date_tables'),
+                        measure_tables=ctx.get('measure_tables'),
+                        model_columns=ctx.get('model_columns'))
                 results.append({
                     "key": {dim_col: val},
                     "values": {m: (fast[m].get(val) if m in fast else
@@ -14481,7 +14485,9 @@ def pbix_evaluate_dax_grouped(
                     measure_names, ctx['tables'], ctx['measure_defs'], fc,
                     ctx['date_table'], ctx['date_column'], rels,
                     group_keys={k[0] for k in keys}, selected_filters=base_fc,
-                    date_tables=ctx.get('date_tables'))
+                    date_tables=ctx.get('date_tables'),
+                        measure_tables=ctx.get('measure_tables'),
+                        model_columns=ctx.get('model_columns'))
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},
                     "values": {m: vals.get(m) for m in measure_names},

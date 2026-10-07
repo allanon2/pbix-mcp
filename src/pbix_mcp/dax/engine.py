@@ -11635,8 +11635,14 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             group_keys: set | None = None,
                             selected_filters: dict | None = None,
                             culture: str | None = None,
-                            date_tables: dict | None = None) -> dict:
+                            date_tables: dict | None = None,
+                            measure_tables: dict | None = None,
+                            model_columns: dict | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }.
+
+    ``measure_tables`` (each measure's home table) and ``model_columns`` are what
+    resolve a bare ``[Column]`` in a measure, as in evaluate_measures_smart;
+    without them ``AVERAGE([ProductRevenue])`` evaluated to BLANK here.
 
     ``group_keys`` names the filter_context keys that came from GROUPED
     evaluation (the visual's row grouping) rather than the caller's slicer
@@ -11658,6 +11664,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     if selected_filters is not None:
         ctx.selected_filters = dict(selected_filters)
     ctx.culture = culture
+    ctx.measure_tables = measure_tables or {}
+    ctx.model_columns = model_columns or {}
     results = {}
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
