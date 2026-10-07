@@ -127,6 +127,32 @@ class TestPBIRSchemaConformance:
         assert checked > 0
         assert errors == [], "\n".join(errors)
 
+    def test_bookmark_report_filter_shorthand_conforms(self, validator,
+                                                      tmp_path):
+        """Issue #76: the documented report_filter_json example was written
+        verbatim — no `name`, three disallowed keys — so the bookmark failed
+        FilterContainerState, and the report filter card added for it must
+        use PBIR's own FilterContainer shape in report.json."""
+        import pathlib
+
+        src = _pbir_pbix(tmp_path)
+        out = str(tmp_path / "bookmarked.pbix")
+        alias = "sc_" + uuid.uuid4().hex[:8]
+        server.pbix_open(src, alias)
+        try:
+            for name, op in (("Only West", "In"), ("Not West", "NotIn")):
+                assert json.loads(server.pbix_add_bookmark(
+                    alias, name, report_filter_json=json.dumps([{
+                        "target": {"table": "Sales", "column": "Region"},
+                        "operator": op, "values": ["West"]}])))["success"]
+            server.pbix_save(alias, out, overwrite=True, backup=False)
+        finally:
+            server.pbix_close(alias, force=True)
+
+        checked, errors = validator.validate_pbix(pathlib.Path(out))
+        assert checked > 0
+        assert errors == [], "\n".join(errors)
+
     def test_new_page_uses_the_enum_name_not_the_classic_int(
             self, validator, tmp_path):
         """`displayOption` is an int in Report/Layout and a string in PBIR.

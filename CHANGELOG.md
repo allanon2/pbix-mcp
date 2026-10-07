@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.109] - 2026-10-07
+
+### Fixed — `report_filter_json` wrote schema-invalid bookmarks that never filtered (issue #76, from #52)
+
+- **`pbix_add_bookmark` wrote `report_filter_json` verbatim** into
+  `explorationState.filters.byExpr`. Its own documented example,
+  `[{"target": {"table", "column"}, "operator": "In", "values": [...]}]`, has
+  no `name` and three keys Microsoft's PBIR bookmark schema forbids
+  (`FilterContainerState`: `name` required, `additionalProperties: false`),
+  so every bookmark authored that way was schema-invalid — and the call
+  answered success. Flagged in #52, queued, and never landed until now.
+- The shorthand is now converted to the container Desktop writes —
+  `{name, type: "Categorical", filter: {Version: 2, From, Where: In},
+  expression, howCreated: 1}` (28 of 28 bookmark report filters in the
+  corpus) — with values typed to the column (`'West'`, `2024L`, `2.5D`,
+  `datetime'…'`, `true`; quotes doubled). `"NotIn"` wraps the condition in
+  `Not`. A full container passes through. Anything else — no `name`, a
+  disallowed key, an unknown operator, empty values, a column not in the
+  model, a value that does not fit the column — is refused, and nothing is
+  written.
+- **A bookmark filters only through a report filter card.**
+  Desktop-verified: the same bookmark filters the report when a report-level
+  card on that column exists, and does nothing at all when none does. So a
+  shorthand target without a card gets an unselected one ("is (All)") added —
+  reported in the message and in `data.added_report_filter_cards` — and the
+  bookmark's filter is named after it, so every bookmark on that column shares
+  the card. In Desktop, "Only West" and "Not West" apply and switch, with and
+  without a pre-existing card.
+- In a PBIR report the added card uses PBIR's own `FilterContainer` shape
+  (`field`, `howCreated: "User"`), and report.json plus the bookmark files
+  validate against Microsoft's schemas. A report without a model (a thin
+  report) cannot check the column: values are encoded by their JSON type and
+  a warning says so.
+- Pinned by `tests/test_issue76_bookmark_report_filters.py` (22 tests) and a
+  new case in `tests/test_pbir_schema_conformance.py`: 22 of the 23 fail on
+  0.9.108; the one that passes is a control (unparseable JSON was already
+  refused).
+
 ## [0.9.108] - 2026-10-07
 
 ### Fixed — build warnings never reached an MCP caller (issue #75)

@@ -19,6 +19,7 @@ Architecture:
 import atexit
 import copy
 import difflib
+import hashlib
 import io
 import json
 import os
@@ -4296,6 +4297,198 @@ def _bookmark_visual_state(vc: dict, vc_config: dict, capture: bool,
     return state
 
 
+def _semantic_literal(value, data_type: str = "") -> dict:
+    """A semantic-query literal, spelled as Desktop spells it in filters.
+
+    The inverse of the filter readers' ``_parse_literal``: ``'text'`` with
+    embedded quotes doubled, ``2007L`` for integers, ``2.5D`` for other
+    numbers, ``true``/``false``, ``null``, ``datetime'…'``. Desktop-authored
+    filter literals in the corpus: 'text' 60, true 19, 2007L 3. A value for a
+    String column is always quoted, so ``2024`` sent for a text column still
+    matches the text "2024".
+    """
+    def _double(v) -> str:
+        f = float(v)
+        return f"{int(f)}D" if f == int(f) else f"{f}D"
+
+    if value is None:
+        raw = "null"
+    elif data_type == "Boolean" or isinstance(value, bool) and not data_type:
+        raw = "true" if str(value).lower() in ("true", "1") else "false"
+    elif data_type == "DateTime":
+        iso = str(value) if "T" in str(value) else f"{value}T00:00:00"
+        raw = f"datetime'{iso}'"
+    elif data_type == "Int64":
+        f = float(value)
+        if f != int(f):
+            raise ValueError(f"{value!r} is not a whole number")
+        raw = f"{int(f)}L"
+    elif data_type in ("Double", "Decimal"):
+        raw = _double(value)
+    elif not data_type and isinstance(value, int):
+        raw = f"{value}L"
+    elif not data_type and isinstance(value, float):
+        raw = _double(value)
+    else:
+        raw = "'" + str(value).replace("'", "''") + "'"
+    return {"Literal": {"Value": raw}}
+
+
+def _bookmark_report_filters(report_filter_json: str, layout: dict,
+                             info: dict) -> tuple[list, list]:
+    """Turn ``report_filter_json`` into conformant bookmark filter containers.
+
+    Each entry is either the documented shorthand
+    ``{"target": {"table", "column"}, "operator": "In" | "NotIn",
+    "values": [...]}`` — converted to the container Desktop writes (a
+    categorical filter in semantic-query form, named after the report's own
+    filter card on that column) — or an already-conformant
+    ``FilterContainerState``, passed through. Anything else is refused: it
+    used to be written verbatim, and the documented example itself produced a
+    schema-invalid bookmark (issue #76, from #52).
+
+    A bookmark restores the state of the report's EXISTING filter cards; it
+    does not create one. Desktop-verified: the same bookmark filters the
+    report when a report-level card on that column exists, and does nothing
+    at all when none does. So a shorthand target without a card gets an
+    unselected one ("is (All)") added to ``layout["filters"]``.
+
+    Returns ``(containers, added_cards)`` — the latter as "'T'[C]" strings.
+    """
+    try:
+        entries = json.loads(report_filter_json)
+    except json.JSONDecodeError as exc:
+        raise LayoutParseError(
+            f"Invalid report_filter_json — must be a JSON array: {exc}")
+    if isinstance(entries, dict):
+        entries = [entries]
+    if not isinstance(entries, list):
+        raise LayoutParseError("report_filter_json must be a JSON array of filters")
+
+    raw_cards = layout.get("filters")
+    if isinstance(raw_cards, list):
+        report_cards = raw_cards
+    else:
+        try:
+            report_cards = json.loads(raw_cards or "[]")
+        except (TypeError, json.JSONDecodeError):
+            report_cards = []
+        if not isinstance(report_cards, list):
+            report_cards = []
+    added_cards: list = []
+    schema = None
+    out = []
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            raise LayoutParseError(
+                f"report_filter_json[{i}] is {type(e).__name__}, not an object")
+        if "target" not in e:
+            bad = sorted(set(e) - _BOOKMARK_FILTER_KEYS)
+            if "name" not in e or bad:
+                problems = (["no 'name'"] if "name" not in e else []) + (
+                    [f"keys a bookmark filter may not carry: {bad}"] if bad else [])
+                raise LayoutParseError(
+                    f"report_filter_json[{i}] is neither the documented "
+                    f"{{target, operator, values}} form nor a valid bookmark "
+                    f"filter container ({'; '.join(problems)}). A container "
+                    f"needs 'name' and only {sorted(_BOOKMARK_FILTER_KEYS)}.")
+            out.append(e)
+            continue
+
+        tgt = e.get("target") or {}
+        table, column = tgt.get("table"), tgt.get("column")
+        op = str(e.get("operator", "In"))
+        values = e.get("values")
+        unknown = sorted(set(e) - {"target", "operator", "values"})
+        if not table or not column:
+            raise LayoutParseError(
+                f"report_filter_json[{i}].target needs 'table' and 'column'")
+        if op not in ("In", "NotIn"):
+            raise LayoutParseError(
+                f"report_filter_json[{i}].operator '{op}' is not supported — "
+                f"use 'In' or 'NotIn', or pass a full filter container")
+        if not isinstance(values, list) or not values:
+            raise LayoutParseError(
+                f"report_filter_json[{i}].values must be a non-empty array")
+        if unknown:
+            raise LayoutParseError(
+                f"report_filter_json[{i}] has keys the shorthand does not "
+                f"read: {unknown}")
+        if schema is None:
+            from pbix_mcp.formats.model_reader import ModelReader
+            try:
+                schema = {(r["TableName"], r["ColumnName"]): r["DataType"]
+                          for r in ModelReader(
+                              info["path"], work_dir=info.get("work_dir")).schema}
+            except Exception:
+                schema = {}   # no model in this file (thin / live report)
+        if schema and (table, column) not in schema:
+            raise LayoutParseError(
+                f"report_filter_json[{i}]: column '{table}'[{column}] is not "
+                f"in the model, so the filter could never apply")
+        if not schema:
+            _responses.add_pending_warning(
+                f"report_filter_json[{i}]: this file carries no model (a thin "
+                f"report), so '{table}'[{column}] was not checked and its "
+                f"values were encoded by their JSON type")
+        dtype = schema.get((table, column), "")
+
+        expression = {"Column": {"Expression": {"SourceRef": {"Entity": table}},
+                                 "Property": column}}
+        src = table[:1].lower() or "t"
+        try:
+            literals = [[_semantic_literal(v, dtype)] for v in values]
+        except (TypeError, ValueError) as exc:
+            raise LayoutParseError(
+                f"report_filter_json[{i}]: a value does not fit the {dtype} "
+                f"column '{table}'[{column}]: {exc}")
+        cond: dict = {"In": {
+            "Expressions": [{"Column": {
+                "Expression": {"SourceRef": {"Source": src}},
+                "Property": column}}],
+            "Values": literals,
+        }}
+        if op == "NotIn":
+            cond = {"Not": {"Expression": cond}}
+        # Desktop names a bookmark's filter after the report filter card it
+        # snapshots; reuse that name. Without a card, derive a Desktop-style
+        # 20-hex name from the column, so every bookmark filtering the same
+        # column names the same filter (as Desktop's snapshots do).
+        # A classic card keys its column as `expression`, a PBIR one (kept
+        # in its own shape by the PBIR reader) as `field`.
+        card = next((c for c in report_cards if isinstance(c, dict) and
+                     expression in (c.get("expression"), c.get("field"))),
+                    None)
+        name = (card or {}).get("name") or hashlib.sha1(
+            f"{table}\x00{column}".encode("utf-8")).hexdigest()[:20]
+        if card is None:
+            # Same card in each format's own spelling: PBIR's FilterContainer
+            # names the column `field` and howCreated as a string — "User"
+            # is classic 1 (the enum is index-aligned).
+            report_cards.append(
+                {"name": name, "field": expression, "type": "Categorical",
+                 "howCreated": "User"} if _is_pbir(info["work_dir"]) else
+                {"name": name, "expression": expression,
+                 "type": "Categorical", "howCreated": 1})
+            added_cards.append(f"'{table}'[{column}]")
+        out.append({
+            "name": name,
+            "type": "Categorical",
+            "filter": {
+                "Version": 2,
+                "From": [{"Name": src, "Entity": table, "Type": 0}],
+                "Where": [{"Condition": cond}],
+            },
+            "expression": expression,
+            "howCreated": 1,
+        })
+    if added_cards:
+        # Desktop keeps report filters as a JSON string in Report/Layout.
+        layout["filters"] = (report_cards if isinstance(raw_cards, list)
+                             else json.dumps(report_cards, ensure_ascii=False))
+    return out, added_cards
+
+
 @mcp.tool()
 def pbix_add_bookmark(
     alias: str,
@@ -4323,6 +4516,16 @@ def pbix_add_bookmark(
         report_filter_json: Optional JSON array of report-level filters to apply
                             when bookmark is activated, e.g.
                             '[{"target":{"table":"Sales","column":"Region"},"operator":"In","values":["West"]}]'
+                            operator: "In" or "NotIn"; values are encoded for
+                            the column's type (the column must exist). Each
+                            entry is converted to the filter container Desktop
+                            writes, named after the report's filter card on
+                            that column. A bookmark filters ONLY through such a
+                            card, so one is added (unselected, "is (All)") when
+                            the report has none — reported in the message and
+                            data.added_report_filter_cards. A full container
+                            ({name, type, filter, expression, ...}) is passed
+                            through; anything else is refused.
         capture_visual_state: Capture each targeted visual's CURRENT data state —
                               the slicer selection in objects.general[].properties.filter
                               plus the visual's own filters — so applying the bookmark
@@ -4431,13 +4634,13 @@ def pbix_add_bookmark(
             section_name: {"visualContainers": vc_states}
         }
 
-        # Add report-level filters if provided
+        # Report-level filters, converted to conformant filter containers —
+        # written verbatim they were schema-invalid (issue #76).
+        added_cards: list = []
         if report_filter_json:
-            try:
-                filters = json.loads(report_filter_json)
-                bookmark["explorationState"]["filters"] = {"byExpr": filters}
-            except json.JSONDecodeError:
-                raise LayoutParseError("Invalid report_filter_json — must be valid JSON array")
+            containers, added_cards = _bookmark_report_filters(
+                report_filter_json, layout, info)
+            bookmark["explorationState"]["filters"] = {"byExpr": containers}
 
         # Insert into layout config
         config_str = layout.get("config", "{}")
@@ -4466,6 +4669,12 @@ def pbix_add_bookmark(
             state_msg = f", cleared state captured for {captured} visual(s)"
         else:
             state_msg = f", data state captured for {captured} visual(s)"
+        # A bookmark filters only through a report filter card (#76): say so
+        # when one had to be added, since it shows in the Filters pane.
+        card_msg = (f" Added a report filter card on {', '.join(added_cards)} "
+                    f"(unselected) — a bookmark's report filter applies only "
+                    f"through a card on that column."
+                    if added_cards else "")
         # The INTERNAL name is what a button's bookmark action must reference;
         # returning only the display name forced callers to read Report/Layout
         # raw and match on displayName, which is not even unique (issue #52).
@@ -4473,11 +4682,12 @@ def pbix_add_bookmark(
             f"Created bookmark '{display_name}' (name: {bookmark['name']}) → "
             f"page '{target_section.get('displayName')}'"
             f"{hidden_msg}{state_msg}. "
-            f"Total bookmarks: {len(config['bookmarks'])}",
+            f"Total bookmarks: {len(config['bookmarks'])}.{card_msg}",
             data={"name": bookmark["name"], "displayName": display_name,
                   "page": target_section.get("displayName"),
                   "index": len(config["bookmarks"]) - 1,
-                  "visuals_with_state": captured},
+                  "visuals_with_state": captured,
+                  "added_report_filter_cards": added_cards},
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
