@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.114] - 2026-10-07
+
+### Fixed — CALCULATE applies its modifiers before its filter arguments (issue #87)
+
+- **What was wrong:** CALCULATE applied its arguments in the order they were
+  written, so a modifier written *after* a filter argument removed that
+  filter. `CALCULATE([S], Cust[Region] = "West", ALL(Cust))` returned the
+  all-regions total.
+- **What DAX does:** it applies the modifiers first, wherever they are
+  written, and only then the filter arguments. The modifiers are `ALL`,
+  `ALLEXCEPT`, `ALLSELECTED`, `ALLNOBLANKROW`, `REMOVEFILTERS`,
+  `USERELATIONSHIP` and `CROSSFILTER`. The engine now does the same, keeping
+  the written order within each group.
+- **`KEEPFILTERS`** intersects with the filter context left *after* the
+  modifiers. `CALCULATE([S], ALL(Cust), KEEPFILTERS(Cust[Region] = "West"))`
+  intersected West with an `East` filter that `ALL(Cust)` had already removed,
+  and returned blank.
+- **Time intelligence** (the `CALCULATE` branch and `TOTALYTD/QTD/MTD`) now
+  derives its context instead of rebuilding it. The rebuilt context dropped
+  the `ALL(table)` snapshot, so a filter `ALL` had removed came back through
+  the relationships.
+- **A table whose name starts with `All`** (for example `Allocation[Type] =
+  "A"`) is no longer taken for an `ALL…` modifier.
+- **Measured on Power BI Desktop** (2.152, ADOMD): 38 shapes under two outer
+  contexts now match, against 17 before.
+- **No regressions found:** the blank-member battery (147/147) and the
+  #78–#80 harness (5,954 + 5,890 cells) still match Desktop. Every measure of
+  Agents Performance, GeoSales, Ecommerce, IT Support and the AI sample gives
+  the same value as on 0.9.113. The only exceptions are measures built on
+  `RAND()`.
+
+### Fixed — the row-context simulation answers the same in every run (issue #88)
+
+- **What was wrong:** when a measure is BLANK and reads `ISFILTERED` /
+  `SELECTEDVALUE`, `evaluate_measures_smart` (with the library default
+  `simulate_row_context=True`) tries one value of the column. It took the
+  first value of a Python `set`, whose order for strings follows the
+  per-process hash seed, so the answer changed between runs. IT Support's
+  "Filters Applied Values" measure came back as "Type: Incident" in one run
+  and "Type: Request" in the next.
+- **Now:** it tries the first value in data order. `pbix_evaluate_dax` was not
+  affected, since it turns the simulation off unless asked.
+
+- **Pinned by 40 tests; 23 fail on 0.9.113:**
+
+  | test file | tests | fail on 0.9.113 |
+  |---|---|---|
+  | `tests/test_issue87_calculate_modifier_order.py` | 39 | 22 |
+  | `tests/test_issue88_simulation_determinism.py` | 1 | 1 |
+
+  `test_issue88` runs the same evaluation under six hash seeds.
+
 ## [0.9.113] - 2026-10-07
 
 ### Fixed — the builder stores an unmatched fact key the way Desktop does (issue #81)

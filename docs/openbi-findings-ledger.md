@@ -40,8 +40,9 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-07 (0.9.113): docs 1-45 and GitHub issues #1-#86 are closed;
-the issue queue is empty.**
+**Updated 2026-10-07 (0.9.114): docs 1-45 and GitHub issues #1-#88 are closed;
+the issue queue is empty.** 0.9.114 adds #87 (CALCULATE applies its modifiers
+before its filter arguments) and #88 (a deterministic row-context simulation).
 
 - #77 (PR, @allanon2) -- ISINSCOPE through a context transition -- 0.9.111;
 - #78, #79, #80 -- the marked-date-table rule, the grouped tool, KEEPFILTERS
@@ -223,6 +224,16 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #88** -- CLOSED (0.9.114). evaluate_measures_smart's row-context
+  simulation tried `list(set(values))[0]`, whose order follows the hash seed:
+  the answer changed between runs. Now the first value in data order.
+  Regression: tests/test_issue88_simulation_determinism.py.
+- **GH #87** -- CLOSED (0.9.114). CALCULATE applied ALL / REMOVEFILTERS /
+  ALLEXCEPT in argument order, so one written after a filter cancelled it;
+  KEEPFILTERS intersected the pre-modifier context; time intelligence rebuilt
+  the context and lost ALL's snapshot. Modifiers now apply first, as in
+  Desktop (38 measured shapes). Regression:
+  tests/test_issue87_calculate_modifier_order.py.
 - **doc 45 (GH #84)** -- CLOSED (0.9.113). Padding and spacing were written as
   Int64 literals (`'8L'`, and 7.5 truncated to `'7L'`), border and drop-shadow
   numbers as `'1.0D'`. Desktop writes integral D literals for all four cards

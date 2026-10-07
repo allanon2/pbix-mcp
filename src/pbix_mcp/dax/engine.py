@@ -589,6 +589,13 @@ _TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
 # multi-column call and only the base column of `T[C].[Part]`.
 _WHOLE_TCOL_RE = re.compile(
     r"^\s*(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]\s*$")
+# CALCULATE's modifier arguments (issue #87), and the subset that REMOVES filters.
+_CALC_MODIFIER_RE = re.compile(
+    r"(?is)^\s*(?:ALL|ALLSELECTED|ALLEXCEPT|ALLNOBLANKROW|ALLCROSSFILTERED|"
+    r"REMOVEFILTERS|USERELATIONSHIP|CROSSFILTER)\s*\(")
+_CALC_REMOVE_RE = re.compile(
+    r"(?is)^\s*(?:ALL|ALLSELECTED|ALLEXCEPT|ALLNOBLANKROW|ALLCROSSFILTERED|"
+    r"REMOVEFILTERS)\s*\(")
 _CALC_PRED_RE = re.compile(
     r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
 # Literal-first CALCULATE predicate: ``2024 = T[Year]`` (issue #39). The left
@@ -4497,16 +4504,23 @@ class DAXEngine:
         # the marked-date-table rule below (Desktop keeps the table's other filters there).
         keep_keys: set = set()
         _kf_before = None
-        for i in range(1, len(args)):
+        # DAX applies the MODIFIERS -- ALL*, REMOVEFILTERS, USERELATIONSHIP,
+        # CROSSFILTER -- before the filter arguments, wherever they are written.
+        # Taken in written order, `CALCULATE(e, T[c] = "x", ALL(T))` removed
+        # the filter it had just applied and returned the all-T total (Desktop:
+        # the "x" value, issue #87). Each group keeps its own order.
+        _rest = [a.strip() for a in args[1:]]
+        ordered = ([a for a in _rest if _CALC_MODIFIER_RE.match(a)]
+                   + [a for a in _rest if not _CALC_MODIFIER_RE.match(a)])
+        for filter_arg in ordered:
             if _kf_before is not None:
                 keep_keys |= self._written_keys(_kf_before, new_ctx)
                 _kf_before = None
-            filter_arg = args[i].strip()
             if filter_arg.upper().startswith('KEEPFILTERS'):
                 _kf_before = new_ctx
 
             # REMOVEFILTERS / ALL
-            if filter_arg.upper().startswith('REMOVEFILTERS') or filter_arg.upper().startswith('ALL'):
+            if _CALC_REMOVE_RE.match(filter_arg):
                 selected = filter_arg.upper().startswith('ALLSELECTED')
                 # Bare ALLSELECTED() — no argument at all. The reference regex
                 # below cannot match empty parens, so this form fell straight
@@ -4680,7 +4694,8 @@ class DAXEngine:
                     key = f"{_tt}.{_tc}"
                     value: Any = list(dict.fromkeys(_tvals))
                     if _tkf and key not in applied_here:
-                        outer = ctx.filter_context.get(key)
+                        # the filter left after the modifiers (#87)
+                        outer = new_ctx.filter_context.get(key)
                         if outer is not None:
                             value = _keep_scope_tag(outer, {"all": [outer, value]})
                     if key in applied_here:
@@ -4734,17 +4749,17 @@ class DAXEngine:
                         tbl_name = first['__table__']
                         col_name = first['__column__']
                         date_vals = [r['__value__'] for r in result]
-                        new_filters = dict(new_ctx.filter_context)
                         # Remove the date table's other filters -- only where
                         # Power BI does (issue #78); elsewhere they intersect.
-                        keys_to_remove = ([k for k in new_filters if k.startswith(f"{tbl_name}.")]
+                        keys_to_remove = ([k for k in new_ctx.filter_context
+                                           if k.startswith(f"{tbl_name}.")]
                                           if (tbl_name, col_name) in self._clearing_date_columns(ctx)
                                           else [])
-                        for k in keys_to_remove:
-                            del new_filters[k]
-                        new_filters[f"{tbl_name}.{col_name}"] = date_vals
-                        new_ctx = DAXContext(new_ctx.tables, new_ctx.measures, new_ctx.date_table,
-                                             new_ctx.date_column, new_filters, new_ctx.relationships)
+                        # Derived, not rebuilt: a fresh DAXContext dropped the
+                        # ALL(T) snapshot (and the grouping, the selection, ...),
+                        # so a filter ALL had removed came back (#87).
+                        new_ctx = new_ctx.without_filters(keys_to_remove).with_filters(
+                            {f"{tbl_name}.{col_name}": date_vals})
                 continue
 
             # FILTER(table, condition) or other table-returning expressions
@@ -4835,7 +4850,8 @@ class DAXEngine:
                             # KEEPFILTERS(FILTER(ALL(D[Date]), D[Date] <= MAX(D[Date]))))
                             # is that day's count, not the running total.
                             for key, vals in list(groups.items()):
-                                outer = ctx.filter_context.get(key)
+                                # the filter left after the modifiers (#87)
+                                outer = new_ctx.filter_context.get(key)
                                 if outer is not None:
                                     groups[key] = _keep_scope_tag(outer, {"all": [outer, vals]})
                         new_ctx = new_ctx.with_filters(groups)
@@ -4854,7 +4870,11 @@ class DAXEngine:
                     # intersection filters to zero rows, so SUM correctly goes
                     # BLANK (issue #35 — the passthrough made the override
                     # indistinguishable from not writing KEEPFILTERS at all).
-                    outer = ctx.filter_context.get(key)
+                    # It intersects the filter left AFTER the modifiers: with
+                    # ALL(T) earlier in the call there is nothing to intersect
+                    # (Desktop: CALCULATE(e, ALL(T), KEEPFILTERS(T[c] = v)) is
+                    # the v value, not BLANK -- #87).
+                    outer = new_ctx.filter_context.get(key)
                     if outer is not None:
                         # Intersecting keeps the grouping -- or the iterated
                         # row -- in scope: Desktop answers CALCULATE(ISINSCOPE(c),
@@ -11091,11 +11111,10 @@ class DAXEngine:
                 # Power BI intersects the dates with the table's filters (#78).
                 return self._eval_expr(expr, ctx.with_filters(
                     {f"{tbl_name}.{col_name}": [item['__value__'] for item in dates]}))
-            new_filters = {k: v for k, v in ctx.filter_context.items()
-                           if not k.startswith(f"{tbl_name}.")}
-            new_filters[f"{tbl_name}.{col_name}"] = [item['__value__'] for item in dates]
-            new_ctx = DAXContext(ctx.tables, ctx.measures, ctx.date_table, ctx.date_column,
-                                 new_filters, ctx.relationships)
+            # Derived from ctx, so ALL snapshots and the grouping survive (#87).
+            new_ctx = ctx.without_filters(
+                [k for k in ctx.filter_context if k.startswith(f"{tbl_name}.")]
+            ).with_filters({f"{tbl_name}.{col_name}": [item['__value__'] for item in dates]})
             return self._eval_expr(expr, new_ctx)
         return self._eval_expr(expr, ctx)
 
@@ -11963,7 +11982,11 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
             if col_idx < 0:
                 continue
 
-            unique_vals = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
+            # Data order, not set order: set iteration of strings follows the
+            # per-process hash seed, so the value tried first -- and the answer
+            # -- changed from one run to the next (issue #88).
+            unique_vals = list(dict.fromkeys(
+                row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
             if not unique_vals:
                 continue
 
