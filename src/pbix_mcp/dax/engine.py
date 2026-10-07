@@ -4181,8 +4181,17 @@ class DAXEngine:
         applied_here: dict = {}
 
         # Process filter arguments
+        # Keys written by KEEPFILTERS(...) arguments: they intersect, so they do not trigger
+        # the marked-date-table rule below (Desktop keeps the table's other filters there).
+        keep_keys: set = set()
+        _kf_before = None
         for i in range(1, len(args)):
+            if _kf_before is not None:
+                keep_keys |= self._written_keys(_kf_before, new_ctx)
+                _kf_before = None
             filter_arg = args[i].strip()
+            if filter_arg.upper().startswith('KEEPFILTERS'):
+                _kf_before = new_ctx
 
             # REMOVEFILTERS / ALL
             if filter_arg.upper().startswith('REMOVEFILTERS') or filter_arg.upper().startswith('ALL'):
@@ -4482,6 +4491,16 @@ class DAXEngine:
                         # Single-column row set (ALL(T[Col]), VALUES): replaces
                         # the filter on that ONE column, and a filter reaching
                         # the table through a relationship still applies.
+                        if filter_arg.upper().startswith('KEEPFILTERS'):
+                            # KEEPFILTERS(FILTER(...)) INTERSECTS the outer filter on
+                            # the column, as it does for a predicate. Desktop 2.157,
+                            # grouped by the date itself: CALCULATE(COUNTROWS(F),
+                            # KEEPFILTERS(FILTER(ALL(D[Date]), D[Date] <= MAX(D[Date]))))
+                            # is that day's count, not the running total.
+                            for key, vals in list(groups.items()):
+                                outer = ctx.filter_context.get(key)
+                                if outer is not None:
+                                    groups[key] = {"all": [outer, vals]}
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 
@@ -4522,7 +4541,9 @@ class DAXEngine:
                     new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
                 continue
 
-        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx)
+        if _kf_before is not None:
+            keep_keys |= self._written_keys(_kf_before, new_ctx)
+        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx, keep_keys)
 
         # CALCULATE performs the row->filter context transition: inside its
         # expression the iteration row's filters are real filters, plain
@@ -4540,7 +4561,14 @@ class DAXEngine:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
 
-    def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext) -> DAXContext:
+    @staticmethod
+    def _written_keys(before: DAXContext, after: DAXContext) -> set:
+        """filter_context keys `after` set that `before` did not have as the same object."""
+        b, a = before.filter_context, after.filter_context
+        return {k for k, v in a.items() if k not in b or b[k] is not v}
+
+    def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
+                                        keep_keys: set = frozenset()) -> DAXContext:
         """A filter on a MARKED date table's date column removes the table's
         other filters.
 
@@ -4551,7 +4579,10 @@ class DAXEngine:
         <= MAX('Date'[Date]))) under Year x Period is the cumulative value, not
         the period's; CALCULATE(SUM(..), 'Date'[Date] <= DATE(2014, 6, 30)) under
         Year is the same for every year. Filters this CALCULATE wrote itself are
-        kept; KEEPFILTERS intersections are left alone (not measured).
+        kept. A date filter inside KEEPFILTERS does not trigger it: Desktop gives
+        CALCULATE(e, KEEPFILTERS('Date'[Date] <= x)) under Year x Period the
+        period's own value (the Period filter stays), measured on the same
+        sample and on a daily marked table (Revenue Opportunities).
 
         "Written here" is identity: with_filters copies the outer dict, so a
         filter this CALCULATE did not touch is the same object as outside.
@@ -4562,12 +4593,13 @@ class DAXEngine:
         before, after = outer.filter_context, new_ctx.filter_context
         written = {k for k, v in after.items() if k not in before or before[k] is not v}
         drop = set()
+        triggers = written - set(keep_keys)
         for table, date_col in marked.items():
             if not date_col:
                 continue
             key = f"{table}.{date_col}"
             value = after.get(key)
-            if key not in written or (isinstance(value, dict) and 'all' in value):
+            if key not in triggers or (isinstance(value, dict) and 'all' in value):
                 continue
             drop |= {k for k in after if k.split('.', 1)[0] == table and k not in written}
         return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
