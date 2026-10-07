@@ -1361,6 +1361,23 @@ class GroupByPredicate(dict):
     ``{"is_blank": True}``)."""
 
 
+class RowContextValues(list):
+    """A filter_context In-set that an ITERATION's row put there.
+
+    This engine applies the row->filter transition eagerly, so an iterator's row
+    is already in filter_context while its row context is still only a row
+    context (``_outer_ctx`` is set). In DAX the row becomes a filter -- and its
+    columns come into scope for ISINSCOPE -- only through CALCULATE or a measure
+    reference, which clear ``_outer_ctx``. Desktop 2.157 (Microsoft's MIT
+    Corporate Spend sample):
+
+        SUMX(VALUES(T[c]), IF(CALCULATE(ISINSCOPE(T[c])), 1, 0))   -- 5 at the total
+        SUMX(VALUES(T[c]), [ISINSCOPE(T[c]) measure] + 0)          -- 5
+        SUMX(T, IF(CALCULATE(ISINSCOPE(T[c])), 1, 0))              -- 40, one per row
+        SUMX(VALUES(T[c]), IF(ISINSCOPE(T[c]), 1, 0))              -- 0 (no transition)
+    """
+
+
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
 
@@ -3283,12 +3300,12 @@ class DAXEngine:
         for k, v in row_item.items():
             if k in meta_keys or v is None:
                 continue
-            filters[f"{table_name}.{k}"] = [v]
+            filters[f"{table_name}.{k}"] = RowContextValues([v])
         # Also add the primary column filter
         col = row_item.get('__column__', '')
         val = row_item.get('__value__')
         if col and val is not None:
-            filters[f"{table_name}.{col}"] = [val]
+            filters[f"{table_name}.{col}"] = RowContextValues([val])
         elif col and '__value__' in row_item:
             # The BLANK (unknown) member. It must still emit a filter -- skipping
             # it left the context UNFILTERED, so iterating a dimension that has an
@@ -5710,15 +5727,27 @@ class DAXEngine:
             CALCULATE(ISFILTERED('Risk'[Location]), 'Risk'[Location] = "x")  TRUE
 
         and a column the query filters without grouping it is ISFILTERED but not
-        ISINSCOPE. KEEPFILTERS on a grouped column keeps it in scope. Not
-        modelled: Desktop also puts a column in scope through a context
-        transition (CALCULATE(ISINSCOPE(c)) inside an iteration over c); that
-        answers FALSE here.
+        ISINSCOPE. KEEPFILTERS on a grouped column keeps it in scope. A context
+        transition also brings the iterated row's columns into
+        scope (RowContextValues, see there); without one, a row context leaves
+        ISINSCOPE to the enclosing filter context.
         """
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            return isinstance(ctx.filter_context.get(f"{ref[0]}.{ref[1]}"),
-                              (GroupByValues, GroupByPredicate))
+        # ISINSCOPE takes a column REFERENCE: parse it like the plain aggregates do,
+        # so a row context cannot collapse it to the current row's value.
+        ref = self._parse_column_ref(args_str) or self._eval_expr(args_str.strip(), ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return False
+        return self._in_scope(f"{ref[0]}.{ref[1]}", ctx)
+
+    def _in_scope(self, key: str, ctx: DAXContext) -> bool:
+        value = ctx.filter_context.get(key)
+        if isinstance(value, (GroupByValues, GroupByPredicate)):
+            return True
+        outer = getattr(ctx, '_outer_ctx', None)
+        if isinstance(value, RowContextValues):
+            # The iteration's row: in scope once CALCULATE / a measure reference
+            # made it a filter; before that, only what was in scope outside.
+            return True if outer is None else self._in_scope(key, outer)
         return False
 
     def _fn_error(self, args_str: str, ctx: DAXContext) -> Any:
