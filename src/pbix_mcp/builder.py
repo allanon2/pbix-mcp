@@ -727,6 +727,14 @@ class PBIXBuilder:
         # Source model's 0.CryptKey.bin — the only key that can decrypt the
         # sensitive values its metadata already carries.
         self._source_cryptkey: bytes | None = None
+        # Every non-critical warning of the last build()/save(), as
+        # {"kind", "tables", "message"}. They also go to Python's `warnings`
+        # module, but an MCP caller never sees that stream, so the server
+        # forwards these into its responses (issue #75). `tables` names the
+        # tables a warning is about, so a rebuild can tell a problem with the
+        # data supplied in this call from a standing one elsewhere.
+        self.build_warnings: list[dict] = []
+        self._prebuild_meta: dict[str, tuple[str, tuple]] = {}
 
     def add_table(
         self,
@@ -1207,6 +1215,14 @@ class PBIXBuilder:
         Raises ValueError for critical issues that would produce a corrupt file.
         """
         issues: list[str] = []
+        self._prebuild_meta = {}
+
+        def warn(kind: str, tables, message: str) -> None:
+            """A non-critical issue, remembered with the tables it concerns
+            so build() can hand it to callers that cannot see `warnings`."""
+            issues.append(message)
+            self._prebuild_meta[message] = (kind, tuple(tables))
+
         table_names = {t["name"] for t in self._tables}
         # Map table→columns for lookup
         table_columns: dict[str, set[str]] = {}
@@ -1255,7 +1271,8 @@ class PBIXBuilder:
                         f"CRITICAL: Table '{t['name']}' has no columns but has "
                         f"{len(t['rows'])} rows")
             elif not t["rows"]:
-                issues.append(f"WARNING: Table '{t['name']}' has no rows (empty table)")
+                warn("empty_table", [t["name"]],
+                     f"WARNING: Table '{t['name']}' has no rows (empty table)")
             # Column names collide CASE-INSENSITIVELY (issue #53). Analysis
             # Services treats `DEST_WAC` and `Dest_WAC` as one name, but
             # nothing engine-side notices: the build succeeds, both columns
@@ -1321,7 +1338,8 @@ class PBIXBuilder:
                         " / ".join(repr(s) for s in sorted(v)[:3])
                         for _k, v in list(collisions.items())[:3]
                     )
-                    issues.append(
+                    warn(
+                        "case_fold", [t["name"]],
                         f"WARNING: Table '{t['name']}' column '{cname}' has "
                         f"{len(collisions)} value(s) differing only by case "
                         f"({examples}). VertiPaq's string store is "
@@ -1331,15 +1349,31 @@ class PBIXBuilder:
                         f"the folded value."
                     )
 
-            # Check row data matches column definitions
+            # Check row data matches column definitions. A field that is not
+            # a column is not stored anywhere — and when it is a misspelt
+            # column name, that column is left blank. One line per TABLE, not
+            # per row: a systematic typo across a 100k-row load used to emit
+            # 100k identical warnings (issue #75).
             col_names = {c["name"] for c in t["columns"]}
+            extra_fields: set = set()
+            extra_rows = 0
+            first_row = None
             for i, row in enumerate(t.get("rows", [])):
                 extra = set(row.keys()) - col_names
                 if extra:
-                    issues.append(
-                        f"WARNING: Table '{t['name']}' row {i} has extra "
-                        f"fields not in columns: {extra}"
-                    )
+                    extra_fields |= extra
+                    extra_rows += 1
+                    if first_row is None:
+                        first_row = i
+            if extra_rows:
+                warn(
+                    "unknown_fields", [t["name"]],
+                    f"WARNING: Table '{t['name']}' has {extra_rows} row(s) "
+                    f"carrying field(s) that are not columns: "
+                    f"{sorted(map(str, extra_fields))} (first at row "
+                    f"{first_row}). Those values are not stored; if a field is "
+                    f"a misspelt column name, that column is left blank."
+                )
 
         # --- Measure checks ---
         # A measure that shares its name (case-insensitively) with a column on
@@ -1456,7 +1490,8 @@ class PBIXBuilder:
                 ft_type = table_col_types[ft].get(fc)
                 tt_type = table_col_types[tt].get(tc)
                 if ft_type and tt_type and ft_type != tt_type:
-                    issues.append(
+                    warn(
+                        "relationship_types", [ft, tt],
                         f"WARNING: Relationship {ft}.{fc} ({ft_type}) → "
                         f"{tt}.{tc} ({tt_type}) — data type mismatch"
                     )
@@ -1466,9 +1501,16 @@ class PBIXBuilder:
                 pk_vals = {row.get(tc) for row in self._get_table_rows(tt)}
                 orphans = fk_vals - pk_vals - {None}
                 if orphans:
-                    issues.append(
+                    # Capped: the whole set used to be printed, which on real
+                    # data is a warning thousands of values long.
+                    shown = sorted(orphans, key=repr)[:10]
+                    more = (f" (+{len(orphans) - len(shown)} more)"
+                            if len(orphans) > len(shown) else "")
+                    warn(
+                        "orphan_keys", [ft, tt],
                         f"WARNING: Relationship {ft}.{fc} → {tt}.{tc} has "
-                        f"orphan FK values not in dimension: {orphans}"
+                        f"{len(orphans)} orphan FK value(s) not in dimension: "
+                        f"{set(shown)}{more}"
                     )
 
         # --- Visual checks ---
@@ -1499,7 +1541,8 @@ class PBIXBuilder:
                         )
                         if entity and entity in table_columns:
                             if prop not in table_columns[entity]:
-                                issues.append(
+                                warn(
+                                    "visual_reference", [entity],
                                     f"WARNING: Visual on '{page['name']}' "
                                     f"references non-existent column "
                                     f"'{entity}.{prop}'"
@@ -1515,7 +1558,8 @@ class PBIXBuilder:
                         )
                         if entity and entity in table_measures:
                             if prop not in table_measures[entity]:
-                                issues.append(
+                                warn(
+                                    "visual_reference", [entity],
                                     f"WARNING: Visual on '{page['name']}' "
                                     f"references non-existent measure "
                                     f"'{entity}.{prop}'"
@@ -1560,6 +1604,7 @@ class PBIXBuilder:
         from pbix_mcp.formats.metadata_schema import create_empty_metadata_db
 
         # 0. Pre-build validation
+        self.build_warnings = []
         issues = self._pre_build_checks()
         critical = [i for i in issues if i.startswith("CRITICAL:")]
         if critical:
@@ -1570,6 +1615,10 @@ class PBIXBuilder:
         if issues:
             import warnings
             for issue in issues:
+                kind, about = self._prebuild_meta.get(issue, ("other", ()))
+                self.build_warnings.append({
+                    "kind": kind, "tables": about,
+                    "message": f"PBIX pre-build: {issue}"})
                 warnings.warn(f"PBIX pre-build: {issue}", stacklevel=2)
 
         tables = self._tables
@@ -1588,6 +1637,7 @@ class PBIXBuilder:
             user_hierarchies=self._user_hierarchies,
             compression_class_a=0xABA5A,
             compression_class_b=0xABA5B,
+            warn_sink=self.build_warnings,
         )
 
         # 3-4. Build ABF binary container from scratch
@@ -1701,6 +1751,9 @@ class PBIXBuilder:
             if issues:
                 import warnings
                 for issue in issues:
+                    self.build_warnings.append({
+                        "kind": "validation", "tables": (),
+                        "message": f"PBIX validation: {issue}"})
                     warnings.warn(f"PBIX validation: {issue}", stacklevel=2)
 
         abs_path = os.path.abspath(path)
@@ -2247,13 +2300,24 @@ def _modify_metadata_and_encode(
     user_hierarchies: list[dict] | None = None,
     compression_class_a: int = 0xABA5A,
     compression_class_b: int = 0xABA5B,
+    warn_sink: list | None = None,
 ) -> tuple[bytes, dict[str, bytes]]:
     """Populate metadata SQLite with tables/measures/relationships and encode VertiPaq data.
+
+    ``warn_sink``, when given, also receives each skipped-hierarchy warning as
+    {"kind", "tables", "message"} (see PBIXBuilder.build_warnings).
 
     Returns:
         (new_sqlite_bytes, vertipaq_files) where vertipaq_files maps
         ABF internal paths to binary content.
     """
+
+    def _skip_hierarchy(table: str, message: str) -> None:
+        warnings.warn(message)
+        if warn_sink is not None:
+            warn_sink.append({"kind": "hierarchy_skipped",
+                              "tables": (table,), "message": message})
+
     from pbix_mcp.formats.vertipaq_encoder import (
         _align_bit_width,
         encode_nosplit_idf,
@@ -3675,7 +3739,7 @@ def _modify_metadata_and_encode(
             uh_levels = uhier["levels"]
 
             if uh_table_name not in table_id_map:
-                warnings.warn(f"Hierarchy '{uh_name}': table '{uh_table_name}' not found, skipping")
+                _skip_hierarchy(uh_table_name, f"Hierarchy '{uh_name}': table '{uh_table_name}' not found, skipping")
                 continue
 
             parent_table_id = table_id_map[uh_table_name]
@@ -3691,11 +3755,11 @@ def _modify_metadata_and_encode(
             for lspec in uh_levels:
                 col_name = lspec["column"]
                 if col_name not in tdef_col_names:
-                    warnings.warn(f"Hierarchy '{uh_name}': column '{col_name}' not found in '{uh_table_name}', skipping hierarchy")
+                    _skip_hierarchy(uh_table_name, f"Hierarchy '{uh_name}': column '{col_name}' not found in '{uh_table_name}', skipping hierarchy")
                     break
                 col_id = column_id_map.get(uh_table_name, {}).get(col_name)
                 if col_id is None:
-                    warnings.warn(f"Hierarchy '{uh_name}': column '{col_name}' ID not found, skipping hierarchy")
+                    _skip_hierarchy(uh_table_name, f"Hierarchy '{uh_name}': column '{col_name}' ID not found, skipping hierarchy")
                     break
                 level_col_ids.append(col_id)
                 level_col_names.append(col_name)

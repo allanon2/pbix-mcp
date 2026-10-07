@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.108] - 2026-10-07
+
+### Fixed — build warnings never reached an MCP caller (issue #75)
+
+- **The builder reports every non-critical pre-build issue through Python's
+  `warnings` module, which an MCP caller never sees.** So `pbix_create`,
+  `pbix_set_table_data`, `pbix_update_table_rows`, `pbix_append_table_rows`
+  and every other rebuild-path tool answered `success: true, warnings: []`
+  while:
+  - folding values that differ only by case onto one spelling (#43) — so
+    0.9.105's "the fold is no longer silent" held only for Python-API
+    callers;
+  - dropping a row field that is not a column (and when it was a misspelt
+    column name, leaving that column blank);
+  - skipping a user hierarchy whose level column the edit had removed;
+  - building a relationship between columns of different types, or with
+    orphan keys.
+- The builder now records each warning with its kind and the tables it
+  concerns (`PBIXBuilder.build_warnings`). `pbix_create`, the rebuild path
+  behind every data-changing tool, and TMDL import (`pbix_import_tmdl`,
+  `pbix_open_pbip`) forward them into the response's `warnings`. Python
+  callers still get the same `UserWarning`s.
+- A rebuild re-checks the whole model, so it forwards only the warnings about
+  tables the call touched: a standing condition elsewhere (an orphan key, an
+  empty table) is not repeated on every unrelated edit. TMDL import still
+  leaves out its expected empty-table warnings.
+- The unknown-field warning is one line per **table** (rows affected, the
+  fields, the first row) instead of one per row — a systematic typo across a
+  100k-row load used to emit 100k warnings. The orphan-key warning gives a
+  count and at most 10 examples instead of printing the whole set.
+- Pinned by `tests/test_issue75_build_warnings_reach_mcp.py` (18 tests): 16
+  fail on 0.9.107; the 2 that pass are controls (a measures-only table stays
+  quiet; Python callers keep their `UserWarning`).
+
 ## [0.9.107] - 2026-10-07
 
 ### Fixed — `outline` was written where Power BI never reads it (issue #74)

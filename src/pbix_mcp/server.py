@@ -2777,6 +2777,9 @@ def pbix_create(
 
         # Auto-open the created file
         result = pbix_open(abs_path, alias)
+        # After pbix_open, whose own response drains the pending channel:
+        # the build warnings belong to THIS response (issue #75).
+        _forward_build_warnings(builder)
         return ToolResponse.ok(f"Created '{abs_path}' ({size:,} bytes) and opened it.\n{result}").to_text()
 
     except PBIXMCPError as e:
@@ -9632,6 +9635,30 @@ def _restore_carryable_metadata(dm_path: str, snap: dict) -> list[str]:
     return out
 
 
+def _forward_build_warnings(builder, touched: set | None = None,
+                            skip_kinds: tuple = ()) -> None:
+    """Hand the builder's warnings to this call's response (issue #75).
+
+    The builder reports through Python's `warnings` module, which an MCP
+    caller never sees — so case-folded values (#43) and row fields that are
+    not columns read as plain success, `warnings: []`. This forwards them
+    into the shared pending channel the response drains.
+
+    ``touched`` scopes a REBUILD to the tables this call changed: a rebuild
+    re-checks the whole model, and a standing condition of a table the call
+    never touched (an orphan key, an empty table) would otherwise repeat on
+    every unrelated edit. ``None`` means the call supplied the whole model
+    (pbix_create), so everything it raised is about the caller's input.
+    """
+    for w in getattr(builder, "build_warnings", None) or []:
+        if w.get("kind") in skip_kinds:
+            continue
+        about = set(w.get("tables") or ())
+        if touched is not None and about and not (about & touched):
+            continue
+        _responses.add_pending_warning(w["message"])
+
+
 def _rebuild_datamodel(
     info: dict,
     table_updates: dict[str, dict] | None = None,
@@ -9643,6 +9670,7 @@ def _rebuild_datamodel(
     calc_authoring: bool = False,
     restamp_calc_tables: set[str] | None = None,
     lost_report: list[str] | None = None,
+    caller_tables: set[str] | None = None,
 ) -> tuple[int, int]:
     """Rebuild the entire DataModel using the builder pipeline.
 
@@ -9657,6 +9685,10 @@ def _rebuild_datamodel(
         extra_relationships: New rels: [{"from_table", "from_column", "to_table", "to_column"}, ...]
         remove_tables: Set of table names to exclude from rebuild
         remove_relationships: List of (from_table, from_col, to_table, to_col) to exclude
+        caller_tables: the tables whose data the CALLER supplied, when
+            ``table_updates`` also carries re-materialized calc tables;
+            defaults to ``table_updates``' keys. Build warnings about other
+            tables are not forwarded (see _forward_build_warnings).
 
     Returns (old_dm_size, new_dm_size).
     """
@@ -10048,6 +10080,13 @@ def _rebuild_datamodel(
             builder.add_user_hierarchy(uh["table"], uh["name"], uh["levels"])
 
     new_pbix = builder.build()
+    # Warnings about what THIS call supplied or changed reach the response.
+    touched = set(caller_tables if caller_tables is not None
+                  else table_updates)
+    touched |= {et["name"] for et in extra_tables}
+    for er in extra_relationships:
+        touched |= {t for t in (er.get("from_table"), er.get("to_table")) if t}
+    _forward_build_warnings(builder, touched=touched)
 
     # Extract new DataModel from builder output
     import io
@@ -12948,6 +12987,8 @@ def _rebuild_preserving_calc(alias: str, info: dict, **rebuild_kwargs):
     old_size, new_size = _rebuild_datamodel(
         info, table_updates=merged, calc_authoring=True,
         restamp_calc_tables={s["table"] for s in table_restamp},
+        # warnings are about the caller's tables, not the re-materialized ones
+        caller_tables=set(caller_updates),
         **rebuild_kwargs)
     # TABLE metadata first, then COLUMN metadata. An auto-date table is both a
     # calculated table AND the owner of calculated columns; stamping the table
@@ -19488,7 +19529,7 @@ def _build_pbix_from_tmdl_model(model: dict, output_path: str) -> dict:
     from pbix_mcp.builder import PBIXBuilder
 
     b = PBIXBuilder(model.get("name") or "Model")
-    stats = {"tables": 0, "columns": 0, "measures": 0,
+    stats: dict[str, Any] = {"tables": 0, "columns": 0, "measures": 0,
              "relationships": 0, "roles": len(model.get("roles") or []),
              "hierarchies": 0, "expressions": len(model.get("expressions") or [])}
     for t in model["tables"]:
@@ -19527,6 +19568,11 @@ def _build_pbix_from_tmdl_model(model: dict, output_path: str) -> dict:
         # Schema-only import: every table is legitimately empty.
         _warnings.simplefilter("ignore", UserWarning)
         b.save(output_path)
+    # ...but nothing ELSE the build found may vanish with that filter (#75).
+    # Returned rather than forwarded here: pbix_import_tmdl then opens the
+    # file through pbix_open, whose response would drain them first.
+    stats["build_warnings"] = [w for w in b.build_warnings
+                               if w.get("kind") != "empty_table"]
 
     # Full-fidelity post-pass on the saved file's DataModel.
     tmp_dir = tempfile.mkdtemp(prefix="pbix_tmdl_import_")
@@ -19604,6 +19650,8 @@ def pbix_import_tmdl(tmdl_path: str, output_path: str = "", alias: str = "") -> 
                     "IMPORT_OPEN_FAILED").to_text()
             opened_note = f"\nOpened as alias '{alias}'."
 
+        for _w in stats.get("build_warnings") or []:
+            _responses.add_pending_warning(_w["message"])
         return ToolResponse.ok(
             f"TMDL imported to: {output_path}\n"
             f"  Tables: {stats['tables']} ({stats['columns']} columns)\n"
@@ -19767,6 +19815,8 @@ def pbix_open_pbip(path: str, alias: str = "") -> str:
             "pbip_dir": root,
             "pbip_base": base_name,
         }
+        for _w in stats.get("build_warnings") or []:
+            _responses.add_pending_warning(_w["message"])
         return ToolResponse.ok(
             f"Opened PBIP project '{root}' as '{alias}'\n"
             f"  Model: {stats['tables']} tables, {stats['measures']} measures, "
