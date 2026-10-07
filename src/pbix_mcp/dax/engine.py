@@ -292,7 +292,9 @@ _FMT_RUN_RE = re.compile(r'[#0][#0,.]*')
 # FORMAT's named formats, as the ones Power BI itself generates.
 _NAMED_FORMATS = {
     'general number': '',
-    'currency': '$#,##0.00',
+    # en-US, as every entry here: Desktop 2.157 renders FORMAT(-0.4, "Currency") as
+    # "($0.40)" in an en-US model, so the negative section is parenthesised.
+    'currency': '$#,##0.00;($#,##0.00)',
     'fixed': '0.00',
     'standard': '#,##0.00',
     'percent': '0.00%',
@@ -462,6 +464,15 @@ def _format_number(val: float, fmt: str, group_sep: str = ",",
     #   FORMAT(0.125,  "0.00")  -> 0.13    (banker's would give 0.12)
     rounded = decimal.Decimal(repr(abs(val))).quantize(
         decimal.Decimal(1).scaleb(-max_dec), rounding=decimal.ROUND_HALF_UP)
+    if not rounded and val:
+        # A value that ROUNDS to zero is formatted as zero: no sign, no negative
+        # section, and the zero section when there is one. Desktop 2.157:
+        #   FORMAT(-0.004, "$#,##0")                  -> "$0"   (not "-$0")
+        #   FORMAT(-0.004, "$#,##0;($#,##0)")         -> "$0"   (not "($0)")
+        #   FORMAT(-0.004, "$#,##0;($#,##0);\"zero\"")  -> "zero"
+        #   FORMAT( 0.004, "$#,##0;($#,##0);\"zero\"")  -> "zero"
+        #   FORMAT(-0.004, "0.0%")                    -> "-0.4%" (does not round to zero)
+        return _format_number(0.0, fmt, group_sep, dec_sep)
     body = f"{rounded:,.{max_dec}f}" if grouping else f"{rounded:.{max_dec}f}"
     int_part, _d, dec_part = body.partition('.')
     # `#` decimals are optional: drop trailing zeros down to the required count.
