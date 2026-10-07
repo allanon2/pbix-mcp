@@ -375,6 +375,25 @@ def _read_datamashup_m_code(work_dir: str) -> str | None:
     with open(dm_path, "rb") as f:
         data = f.read()
 
+    # MS-QDEFF: Version (u32) | PackagePartsLength (u32) | PackageParts (a zip holding
+    # Formulas/Section1.m) | Permissions | Metadata | PermissionBindings. Read the package
+    # parts by their length prefix: the Metadata part ends with its own content zip, which can
+    # be an EMPTY zip (a bare end-of-central-directory record), and scanning for the LAST
+    # EOCD landed on that one -- the archive read as [] and no M was returned
+    # (2018 Fuzzy Matching demo .pbix, COVID-19 US Tracking .pbit, both Microsoft MIT samples).
+    if len(data) >= 8:
+        version, parts_len = struct.unpack_from("<II", data, 0)
+        if version == 0 and 0 < parts_len <= len(data) - 8:
+            parts = data[8:8 + parts_len]
+            if parts.startswith(b"PK\x03\x04"):
+                try:
+                    with zipfile.ZipFile(io.BytesIO(parts), "r") as inner_zf:
+                        for candidate in ("Formulas/Section1.m", "formulas/Section1.m", "Section1.m"):
+                            if candidate in inner_zf.namelist():
+                                return inner_zf.read(candidate).decode("utf-8-sig")
+                except zipfile.BadZipFile:
+                    pass   # fall back to the signature scan below
+
     # Find the inner ZIP (PK\x03\x04 signature)
     pk_offset = data.find(b"PK\x03\x04")
     if pk_offset == -1:
