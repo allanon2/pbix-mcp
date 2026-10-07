@@ -2692,6 +2692,7 @@ class DAXEngine:
             # ALL under a grouped query (issues #25 r23#2 / #26 r24).
             self._query_filters = dict(ctx.filter_context)
             self._group_keys = set(getattr(ctx, 'group_keys', ()) or ())
+            self._date_tables = dict(getattr(ctx, 'date_tables', None) or {})
             self._selected_base = getattr(ctx, 'selected_filters', None)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
@@ -4155,8 +4156,17 @@ class DAXEngine:
         applied_here: dict = {}
 
         # Process filter arguments
+        # Keys written by KEEPFILTERS(...) arguments: they intersect, so they do not trigger
+        # the marked-date-table rule below (Desktop keeps the table's other filters there).
+        keep_keys: set = set()
+        _kf_before = None
         for i in range(1, len(args)):
+            if _kf_before is not None:
+                keep_keys |= self._written_keys(_kf_before, new_ctx)
+                _kf_before = None
             filter_arg = args[i].strip()
+            if filter_arg.upper().startswith('KEEPFILTERS'):
+                _kf_before = new_ctx
 
             # REMOVEFILTERS / ALL
             if filter_arg.upper().startswith('REMOVEFILTERS') or filter_arg.upper().startswith('ALL'):
@@ -4451,6 +4461,16 @@ class DAXEngine:
                         # Single-column row set (ALL(T[Col]), VALUES): replaces
                         # the filter on that ONE column, and a filter reaching
                         # the table through a relationship still applies.
+                        if filter_arg.upper().startswith('KEEPFILTERS'):
+                            # KEEPFILTERS(FILTER(...)) INTERSECTS the outer filter on
+                            # the column, as it does for a predicate. Desktop 2.157,
+                            # grouped by the date itself: CALCULATE(COUNTROWS(F),
+                            # KEEPFILTERS(FILTER(ALL(D[Date]), D[Date] <= MAX(D[Date]))))
+                            # is that day's count, not the running total.
+                            for key, vals in list(groups.items()):
+                                outer = ctx.filter_context.get(key)
+                                if outer is not None:
+                                    groups[key] = {"all": [outer, vals]}
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 
@@ -4486,6 +4506,10 @@ class DAXEngine:
                     new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
                 continue
 
+        if _kf_before is not None:
+            keep_keys |= self._written_keys(_kf_before, new_ctx)
+        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx, keep_keys)
+
         # CALCULATE performs the row->filter context transition: inside its
         # expression the iteration row's filters are real filters, plain
         # aggregates must NOT step back to the pre-transition outer context, and
@@ -4501,6 +4525,49 @@ class DAXEngine:
         finally:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
+
+    @staticmethod
+    def _written_keys(before: DAXContext, after: DAXContext) -> set:
+        """filter_context keys `after` set that `before` did not have as the same object."""
+        b, a = before.filter_context, after.filter_context
+        return {k for k, v in a.items() if k not in b or b[k] is not v}
+
+    def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
+                                        keep_keys: set = frozenset()) -> DAXContext:
+        """A filter on a MARKED date table's date column removes the table's
+        other filters.
+
+        When a table is marked as a date table, Desktop adds ALL(table) to a
+        CALCULATE that filters its date column. Measured on Power BI Desktop
+        2.157 (Microsoft's MIT Corporate Spend sample, 'Date' marked): the
+        running total CALCULATE(SUM(..), FILTER(ALL('Date'[Date]), 'Date'[Date]
+        <= MAX('Date'[Date]))) under Year x Period is the cumulative value, not
+        the period's; CALCULATE(SUM(..), 'Date'[Date] <= DATE(2014, 6, 30)) under
+        Year is the same for every year. Filters this CALCULATE wrote itself are
+        kept. A date filter inside KEEPFILTERS does not trigger it: Desktop gives
+        CALCULATE(e, KEEPFILTERS('Date'[Date] <= x)) under Year x Period the
+        period's own value (the Period filter stays), measured on the same
+        sample and on a daily marked table (Revenue Opportunities).
+
+        "Written here" is identity: with_filters copies the outer dict, so a
+        filter this CALCULATE did not touch is the same object as outside.
+        """
+        marked = getattr(self, '_date_tables', None)
+        if not marked:
+            return new_ctx
+        before, after = outer.filter_context, new_ctx.filter_context
+        written = {k for k, v in after.items() if k not in before or before[k] is not v}
+        drop = set()
+        triggers = written - set(keep_keys)
+        for table, date_col in marked.items():
+            if not date_col:
+                continue
+            key = f"{table}.{date_col}"
+            value = after.get(key)
+            if key not in triggers or (isinstance(value, dict) and 'all' in value):
+                continue
+            drop |= {k for k in after if k.split('.', 1)[0] == table and k not in written}
+        return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
@@ -11324,8 +11391,13 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             simulate_row_context: bool = True,
                             measure_tables: dict | None = None,
                             model_columns: dict | None = None,
-                            culture: str | None = None) -> dict:
+                            culture: str | None = None,
+                            date_tables: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
+
+    ``date_tables`` maps each table MARKED as a date table to its date column
+    (ModelReader.date_tables): a CALCULATE filter on that column removes the
+    table's other filters, as Desktop does.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
     parameter table, this tries evaluating with each possible value to find
@@ -11341,6 +11413,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     does so unless the caller opts in.
     """
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    ctx.date_tables = date_tables or {}
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
