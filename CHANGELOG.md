@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.110] - 2026-10-07
+
+### Fixed — DAX engine: four contributed fixes (PRs #69, #70, #71, #73, by @allanon2)
+
+Each was verified against Power BI Desktop (2.152, queried over ADOMD) on a
+review model with marked, unmarked, sparse and relationship-joined date
+tables. Across 4,896 cells evaluated through `pbix_evaluate_dax`, the four
+together fix **717 cells that differed from Desktop and change no cell that
+matched**.
+
+- **`FORMAT` rounds before it picks the sign and the section (PR #70).** A
+  value that rounds to zero under the picture prints as zero — no `-`, no
+  negative section, and the zero section when there is one:
+  `FORMAT(-0.004, "$#,##0")` is `$0`, not `-$0`. The named `Currency` format
+  parenthesises negatives in an en-US model: `FORMAT(-0.4, "Currency")` is
+  `($0.40)`. All 30 FORMAT cases in the review match Desktop (12 differed).
+- **A filter on a marked date table's date column clears the table's other
+  filters (PR #73).** `ModelReader.date_tables` reads the marking
+  (`DataCategory = 'Time'`; the key column, else the only DateTime column).
+  Inside `CALCULATE`, a filter on that column drops the table's other filters,
+  as Desktop does. This covers the classic running total
+  `FILTER(ALL('Date'[Date]), 'Date'[Date] <= MAX('Date'[Date]))` and
+  `'Date'[Date] <= DATE(…)` under a Year × Month axis. `KEEPFILTERS` still
+  intersects. 615 cells fixed.
+- **`ISINSCOPE` answers from the query's grouping (PR #69).**
+  `pbix_evaluate_dax` takes an optional `group_by` — the `filter_context` keys
+  that are the visual's grouping. ISINSCOPE is TRUE for those, and FALSE for a
+  column that is only filtered, or whose filter a `CALCULATE` replaced or
+  removed, matching Desktop in every case measured. A context transition
+  inside an iterator is not modelled yet.
+- **`ALLSELECTED` restores a slicer on the grouped column (PR #71).**
+  `pbix_evaluate_dax` takes an optional `selected_filter_context` — the
+  query's own filters before the grouping keys were merged in — so
+  `ALLSELECTED(column)` returns the selected values' total instead of every
+  value's.
+
+Merge note: #73 and #69/#71 each added a keyword to `evaluate_measures_smart`,
+resolved by keeping all three (`group_by`, `selected_filters`,
+`date_tables`). Three new mypy errors from the merge were fixed, so mypy stays
+at 135.
+
+### Known gaps — tracked
+
+- **#78** — Desktop clears a date table's other filters for a **marked date
+  table or a DateTime column used in a relationship**, and nowhere else. The
+  engine still clears them unconditionally in `CALCULATE` with a
+  time-intelligence filter, and never in `TOTALxTD`, `STARTOF*` / `ENDOF*` or
+  the balances. PRs #68 and #72 were sent back to use exactly that rule; with
+  it, all 4,896 review cells match Desktop.
+- **#79** — `pbix_evaluate_dax_grouped` does not yet receive the marked-table
+  information (#73) or the grouping tags (#69).
+
 ## [0.9.109] - 2026-10-07
 
 ### Fixed — `report_filter_json` wrote schema-invalid bookmarks that never filtered (issue #76, from #52)

@@ -1435,6 +1435,9 @@ class DAXContext:
         # `Cat IN (A,B)` grouped by Cat becomes `Cat=[A]`, and the slicer
         # selection is unrecoverable from the merged dict (r24#2's 180-vs-60).
         self.selected_filters: dict | None = None
+        # Tables MARKED as date tables, {table: date column} (PR #73): read
+        # once per evaluation into DAXEngine._date_tables.
+        self.date_tables: dict = {}
         # Tables an enclosing ALL(Table)/REMOVEFILTERS(Table) made immune to
         # cross-table filter propagation (see _get_cross_table_filters).
         self._no_propagate: set = set()
@@ -4563,7 +4566,7 @@ class DAXEngine:
         return {k for k, v in a.items() if k not in b or b[k] is not v}
 
     def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
-                                        keep_keys: set = frozenset()) -> DAXContext:
+                                        keep_keys: set | frozenset = frozenset()) -> DAXContext:
         """A filter on a MARKED date table's date column removes the table's
         other filters.
 
@@ -11478,7 +11481,7 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     if group_by:
         ctx.group_keys = set(group_by)
         ctx.selected_filters = (dict(selected_filters) if selected_filters is not None else
-                                {key: v for key, v in filter_context.items() if key not in group_by})
+                                {key: v for key, v in (filter_context or {}).items() if key not in group_by})
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
