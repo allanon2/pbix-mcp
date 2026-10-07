@@ -13451,6 +13451,7 @@ def pbix_evaluate_dax(
     filter_context: str = "",
     apply_default_filters: bool = True,
     page_index: int = -1,
+    group_by: str = "",
 ) -> str:
     """Evaluate one or more DAX measures against the data model.
 
@@ -13476,6 +13477,11 @@ def pbix_evaluate_dax(
             slicers — the service scopes a slicer's default selection to its
             own page, so pass the page a visual lives on to reproduce the
             number that visual shows in the service.
+        group_by: Optional JSON array of filter_context keys that are the
+            query's GROUPING rather than filters, e.g. '["dim-Geo.State"]' when
+            evaluating one row of a visual grouped by State. ISINSCOPE answers
+            TRUE only for these (Desktop: a filtered-but-not-grouped column is
+            not in scope). Every key must also be in filter_context.
     """
     try:
         info = _ensure_open(alias)
@@ -13515,13 +13521,31 @@ def pbix_evaluate_dax(
         # Desktop's own engine does. The fallback that guesses a parameter-table
         # selection when a measure is BLANK produced numbers Desktop never shows
         # at the grand total (see evaluate_measures_smart).
+        group_keys: set = set()
+        if group_by:
+            try:
+                parsed_gb = json.loads(group_by)
+            except (json.JSONDecodeError, TypeError):
+                parsed_gb = None
+            if not isinstance(parsed_gb, list) or not all(isinstance(k, str) for k in parsed_gb):
+                return ToolResponse.error(
+                    "group_by must be a JSON array of 'Table.Column' filter_context keys",
+                    "INVALID_INPUT").to_text()
+            missing = [k for k in parsed_gb if k not in (fc or {})]
+            if missing:
+                return ToolResponse.error(
+                    f"group_by keys must also be in filter_context: {missing}",
+                    "INVALID_INPUT").to_text()
+            group_keys = set(parsed_gb)
+
         results = dax_engine.evaluate_measures_smart(
             measure_names, ctx['tables'], ctx['measure_defs'],
             fc, ctx['date_table'], ctx['date_column'],
             ctx.get('relationships'), simulate_row_context=False,
             measure_tables=ctx.get('measure_tables'),
             model_columns=ctx.get('model_columns'),
-            culture=ctx.get('culture')
+            culture=ctx.get('culture'),
+            group_by=group_keys or None,
         )
 
         # Build structured response with DAXResult objects
