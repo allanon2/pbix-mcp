@@ -40,9 +40,11 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-07 (0.9.114): docs 1-45 and GitHub issues #1-#88 are closed;
-the issue queue is empty.** 0.9.114 adds #87 (CALCULATE applies its modifiers
-before its filter arguments) and #88 (a deterministic row-context simulation).
+**Updated 2026-10-07 (0.9.115): docs 1-45 and GitHub issues/PRs #1-#91 are
+closed; the queues are empty.** 0.9.114 adds #87 (CALCULATE applies its
+modifiers before its filter arguments) and #88 (a deterministic row-context
+simulation); 0.9.115 merges PRs #89 (bare [Column] in the grouped tools) and
+#90 (DataMashup reader) by @allanon2, and fixes #91 (DataMashup writer).
 
 - #77 (PR, @allanon2) -- ISINSCOPE through a context transition -- 0.9.111;
 - #78, #79, #80 -- the marked-date-table rule, the grouped tool, KEEPFILTERS
@@ -224,6 +226,18 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #91** -- CLOSED (0.9.115). pbix_set_m_code returned success but left
+  the DataMashup unparseable when its MS-QDEFF Metadata ends with a content zip
+  (Microsoft's 2018 Fuzzy Matching demo, COVID-19 US Tracking template). It now
+  rewrites only the PackageParts and their length; Desktop opens the edited
+  sample and shows the edit. Regression: tests/test_issue91_datamashup_writer.py.
+- **PR #90** -- MERGED (0.9.115, @allanon2). pbix_get_m_code read the wrong
+  archive on those same files; now reads PackageParts by their length prefix.
+  Regression: tests/test_datamashup_package_parts.py.
+- **PR #89** -- MERGED (0.9.115, @allanon2). The grouped and per-dimension
+  tools answered None for every measure with a bare [Column]; they now pass the
+  measures' home tables (Desktop-verified). Regression:
+  tests/test_batch_measure_home_tables.py.
 - **GH #88** -- CLOSED (0.9.114). evaluate_measures_smart's row-context
   simulation tried `list(set(values))[0]`, whose order follows the hash seed:
   the answer changed between runs. Now the first value in data order.

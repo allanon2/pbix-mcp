@@ -5,6 +5,72 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.115] - 2026-10-07
+
+### Fixed — the grouped and per-dimension tools resolve a bare `[Column]` through the measure's home table (PR #89, by @allanon2)
+
+- **What was wrong:** `pbix_evaluate_dax_grouped` and
+  `pbix_evaluate_dax_per_dimension` evaluate through `evaluate_measures_batch`,
+  which never received the measures' home tables. So a measure with an
+  unqualified column (`AVERAGE([Revenue])`) came back **None in every group**,
+  with `success: true`, while `pbix_evaluate_dax` resolved it.
+- **The fix:** `evaluate_measures_batch` now takes `measure_tables` and
+  `model_columns`, and both tools pass them.
+- **Verified in Power BI Desktop** (2.152, ADOMD) on a model where three tables
+  own a `Revenue` column. Both tools now return Desktop's values: N 20 / 1000 /
+  5 / 50, S 20 / 2000 / 5 / 100.
+- **Review additions:** a test through both tools themselves (the PR's tests
+  call the engine function), and aligned indentation at the composite
+  `group_by` call.
+
+### Fixed — `pbix_get_m_code` reads the DataMashup PackageParts by their length prefix (PR #90, by @allanon2)
+
+- **What was wrong:** the reader scanned to the **last**
+  end-of-central-directory record. When the MS-QDEFF Metadata ends with its
+  own content zip, that record belongs to the wrong archive, and the reader
+  returned `[No Section1.m found. Archive contains: []]`.
+- **The fix:** it now reads `PackageParts` by the length prefix the MS-QDEFF
+  specification defines.
+- **Verified on Microsoft's own samples:** the 2018 Fuzzy Matching demo `.pbix`
+  and the COVID-19 US Tracking `.pbit`, downloaded from
+  microsoft/powerbi-desktop-samples at the commits that added them, with their
+  bytes matching the repository's git blob hashes. Both now return their M. A
+  Metadata that ends with a *non-empty* zip, where the old scan read the wrong
+  archive's entries, reads correctly too.
+
+### Fixed — `pbix_set_m_code` rewrites only the PackageParts (issue #91)
+
+- **What was wrong:** the writer had the same last-record scan, and it was
+  destructive. On both samples above it returned success and left a
+  DataMashup that no longer parsed: all queries, Permissions and Metadata
+  gone. On a synthetic part with an empty content zip it shrank the part from
+  378 to 34 bytes and left the length field stale.
+- **The fix:** the writer now replaces only the `PackageParts` zip and its
+  length. Permissions, Metadata and PermissionBindings stay byte-identical,
+  and every package entry keeps its name, timestamp and compression. The old
+  scan remains only for a part without the MS-QDEFF prefix. Reader and writer
+  share one locator, `_datamashup_package_parts`.
+- **A package with no `Section1.m`** is now reported as a failure. Before, the
+  writer reported success without writing anything.
+- **Verified in Power BI Desktop 2.152:** the Fuzzy Matching demo edited
+  through `pbix_set_m_code` (`People` gains `Table.FirstN(…, 5)`) opens, and
+  its Power Query editor shows the added step with a 5-row preview.
+- **Pending changes, not data:** the model keeps its last-applied query until
+  the edit is applied, as with any Power Query edit. The DataMashup records
+  each query's last-applied M (`LastAnalysisServicesFormulaText`), and the
+  writer deliberately does not rewrite it.
+
+- **Pinned by 10 tests; 8 fail on 0.9.114:**
+
+  | test file | tests | fail on 0.9.114 |
+  |---|---|---|
+  | `tests/test_batch_measure_home_tables.py` | 3 | 3 |
+  | `tests/test_datamashup_package_parts.py` | 2 | 1 |
+  | `tests/test_issue91_datamashup_writer.py` | 5 | 4 |
+
+  The two that pass on 0.9.114 are controls: a part with no metadata content,
+  and one without the MS-QDEFF prefix.
+
 ## [0.9.114] - 2026-10-07
 
 ### Fixed — CALCULATE applies its modifiers before its filter arguments (issue #87)

@@ -361,6 +361,27 @@ def _write_json_component(work_dir: str, rel_path: str, data: Any) -> None:
         f.write(text.encode(enc))
 
 
+def _datamashup_package_parts(data: bytes) -> tuple[int, int] | None:
+    """(start, end) of the PackageParts zip in a DataMashup part, or None.
+
+    MS-QDEFF lays the part out as Version (u32) | PackagePartsLength (u32) |
+    PackageParts (a zip holding Formulas/Section1.m) | Permissions | Metadata
+    | PermissionBindings. The Metadata ends with its own content zip -- on
+    Microsoft's 2018 Fuzzy Matching demo and COVID-19 US Tracking template an
+    EMPTY one -- so scanning for the last end-of-central-directory record finds
+    the wrong archive (#90, #91). None when the prefix is implausible; callers
+    then fall back to the signature scan.
+    """
+    if len(data) < 8:
+        return None
+    version, parts_len = struct.unpack_from("<II", data, 0)
+    if version != 0 or not 0 < parts_len <= len(data) - 8:
+        return None
+    if not data.startswith(b"PK\x03\x04", 8):
+        return None
+    return 8, 8 + parts_len
+
+
 def _read_datamashup_m_code(work_dir: str) -> str | None:
     """Extract M code from the DataMashup binary.
 
@@ -375,24 +396,19 @@ def _read_datamashup_m_code(work_dir: str) -> str | None:
     with open(dm_path, "rb") as f:
         data = f.read()
 
-    # MS-QDEFF: Version (u32) | PackagePartsLength (u32) | PackageParts (a zip holding
-    # Formulas/Section1.m) | Permissions | Metadata | PermissionBindings. Read the package
-    # parts by their length prefix: the Metadata part ends with its own content zip, which can
-    # be an EMPTY zip (a bare end-of-central-directory record), and scanning for the LAST
-    # EOCD landed on that one -- the archive read as [] and no M was returned
-    # (2018 Fuzzy Matching demo .pbix, COVID-19 US Tracking .pbit, both Microsoft MIT samples).
-    if len(data) >= 8:
-        version, parts_len = struct.unpack_from("<II", data, 0)
-        if version == 0 and 0 < parts_len <= len(data) - 8:
-            parts = data[8:8 + parts_len]
-            if parts.startswith(b"PK\x03\x04"):
-                try:
-                    with zipfile.ZipFile(io.BytesIO(parts), "r") as inner_zf:
-                        for candidate in ("Formulas/Section1.m", "formulas/Section1.m", "Section1.m"):
-                            if candidate in inner_zf.namelist():
-                                return inner_zf.read(candidate).decode("utf-8-sig")
-                except zipfile.BadZipFile:
-                    pass   # fall back to the signature scan below
+    # Read the PackageParts by their length prefix (#90): the Metadata part
+    # ends with its own content zip, which can be EMPTY, and scanning for the
+    # LAST end-of-central-directory record landed on that one -- the archive
+    # read as [] and no M was returned.
+    span = _datamashup_package_parts(data)
+    if span is not None:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data[span[0]:span[1]]), "r") as inner_zf:
+                for candidate in ("Formulas/Section1.m", "formulas/Section1.m", "Section1.m"):
+                    if candidate in inner_zf.namelist():
+                        return inner_zf.read(candidate).decode("utf-8-sig")
+        except zipfile.BadZipFile:
+            pass   # fall back to the signature scan below
 
     # Find the inner ZIP (PK\x03\x04 signature)
     pk_offset = data.find(b"PK\x03\x04")
@@ -439,6 +455,25 @@ def _write_datamashup_m_code(work_dir: str, new_m_code: str) -> bool:
     with open(dm_path, "rb") as f:
         data = f.read()
 
+    # Rewrite ONLY the PackageParts and its length prefix (#91). The scan
+    # below spans from the first zip to the LAST end-of-central-directory
+    # record, which on a part whose Metadata ends with a content zip covers
+    # Permissions and Metadata too and opens the metadata's zip: it returned
+    # True and left the DataMashup unparseable (Microsoft's 2018 Fuzzy
+    # Matching demo, the COVID-19 US Tracking template).
+    span = _datamashup_package_parts(data)
+    if span is not None:
+        start, end = span
+        new_parts = _rebuild_package_parts(data[start:end], new_m_code)
+        if new_parts is None:
+            return False
+        new_data = (data[:4] + struct.pack("<I", len(new_parts)) + new_parts
+                    + data[end:])
+        with open(dm_path, "wb") as f:
+            f.write(new_data)
+        return True
+
+    # Not laid out as MS-QDEFF: the signature scan, as before.
     pk_offset = data.find(b"PK\x03\x04")
     if pk_offset == -1:
         return False
@@ -487,6 +522,32 @@ def _write_datamashup_m_code(work_dir: str, new_m_code: str) -> bool:
         f.write(new_data)
 
     return True
+
+
+def _rebuild_package_parts(old_zip: bytes, new_m_code: str) -> bytes | None:
+    """The PackageParts zip with Section1.m replaced, or None if it does not
+    open or holds no Section1.m (nothing to replace is a failure, not a silent
+    success). Every other entry is copied byte for byte, and each entry keeps
+    its name, timestamp and compression -- Desktop writes Section1.m deflated,
+    as UTF-8 without a BOM."""
+    buf = io.BytesIO()
+    replaced = False
+    try:
+        with zipfile.ZipFile(io.BytesIO(old_zip), "r") as old_zf, \
+                zipfile.ZipFile(buf, "w") as new_zf:
+            for info in old_zf.infolist():
+                if info.filename.endswith("Section1.m"):
+                    payload = new_m_code.encode("utf-8")
+                    replaced = True
+                else:
+                    payload = old_zf.read(info.filename)
+                entry = zipfile.ZipInfo(info.filename, date_time=info.date_time)
+                entry.compress_type = info.compress_type
+                entry.external_attr = info.external_attr
+                new_zf.writestr(entry, payload)
+    except zipfile.BadZipFile:
+        return None
+    return buf.getvalue() if replaced else None
 
 
 def _detect_encoding(file_path: str) -> str:
@@ -14505,8 +14566,8 @@ def pbix_evaluate_dax_grouped(
                     ctx['date_table'], ctx['date_column'], rels,
                     group_keys={k[0] for k in keys}, selected_filters=base_fc,
                     date_tables=ctx.get('date_tables'),
-                        measure_tables=ctx.get('measure_tables'),
-                        model_columns=ctx.get('model_columns'))
+                    measure_tables=ctx.get('measure_tables'),
+                    model_columns=ctx.get('model_columns'))
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},
                     "values": {m: vals.get(m) for m in measure_names},
