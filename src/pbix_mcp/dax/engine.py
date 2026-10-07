@@ -10518,54 +10518,55 @@ class DAXEngine:
         qtd = [d for d in all_dates if quarter_start <= d <= max_date]
         return self._make_date_table_result(table_name, col_name, qtd)
 
+    def _total_over_dates(self, expr: str, dates: Any, ctx: DAXContext) -> Any:
+        """Evaluate ``expr`` with ``dates`` (a DATESYTD/QTD/MTD result) as the
+        filter on its date column.
+
+        TOTALYTD(e, d) is CALCULATE(e, DATESYTD(d)) (Microsoft's DAX
+        reference), so the dates REPLACE every existing filter on the date
+        table, exactly as the CALCULATE branch does for a time-intelligence
+        filter argument. Merging them instead (ctx.with_filters) kept a
+        Year/Month/Period filter alive, and TOTALYTD under a Year x Period
+        axis returned the period's own value: on Corporate Spend
+        (``[Amount] := TOTALYTD(SUM([Value]), 'Date'[Date]) * .3``, 'Date'
+        marked as a date table) Desktop 2.157 shows 1,042,148,723.37 for
+        2014 / Period 10 and this returned 109,053,968.15, the October value.
+        Verified against Desktop: TOTALYTD and TOTALQTD now equal
+        CALCULATE(e, DATESYTD/DATESQTD(d)) in every cell grouped by year,
+        year x period and a non-date column x year.
+        """
+        if dates and isinstance(dates, list) and isinstance(dates[0], dict) and '__table__' in dates[0]:
+            tbl_name, col_name = dates[0]['__table__'], dates[0]['__column__']
+            new_filters = {k: v for k, v in ctx.filter_context.items()
+                           if not k.startswith(f"{tbl_name}.")}
+            new_filters[f"{tbl_name}.{col_name}"] = [item['__value__'] for item in dates]
+            new_ctx = DAXContext(ctx.tables, ctx.measures, ctx.date_table, ctx.date_column,
+                                 new_filters, ctx.relationships)
+            return self._eval_expr(expr, new_ctx)
+        return self._eval_expr(expr, ctx)
+
     def _fn_totalytd(self, args_str: str, ctx: DAXContext) -> Any:
         """TOTALYTD(expression, dates, filter, yearEndDate) — year to date total."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
         expr = args[0].strip()
-        # Get YTD dates
         ytd_dates = self._fn_datesytd(', '.join(args[1:]), ctx)
-        if not ytd_dates:
-            return self._eval_expr(expr, ctx)
-        # Apply date filter
-        if ytd_dates and isinstance(ytd_dates, list) and ytd_dates:
-            first = ytd_dates[0]
-            if isinstance(first, dict) and '__table__' in first:
-                date_values = [item['__value__'] for item in ytd_dates]
-                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
-                return self._eval_expr(expr, new_ctx)
-        return self._eval_expr(expr, ctx)
+        return self._total_over_dates(expr, ytd_dates, ctx)
 
     def _fn_totalmtd(self, args_str: str, ctx: DAXContext) -> Any:
         """TOTALMTD(expression, dates) — month to date total."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
-        expr = args[0].strip()
-        mtd_dates = self._fn_datesmtd(args[1].strip(), ctx)
-        if mtd_dates and isinstance(mtd_dates, list) and mtd_dates:
-            first = mtd_dates[0]
-            if isinstance(first, dict) and '__table__' in first:
-                date_values = [item['__value__'] for item in mtd_dates]
-                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
-                return self._eval_expr(expr, new_ctx)
-        return self._eval_expr(expr, ctx)
+        return self._total_over_dates(args[0].strip(), self._fn_datesmtd(args[1].strip(), ctx), ctx)
 
     def _fn_totalqtd(self, args_str: str, ctx: DAXContext) -> Any:
         """TOTALQTD(expression, dates) — quarter to date total."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
-        expr = args[0].strip()
-        qtd_dates = self._fn_datesqtd(args[1].strip(), ctx)
-        if qtd_dates and isinstance(qtd_dates, list) and qtd_dates:
-            first = qtd_dates[0]
-            if isinstance(first, dict) and '__table__' in first:
-                date_values = [item['__value__'] for item in qtd_dates]
-                new_ctx = ctx.with_filters({f"{first['__table__']}.{first['__column__']}": date_values})
-                return self._eval_expr(expr, new_ctx)
-        return self._eval_expr(expr, ctx)
+        return self._total_over_dates(args[0].strip(), self._fn_datesqtd(args[1].strip(), ctx), ctx)
 
     # =========================================================================
     # Time Intelligence — Period Navigation
