@@ -784,6 +784,54 @@ _FORMAT_CARDS = frozenset({
 })
 
 
+class _ConsumedKeys(dict):
+    """A dict that remembers which keys the format mapper looked at.
+
+    The mapper reads every card through ``"key" in card`` tests, so a key it
+    never tests is a key it never writes. Recording the tests lets a caller
+    be TOLD about such a key instead of reading a success message for it —
+    the class behind issues #64, #66 and #67, where a dropped property and an
+    honoured one produced the same answer.
+
+    Iterating the keys (``for k in d``, ``.keys()``, ``.items()``) consumes
+    all of them: a loop over a card's keys handles each one, as the
+    per-column ``columnFormatting`` / ``columnWidth`` cards do. ``.values()``
+    deliberately does NOT — it is a structural probe ("is this the per-column
+    form?") and says nothing about which keys were handled.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.seen: set = set()
+
+    def __contains__(self, key):
+        self.seen.add(key)
+        return super().__contains__(key)
+
+    def __getitem__(self, key):
+        self.seen.add(key)
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        self.seen.add(key)
+        return super().get(key, default)
+
+    def __iter__(self):
+        self.seen.update(dict.keys(self))
+        return super().__iter__()
+
+    def keys(self):
+        self.seen.update(dict.keys(self))
+        return super().keys()
+
+    def items(self):
+        self.seen.update(dict.keys(self))
+        return super().items()
+
+    def unconsumed(self) -> list:
+        return [k for k in dict.keys(self) if k not in self.seen]
+
+
 def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     """Convert human-readable format dict to PBI objects structures.
 
@@ -798,7 +846,17 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
     ``visual_type`` disambiguates the properties whose NAME depends on the
     target visual (issue #45: a plain card reads categoryLabels.color, a
     multi-row card reads categoryLabels.categoryLabelFontColor).
+
+    Also returns what it did NOT consume — ``_ignored_cards`` (top-level keys
+    no branch tested) and ``_ignored_props`` ({card: [keys]}) — so the caller
+    can report them rather than answer success for a dropped key (#67).
     """
+    # Track consumption on copies: the caller's own dict is left untouched.
+    if isinstance(fmt, dict):
+        fmt = _ConsumedKeys({
+            k: (_ConsumedKeys(v) if isinstance(v, dict) else v)
+            for k, v in dict.items(fmt)})
+
     objects: dict[str, list] = {}
     vc_objects: dict[str, list] = {}
 
@@ -831,7 +889,14 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "show" in t: props["show"] = _pbi_lit(t["show"])
         if "text" in t: props["text"] = _pbi_lit(t["text"])
         if "fontSize" in t: props["fontSize"] = _pbi_lit(float(t["fontSize"]))
-        if "color" in t: props["fontColor"] = _solid_color(t["color"])
+        # Text colour. Power BI's own name is `fontColor` (the `commonCards`
+        # title definition in the report theme schema Desktop ships; 341
+        # title cards in the corpus). Only `color` was read, so a caller who
+        # sent Power BI's name got a success message and no colour (#67).
+        # Both are accepted; the Power BI name wins when both are sent, and
+        # the loser is then reported as not written rather than dropped.
+        if "fontColor" in t: props["fontColor"] = _solid_color(t["fontColor"])
+        elif "color" in t: props["fontColor"] = _solid_color(t["color"])
         if "fontFamily" in t: props["fontFamily"] = _pbi_lit(t["fontFamily"])
         if "bold" in t: props["bold"] = _pbi_lit(t["bold"])
         if "italic" in t: props["italic"] = _pbi_lit(t["italic"])
@@ -854,7 +919,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "show" in s: props["show"] = _pbi_lit(s["show"])
         if "text" in s: props["text"] = _pbi_lit(s["text"])
         if "fontSize" in s: props["fontSize"] = _pbi_lit(float(s["fontSize"]))
-        if "color" in s: props["fontColor"] = _solid_color(s["color"])
+        # Same as title: Power BI stores the subtitle colour as `fontColor`
+        # (commonCards.subTitle); accept it beside `color`, native name wins.
+        if "fontColor" in s: props["fontColor"] = _solid_color(s["fontColor"])
+        elif "color" in s: props["fontColor"] = _solid_color(s["color"])
         if "fontFamily" in s: props["fontFamily"] = _pbi_lit(s["fontFamily"])
         if "titleWrap" in s: props["titleWrap"] = _pbi_lit(s["titleWrap"])
         _add_vc("subTitle", props)
@@ -873,9 +941,12 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         # `show` was written regardless, and the tool answered "Formatted
         # visual N: background" — so a caller could not tell honoured from
         # discarded (issue #64). Refuse by name instead, at the call site.
-        _img_keys = [k for k in bg
-                     if k in ("image", "image_base64", "image_path",
-                              "imageUrl", "imageBase64", "imagePath")]
+        # Test the candidate names against the card rather than iterating
+        # the card: a loop over every key of `bg` would mark all of them as
+        # consumed and hide a genuinely unrecognised one (#67).
+        _img_keys = [k for k in ("image", "image_base64", "image_path",
+                                 "imageUrl", "imageBase64", "imagePath")
+                     if k in bg]
         if _img_keys:
             raise LayoutParseError(
                 f"background.{_img_keys[0]} is not a visual-level property — "
@@ -1007,7 +1078,18 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         props = {}
         if "show" in lg: props["show"] = _pbi_lit(lg["show"])
         if "fontSize" in lg: props["fontSize"] = _pbi_lit(float(lg["fontSize"]))
-        if "color" in lg: props["fontColor"] = _solid_color(lg["color"])
+        # Text colour. The legend's property is `labelColor`: the report
+        # theme schema Desktop ships declares a legend for 22 visual types
+        # and every one of them names its text colour `labelColor` — none has
+        # a `fontColor`. This wrote `fontColor`, a property no built-in
+        # legend reads, so legend text colour never applied, not even through
+        # the documented `color` key (found while fixing #67). Accept the
+        # native `labelColor`, the `fontColor` callers send by analogy with
+        # the other text cards, and the documented `color`; first one wins.
+        for _lc in ("labelColor", "fontColor", "color"):
+            if _lc in lg:
+                props["labelColor"] = _solid_color(lg[_lc])
+                break
         if "fontFamily" in lg: props["fontFamily"] = _pbi_lit(lg["fontFamily"])
         if "position" in lg:
             raw = _LEGEND_POSITIONS.get(lg["position"], f"'{lg['position']}'")
@@ -1294,7 +1376,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
 
     # --- text (actionButton label; objects.text with the default-state
     # selector, matching Desktop-authored buttons — issue #48) ---
-    if "text" in fmt and visual_type == "actionButton":
+    # Visual type first: testing `"text" in fmt` first marked the card as
+    # consumed on EVERY visual, so on a non-button it was dropped with no
+    # report. Now it surfaces as an ignored card there (#67).
+    if visual_type == "actionButton" and "text" in fmt:
         tx = fmt["text"]
         if isinstance(tx, str):
             tx = {"text": tx, "show": True}
@@ -1501,7 +1586,19 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "titleFontColor" in vht: props["themedTitleFontColor"] = _solid_color(vht["titleFontColor"])
         _add_vc("visualHeaderTooltip", props)
 
-    return {"_objects": objects, "_vcObjects": vc_objects}
+    ignored_cards: list = []
+    ignored_props: dict = {}
+    if isinstance(fmt, _ConsumedKeys):
+        # underscore keys are internal flags (e.g. _skip_datacolors)
+        ignored_cards = [k for k in fmt.unconsumed()
+                         if not str(k).startswith("_")]
+        for card, value in dict.items(fmt):
+            if card in fmt.seen and isinstance(value, _ConsumedKeys):
+                left = value.unconsumed()
+                if left:
+                    ignored_props[card] = left
+    return {"_objects": objects, "_vcObjects": vc_objects,
+            "_ignored_cards": ignored_cards, "_ignored_props": ignored_props}
 
 
 # ============================= MCP TOOLS ===================================
@@ -3420,11 +3517,17 @@ def pbix_format_visual(
         visual_index: Zero-based visual index on the page
         format_json: JSON object with formatting options. Supported keys:
 
-            title: {text, show, fontSize, color, fontFamily, bold, italic, alignment}
-            subtitle: {text, show, fontSize, color, fontFamily}
+            title: {text, show, fontSize, color | fontColor, fontFamily, bold,
+                italic, alignment}
+            subtitle: {text, show, fontSize, color | fontColor, fontFamily}
             dataLabels: {show, fontSize, color, displayUnits, decimalPlaces}
-            legend: {show, position, fontSize, color}
+            legend: {show, position, fontSize, color | fontColor | labelColor}
                 position: "top", "bottom", "left", "right", "topCenter"
+                text colour is written as Power BI's `labelColor`
+            Any key a card does not read is reported — in the message
+            ("ignored: title.fontColour"), in `warnings`, and in
+            data.ignored = {"cards": [...], "properties": {card: [keys]}} —
+            so a dropped key never reads as success.
             categoryAxis: {show, fontSize, color, title, gridlineShow, innerPadding,
                 invertAxis, axisType, start, end, switchAxisPosition}
             valueAxis: {show, fontSize, color, displayUnits, title, titleFontSize,
@@ -3646,12 +3749,35 @@ def pbix_format_visual(
             _where.append(f"objects: {', '.join(_obj)}")
         if _vc:
             _where.append(f"vcObjects: {', '.join(_vc)}")
+
+        # Keys the mapper never consumed (issue #67). A card can be applied
+        # while one of its keys is dropped — `title: {show, fontColor}`
+        # wrote `show` and answered "Formatted visual N: title", so the
+        # dropped colour read as success. Name every such key in the
+        # message, in `warnings`, and in `data`.
+        _ign_cards = list(result.get("_ignored_cards") or [])
+        _ign_props = dict(result.get("_ignored_props") or {})
+        _ign_flat = ([f"{c}.{k}" for c, ks in _ign_props.items() for k in ks]
+                     + list(_ign_cards))
+        _on = f" on a '{visual_type}'" if visual_type else ""
+        for card, keys in _ign_props.items():
+            _responses.add_pending_warning(
+                f"{card}: nothing was written for {sorted(map(str, keys))} — "
+                f"the card does not read that key{_on}, or another key for "
+                f"the same property took precedence")
+        if _ign_cards:
+            _responses.add_pending_warning(
+                f"unrecognised card(s) {sorted(map(str, _ign_cards))}{_on} — "
+                f"nothing was written for them")
+        _ign_note = f"; ignored: {', '.join(_ign_flat)}" if _ign_flat else ""
+
         return ToolResponse.ok(
             f"Formatted visual {visual_index} on page {page_index}: "
-            f"{', '.join(applied)} ({'; '.join(_where)})",
+            f"{', '.join(applied)} ({'; '.join(_where)}{_ign_note})",
             data={"visual_index": visual_index, "page_index": page_index,
                   "applied": list(applied),
-                  "objects": _obj, "vcObjects": _vc},
+                  "objects": _obj, "vcObjects": _vc,
+                  "ignored": {"cards": _ign_cards, "properties": _ign_props}},
         ).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
@@ -4953,10 +5079,20 @@ def pbix_format_page(alias: str, page_index: int, format_json: str) -> str:
                 cfg = {}
         objects = cfg.setdefault("objects", {})
 
+        ignored_props: dict = {}
         for key, card in cards.items():
             if key not in fmt:
                 continue
-            props = _page_bg_props(info, layout, fmt[key], card)
+            # Same contract as pbix_format_visual (#67): a key inside a card
+            # that nothing reads is reported, not silently dropped.
+            spec = fmt[key]
+            if isinstance(spec, dict):
+                spec = _ConsumedKeys(spec)
+            props = _page_bg_props(info, layout, spec, card)
+            if isinstance(spec, _ConsumedKeys):
+                left = spec.unconsumed()
+                if left:
+                    ignored_props[key] = left
             if not props:
                 continue
             existing = objects.get(card) or [{}]
@@ -4978,12 +5114,23 @@ def pbix_format_page(alias: str, page_index: int, format_json: str) -> str:
         page["config"] = json.dumps(cfg, ensure_ascii=False)
         _set_layout(info["work_dir"], layout)
         info["modified"] = True
-        note = f" (ignored: {sorted(unknown)})" if unknown else ""
+        for card, keys in ignored_props.items():
+            _responses.add_pending_warning(
+                f"{card}: nothing was written for {sorted(map(str, keys))} — "
+                f"the page card does not read that key, or it only applies "
+                f"alongside an image (name, scaling)")
+        _flat = sorted(unknown) + [f"{c}.{k}" for c, ks in
+                                   ignored_props.items() for k in ks]
+        note = f" (ignored: {', '.join(map(str, _flat))})" if _flat else ""
         return ToolResponse.ok(
             f"Formatted page {page_index} "
             f"('{page.get('displayName', '')}'): {', '.join(applied)}{note}",
+            # `ignored` keeps its original shape (unknown top-level cards) so
+            # existing capability probes are unaffected; per-card unread keys
+            # are reported separately.
             data={"page_index": page_index, "cards": applied,
-                  "ignored": sorted(unknown)}).to_text()
+                  "ignored": sorted(unknown),
+                  "ignored_properties": ignored_props}).to_text()
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:

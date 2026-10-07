@@ -5,6 +5,57 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.106] - 2026-10-07
+
+### Fixed — `fontColor` on title / subtitle, and the legend colour that never applied (issue #67)
+
+- **`title` and `subtitle` read their text colour only from `color`.** Sent
+  `fontColor` — the name Power BI stores it under — they wrote nothing for
+  it and still answered "Formatted visual N: title". Both now accept
+  `fontColor` beside the documented `color`; the Power BI name wins when
+  both are sent, and the one it beat is reported rather than dropped.
+- **The legend wrote a colour property no built-in legend reads.** Found
+  while fixing the above: the `legend` card wrote `fontColor`, but Power BI's
+  legend text colour is `labelColor`. The report theme schema that ships
+  inside Power BI Desktop (v5.71) declares a legend for 22 visual types and
+  every one of them names it `labelColor` — none declares a legend
+  `fontColor`. So legend text colour never applied through **any** key, the
+  documented `color` included; the value round-tripped through save/reopen
+  and Desktop ignored it. The legend now writes `labelColor` and accepts
+  `labelColor`, `fontColor` and `color` (in that order of precedence).
+  **Desktop-verified:** two identical pie charts, legend red — the one
+  carrying `legend.fontColor` renders Desktop's default grey (while its
+  font size *is* applied), the one carrying `legend.labelColor` renders red.
+- Title/subtitle needed only the input alias: `commonCards` in the same
+  schema declares `title.fontColor` and `subTitle.fontColor`, and 341 title
+  cards in the local corpus carry `fontColor`, so their output was right.
+
+### Added — keys a card does not read are reported, never dropped
+
+- The format mapper now records which keys it actually consumes. Every key
+  it did not is named **in the message** (`… (vcObjects: title; ignored:
+  title.fontColour)`), **in `warnings`**, and **in
+  `data.ignored = {"cards": [...], "properties": {card: [keys]}}`**. #64,
+  #66 and #67 were all the same shape — a dropped key and an honoured one
+  produced the same answer — and this closes the class rather than one
+  spelling.
+- Covers what was silent before: an unknown property inside a known card;
+  an unknown card sent beside a known one (previously reported only when
+  *nothing* applied); and the `text` card on any visual but `actionButton`,
+  which was tested, marked handled, and dropped.
+- `pbix_format_page` follows the same contract: unread keys inside a page
+  card are reported in `data.ignored_properties` and `warnings`.
+  `data.ignored` keeps its existing shape (unknown top-level cards) so
+  capability probes built on it are unaffected.
+- Verified free of false positives: none of the 38 `pbix_format_visual`
+  calls the existing suite makes reports an ignored key, and a docstring
+  ratchet confirms all 143 documented keys across 24 cards are read.
+
+- Pinned by `tests/test_issue67_font_color_and_ignored_keys.py` (18 tests).
+  15 fail on 0.9.105; the 3 that pass are controls that must keep passing
+  (documented `color` on title, the caller's dict left untouched, the page
+  tool's `ignored` shape). mypy unchanged at 135 (CI baseline 140).
+
 ## [0.9.105] - 2026-09-01
 
 ### Changed — the #43 case-fold is no longer silent
