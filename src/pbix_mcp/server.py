@@ -784,6 +784,65 @@ _FORMAT_CARDS = frozenset({
 })
 
 
+#: Visual types that HAVE an `objects.outline` card. Source: the report theme
+#: schema that ships inside Power BI Desktop (v5.71), which declares the card
+#: for exactly these seven and, on every one, names the stroke colour
+#: `lineColor` beside show / weight / transparency. Desktop-authored files
+#: agree: outline appears on exactly these types, `lineColor` 115 times and
+#: `outline.color` never. (basicShape, a legacy visual outside that schema,
+#: keeps its stroke on a separate `line` card — see issue #48.)
+#:
+#: These are stateful "tile" visuals: Desktop's own visual code reads
+#: `outline.show` from the selector-less entry but lineColor / weight /
+#: transparency per STATE, from the entry whose selector is
+#: {"id": "default"} (or hover, press, selected ...). Desktop-authored files
+#: follow that split — actionButton: show selector-less 231 times, lineColor
+#: 48 / weight 49 on {"id": "default"}, never the other way round — and a
+#: Desktop render of all seven confirmed it: the split draws the requested
+#: stroke on every one, one selector-less entry draws the default grey.
+_OUTLINE_CARD_VISUALS = frozenset({
+    "shape", "actionButton", "cardVisual", "listSlicer",
+    "advancedSlicerVisual", "bookmarkNavigator", "pageNavigator",
+})
+
+#: For visuals WITHOUT an outline card: where Power BI keeps the outline
+#: instead (same schema), so the caller is pointed at the right card rather
+#: than told only that nothing was written.
+_OUTLINE_ELSEWHERE = {
+    "tableEx": 'grid.outlineColor — send {"grid": {"outlineColor": ...}}',
+    "pivotTable": 'grid.outlineColor — send {"grid": {"outlineColor": ...}}',
+    # legacy spellings pbix_add_visual still accepts for the same two visuals
+    "table": 'grid.outlineColor — send {"grid": {"outlineColor": ...}}',
+    "matrix": 'grid.outlineColor — send {"grid": {"outlineColor": ...}}',
+    "multiRowCard": 'card.outlineColor — send {"card": {"outlineColor": ...}}',
+    "slicer": 'general.outlineColor — send {"general": {"outlineColor": ...}}',
+}
+
+
+def _outline_hint(visual_type: str, custom_visual: bool = False) -> str:
+    """Why `outline` was not written on this visual, and what to use."""
+    if custom_visual:
+        # The theme schema covers built-in visuals only; a custom visual's
+        # cards come from its own capabilities, which may or may not include
+        # an outline. Guessing a name is the silent failure this replaced.
+        return (f"outline: '{visual_type}' is a custom visual, which defines "
+                f"its own formatting cards — whether it has an outline card, "
+                f"and what that card's properties are called, is up to the "
+                f"visual, so nothing was written for outline. Write the "
+                f"visual's own property with pbix_update_visual_json, or use "
+                f"the border card for a border around the whole visual: "
+                f'{{"border": {{"show": true, "color": ...}}}}.')
+    where = _OUTLINE_ELSEWHERE.get(visual_type)
+    head = (f"outline: a '{visual_type}' has no outline card"
+            if visual_type else "outline: unknown visual type")
+    tail = (f"; Power BI keeps its outline on {where}" if where else "")
+    return (f"{head} — Power BI defines one only for "
+            f"{', '.join(sorted(_OUTLINE_CARD_VISUALS))}{tail}. For a border "
+            f"around the whole visual, use the border card: "
+            f'{{"border": {{"show": true, "color": ...}}}}. Nothing was '
+            f"written for outline.")
+
+
 class _ConsumedKeys(dict):
     """A dict that remembers which keys the format mapper looked at.
 
@@ -832,7 +891,8 @@ class _ConsumedKeys(dict):
         return [k for k in dict.keys(self) if k not in self.seen]
 
 
-def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
+def _build_format_objects(fmt: dict, visual_type: str = "",
+                          custom_visual: bool = False) -> dict:
     """Convert human-readable format dict to PBI objects structures.
 
     Returns dict with two keys:
@@ -859,6 +919,9 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
 
     objects: dict[str, list] = {}
     vc_objects: dict[str, list] = {}
+    # card -> a specific explanation for a card this visual type lacks; the
+    # caller reports it in place of the generic "unrecognised card" warning.
+    card_hints: dict[str, str] = {}
 
     def _add(category: str, props: dict):
         if props:
@@ -1258,30 +1321,61 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         _add("total", props)
 
     # --- outline ---
-    if "outline" in fmt:
+    # Only visuals that HAVE an outline card get one (_OUTLINE_CARD_VISUALS,
+    # from the report theme schema Desktop ships). This used to write
+    # `outline.color` for every visual but shape/basicShape: the wrong
+    # property on the six other visuals that have the card (it is
+    # `lineColor` on all seven), and a card that does not exist at all on
+    # tables, charts and the legacy card. Both rendered nothing and both
+    # answered success.
+    if visual_type == "basicShape" and "outline" in fmt:
+        # Legacy visual outside the theme schema: its stroke lives on the
+        # selector-less `line` card (issue #48), which Desktop's basicShape
+        # code reads without states. Its capabilities declare line
+        # {lineColor, transparency, weight, roundEdge} and NO outline card,
+        # so `show` has nowhere to go: it used to be written as outline.show,
+        # which nothing reads; now it is left unread and reported.
         ol = fmt["outline"]
-        props = {}
-        if "show" in ol: props["show"] = _pbi_lit(ol["show"])
-        if "weight" in ol: props["weight"] = _pbi_lit(int(ol["weight"]))
-        if "color" in ol:
-            # Stroke colour naming is per-visual (issue #47, measured on
-            # Desktop-authored shapes): the `shape` vintage carries it as
-            # outline.lineColor, basicShape as line.lineColor — the generic
-            # outline.color matched no measured shape, so the authored
-            # colour rendered as Desktop's default stroke.
-            if visual_type == "shape":
-                props["lineColor"] = _solid_color(ol["color"])
-            elif visual_type != "basicShape":
-                props["color"] = _solid_color(ol["color"])
-        if visual_type == "basicShape":
-            line_props = {}
-            if "color" in ol: line_props["lineColor"] = _solid_color(ol["color"])
-            if "weight" in ol: line_props["weight"] = _pbi_lit(int(ol["weight"]))
-            if "transparency" in ol:
-                line_props["transparency"] = _pbi_lit(float(ol["transparency"]))
-            _add("line", line_props)
-            props.pop("weight", None)
-        _add("outline", props)
+        line_props = {}
+        # Power BI name first; a `color` it beats stays unread, so reported.
+        if "lineColor" in ol: line_props["lineColor"] = _solid_color(ol["lineColor"])
+        elif "color" in ol: line_props["lineColor"] = _solid_color(ol["color"])
+        if "weight" in ol: line_props["weight"] = _pbi_lit(int(ol["weight"]))
+        if "transparency" in ol:
+            line_props["transparency"] = _pbi_lit(float(ol["transparency"]))
+        _add("line", line_props)
+    elif visual_type in _OUTLINE_CARD_VISUALS and "outline" in fmt:
+        ol = fmt["outline"]
+        # Two entries, the split Desktop writes and reads (see
+        # _OUTLINE_CARD_VISUALS): `show` on a selector-less entry, the stroke
+        # itself on the default-state entry. A stroke property on the
+        # selector-less entry is never read — Desktop-verified: it renders
+        # the default grey at the default width, which is how shape's
+        # lineColor went unnoticed since #47.
+        show_props = {}
+        if "show" in ol: show_props["show"] = _pbi_lit(ol["show"])
+        stroke = {}
+        # Stroke colour is `lineColor` on every visual that has the card.
+        # Accept the Power BI name and the documented `color`; native wins.
+        if "lineColor" in ol: stroke["lineColor"] = _solid_color(ol["lineColor"])
+        elif "color" in ol: stroke["lineColor"] = _solid_color(ol["color"])
+        # Desktop spells both as integral doubles — "1D", "20D" (67 weight
+        # and 55 transparency literals in Desktop-authored files) — where
+        # weight was written as an int, "1L".
+        if "weight" in ol: stroke["weight"] = _pbi_double_lit(ol["weight"])
+        if "transparency" in ol:
+            stroke["transparency"] = _pbi_double_lit(ol["transparency"])
+        entries: list[dict] = []
+        if show_props:
+            entries.append({"properties": show_props})
+        if stroke:
+            entries.append({"properties": stroke,
+                            "selector": {"id": "default"}})
+        _add_entries("outline", entries)
+    elif isinstance(fmt, dict) and dict.__contains__(fmt, "outline"):
+        # No outline card on this visual. Peek without consuming, so the card
+        # is still reported as ignored, and say where this visual keeps it.
+        card_hints["outline"] = _outline_hint(visual_type, custom_visual)
 
     # --- shape (buttons, shapes) ---
     if "shape" in fmt:
@@ -1477,6 +1571,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         if "barWeight" in cd: props["barWeight"] = _pbi_lit(float(cd["barWeight"]))
         if "cardPadding" in cd: props["cardPadding"] = _pbi_lit(float(cd["cardPadding"]))
         if "outlineStyle" in cd: props["outlineStyle"] = _pbi_lit(float(cd["outlineStyle"]))
+        # Where a multiRowCard keeps its outline (theme schema v5.71); the
+        # outline hint points callers here, so the key must be writable.
+        if "outlineColor" in cd: props["outlineColor"] = _solid_color(cd["outlineColor"])
+        if "outlineWeight" in cd: props["outlineWeight"] = _pbi_double_lit(cd["outlineWeight"])
         _add("card", props)
 
     # --- cardTitle ---
@@ -1557,6 +1655,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
         props = {}
         if "layout" in gn: props["layout"] = _pbi_lit(gn["layout"])
         if "orientation" in gn: props["orientation"] = _pbi_lit(float(gn["orientation"]))
+        # Where a (legacy) slicer keeps its outline: general.outlineColor 13x
+        # and general.outlineWeight 10x ("ND") in Desktop-authored files.
+        if "outlineColor" in gn: props["outlineColor"] = _solid_color(gn["outlineColor"])
+        if "outlineWeight" in gn: props["outlineWeight"] = _pbi_double_lit(gn["outlineWeight"])
         _add("general", props)
 
     # --- visualLink (vcObjects — action buttons navigation) ---
@@ -1598,7 +1700,8 @@ def _build_format_objects(fmt: dict, visual_type: str = "") -> dict:
                 if left:
                     ignored_props[card] = left
     return {"_objects": objects, "_vcObjects": vc_objects,
-            "_ignored_cards": ignored_cards, "_ignored_props": ignored_props}
+            "_ignored_cards": ignored_cards, "_ignored_props": ignored_props,
+            "_card_hints": card_hints}
 
 
 # ============================= MCP TOOLS ===================================
@@ -3555,7 +3658,21 @@ def pbix_format_visual(
             values: {bold, fontSize, fontFamily, fontColor, backColor, wordWrap,
                 backColorPrimary, backColorSecondary, fontColorPrimary, fontColorSecondary}
             total: {show, bold, fontSize, fontColor, backColor}
-            outline: {show, weight, color}
+            outline: {show, weight, transparency, color | lineColor}
+                only on shape, actionButton, cardVisual, listSlicer,
+                advancedSlicerVisual, bookmarkNavigator, pageNavigator
+                (written as Desktop does: show on the card, lineColor /
+                weight / transparency on its {"id": "default"} state entry)
+                and basicShape (line card; no show there — its line has no
+                on/off, weight 0 hides it);
+                other visuals have no outline card, so nothing is written
+                and a warning says where that visual keeps it: border for
+                the whole visual, grid.outlineColor on tables,
+                card.outlineColor on a multiRowCard, general.outlineColor
+                on a slicer
+            card: {barShow, barColor, barWeight, cardPadding, outlineStyle,
+                outlineColor, outlineWeight}  (multiRowCard)
+            general: {layout, orientation, outlineColor, outlineWeight}
             fill: {color, transparency, show}
             line: {lineStyle, strokeWidth, showMarker, markerShape, markerSize}
             categoryLabels: {show, fontSize, color, fontFamily}
@@ -3664,7 +3781,15 @@ def pbix_format_visual(
                 fmt["_skip_datacolors"] = True  # Skip the single-color fallback
 
         visual_type = sv.get("visualType", "")
-        result = _build_format_objects(fmt, visual_type=visual_type)
+        # A custom visual (registered by GUID in publicCustomVisuals) defines
+        # its own cards, so the outline hint must not claim it lacks one.
+        _custom = False
+        if isinstance(fmt, dict) and "outline" in fmt and visual_type:
+            _rc = (_get_report_config(info["work_dir"])
+                   if _is_pbir(info["work_dir"]) else layout) or {}
+            _custom = visual_type in set(_rc.get("publicCustomVisuals") or [])
+        result = _build_format_objects(fmt, visual_type=visual_type,
+                                       custom_visual=_custom)
         new_objects = result.get("_objects", {})
         new_vc_objects = result.get("_vcObjects", {})
 
@@ -3694,6 +3819,12 @@ def pbix_format_visual(
                 existing_vc_objects[category] = _merge_obj_entries(existing_vc_objects.get(category), entries)
 
         applied = list(new_objects.keys()) + list(new_vc_objects.keys())
+        # Specific reasons for cards this visual type lacks (e.g. outline on
+        # a table). Attached before the nothing-applied check so they reach
+        # an error response too.
+        _hints = dict(result.get("_card_hints") or {})
+        for _hint in _hints.values():
+            _responses.add_pending_warning(_hint)
         if not applied:
             # Reporting success for a no-op is the worst failure shape: the
             # caller believes the formatting landed. Name what was ignored --
@@ -3706,8 +3837,17 @@ def pbix_format_visual(
                        if isinstance(fmt, dict) else [])
             known = [k for k in ignored if k in _FORMAT_CARDS]
             unknown = [k for k in ignored if k not in _FORMAT_CARDS]
+            # A known card the mapper never even opened is one THIS visual
+            # type does not have (outline on a table, text on a non-button) —
+            # saying "no recognised properties" would blame its properties.
+            _unopened = set(result.get("_ignored_cards") or [])
             parts = []
             for k in known:
+                if k in _unopened:
+                    parts.append(
+                        f"{k}: not a card a '{visual_type}' has"
+                        if visual_type else f"{k}: not a card this visual has")
+                    continue
                 inner = fmt.get(k)
                 props = (sorted(inner) if isinstance(inner, dict)
                          else [repr(inner)])
@@ -3765,9 +3905,10 @@ def pbix_format_visual(
                 f"{card}: nothing was written for {sorted(map(str, keys))} — "
                 f"the card does not read that key{_on}, or another key for "
                 f"the same property took precedence")
-        if _ign_cards:
+        _generic = [c for c in _ign_cards if c not in _hints]
+        if _generic:
             _responses.add_pending_warning(
-                f"unrecognised card(s) {sorted(map(str, _ign_cards))}{_on} — "
+                f"unrecognised card(s) {sorted(map(str, _generic))}{_on} — "
                 f"nothing was written for them")
         _ign_note = f"; ignored: {', '.join(_ign_flat)}" if _ign_flat else ""
 

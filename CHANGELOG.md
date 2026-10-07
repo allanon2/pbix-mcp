@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.107] - 2026-10-07
+
+### Fixed — `outline` was written where Power BI never reads it
+
+- **On the seven visuals that have an outline card, the stroke never
+  applied.** The mapper wrote one selector-less entry: `outline.color` on
+  actionButton, cardVisual, listSlicer, advancedSlicerVisual,
+  bookmarkNavigator and pageNavigator, `outline.lineColor` on shape. Two
+  things were wrong. The **name**: the report theme schema shipped inside
+  Power BI Desktop (v5.71) declares the card on exactly these seven and
+  names the stroke colour `lineColor` on every one; `outline.color` appears
+  in no Desktop-authored file. And, for all seven including shape, the
+  **place**: Desktop's visual code reads `outline.show` from the
+  selector-less entry but `lineColor` / `weight` / `transparency` per
+  *state*, from the entry whose selector is `{"id": "default"}`.
+  Desktop-authored files follow that split (actionButton: `show`
+  selector-less 231 times, `lineColor` 48 / `weight` 49 times on
+  `{"id": "default"}`, never the reverse). The card now writes exactly
+  that, with `weight` / `transparency` spelled as Desktop spells them
+  (`"6D"`, `"20D"`) and `lineColor` accepted beside `color` (the Power BI
+  name wins; the key it beat is reported).
+  **Desktop-verified on all seven:** the old single entry renders the
+  default grey stroke at the default width — colour *and* weight dropped,
+  `show` applied — while the split renders the requested colour and width.
+  So shape's `lineColor` (#47) had the right name in the wrong entry and
+  never applied either.
+- **Every other visual has no outline card at all** — tables, matrices,
+  charts, the classic card, multiRowCard, slicer — and got one written
+  anyway. It rendered nothing and answered success. Now nothing is written:
+  `outline` is reported as ignored (an error when it was the only card, per
+  the no-op contract of #51) with one warning naming where that visual keeps
+  its outline — `grid.outlineColor` on tableEx/pivotTable,
+  `card.outlineColor` on multiRowCard, `general.outlineColor` on slicer, and
+  the `border` card for a border around any visual. A custom visual gets its
+  own wording: it defines its own cards, so it is neither guessed at nor
+  told it has none.
+- **`card` and `general` gained `outlineColor` / `outlineWeight`**, so the
+  multiRowCard and slicer pointers name keys that work (declared by the
+  schema; `general.outlineColor` 13 and `general.outlineWeight` 10 times in
+  Desktop-authored slicers). Desktop-verified on both, and on
+  `grid.outlineColor` for a table.
+- **basicShape** keeps its stroke on the `line` card, which Desktop's
+  basicShape code reads without states (verified). Its capabilities declare
+  no outline card and no line on/off, so `outline.show` — which used to land
+  on a card basicShape never reads — is now reported as ignored; `weight: 0`
+  hides the line (Desktop-verified).
+
+- Pinned by `tests/test_outline_card.py` (39 tests): 35 fail on 0.9.106; the
+  4 that pass are controls (shape's `lineColor` name, a `show`-only write,
+  basicShape's line card, the caller's payload left untouched). The two
+  tests in `test_report_editing.py` that pinned the old layout — shape's
+  selector-less `lineColor`, a table's `outline.color` — now pin the
+  measured one. mypy unchanged at 135 (CI baseline 140).
+
 ## [0.9.106] - 2026-10-07
 
 ### Fixed — `fontColor` on title / subtitle, and the legend colour that never applied (issue #67)

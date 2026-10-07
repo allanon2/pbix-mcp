@@ -466,7 +466,12 @@ class TestShapeAndButtonFormatting:
         shp = o["shape"][0]["properties"]
         assert "tileShape" in shp and "'line'" in json.dumps(shp["tileShape"])
         assert "rotation" not in shp
-        ol = o["outline"][0]["properties"]
+        # show on the selector-less entry, the stroke on the default-state
+        # entry — the only layout Desktop reads the stroke from
+        by_sel = {json.dumps(e.get("selector")): e["properties"]
+                  for e in o["outline"]}
+        assert set(by_sel["null"]) == {"show"}
+        ol = by_sel['{"id": "default"}']
         assert "lineColor" in ol and "#0000FF" in json.dumps(ol["lineColor"])
         assert "color" not in ol
 
@@ -503,18 +508,20 @@ class TestShapeAndButtonFormatting:
         assert txt["selector"] == {"id": "default"}
         assert "'Open docs'" in json.dumps(txt["properties"]["text"])
 
-    def test_non_shape_visuals_keep_legacy_spellings(self, gap_report,
-                                                     tmp_path):
-        # a table's outline keeps the generic color property — only shape
-        # vintages get the per-visual names
+    def test_table_has_no_outline_card(self, gap_report, tmp_path):
+        # This used to pin `outline.color` on a table. A table has no outline
+        # card at all (theme schema v5.71: the card exists on seven visuals,
+        # none of them tables), so that write rendered nothing. Now nothing is
+        # written and the caller is told where a table keeps its outline.
         alias, _p = gap_report
         assert json.loads(server.pbix_add_visual(
             alias, 0, "tableEx", 300, 40, 200, 100, ""))["success"]
-        assert json.loads(server.pbix_format_visual(alias, 0, 3, json.dumps({
-            "outline": {"color": "#123456"}})))["success"]
+        r = json.loads(server.pbix_format_visual(alias, 0, 3, json.dumps({
+            "outline": {"color": "#123456"}})))
+        assert not r["success"]
+        assert "grid.outlineColor" in " ".join(r.get("warnings") or [])
         sv = self._saved_visuals(alias, tmp_path)[3]
-        ol = sv["objects"]["outline"][0]["properties"]
-        assert "color" in ol and "lineColor" not in ol
+        assert "outline" not in (sv.get("objects") or {})
 
 
 class TestComboSecondaryValueAxis:
