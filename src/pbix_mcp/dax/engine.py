@@ -4324,7 +4324,12 @@ class DAXEngine:
             ti_prefixes = ('DATESYTD', 'DATESMTD', 'DATESQTD', 'PREVIOUSMONTH',
                            'PREVIOUSQUARTER', 'PREVIOUSYEAR', 'NEXTMONTH',
                            'NEXTQUARTER', 'NEXTYEAR', 'PARALLELPERIOD',
-                           'DATESBETWEEN', 'DATESINPERIOD')
+                           'DATESBETWEEN', 'DATESINPERIOD',
+                           # A single date is a date filter like any other: Desktop
+                           # 2.157 gives CALCULATE(e, STARTOFYEAR(d)) the January
+                           # value under every Period of the year.
+                           'STARTOFMONTH', 'STARTOFQUARTER', 'STARTOFYEAR',
+                           'ENDOFMONTH', 'ENDOFQUARTER', 'ENDOFYEAR')
             fa_upper = filter_arg.upper().split('(')[0].strip()
             if fa_upper in ti_prefixes:
                 # Evaluated in the OUTER context (issue #49); the date-key
@@ -10756,156 +10761,123 @@ class DAXEngine:
     # Time Intelligence — Start/End of Period
     # =========================================================================
 
-    def _fn_startofmonth(self, args_str: str, ctx: DAXContext) -> Any:
-        """STARTOFMONTH(dates) — first date of the month."""
+    # Every time-intelligence function returns dates that EXIST in the dates
+    # column (Microsoft's DAX reference: the result is a table of the column's
+    # values). Building calendar dates instead -- the 31st of a month, Dec 31 --
+    # broke every date table that is not daily: Desktop 2.157, on Microsoft's
+    # MIT Corporate Spend sample (one row per month, dated the 1st), returns the
+    # 2014-12-01 row for ENDOFYEAR / ENDOFMONTH, where the calendar end
+    # 2014-12-31 matched no row and the measure went BLANK at every level.
+
+    @staticmethod
+    def _period_bounds(d: datetime, period: str) -> tuple:
+        """(first, last) calendar day of the month / quarter / year containing d."""
+        if period == 'MONTH':
+            first_month, last_month = d.month, d.month
+        elif period == 'QUARTER':
+            first_month = ((d.month - 1) // 3) * 3 + 1
+            last_month = first_month + 2
+        else:
+            first_month, last_month = 1, 12
+        return (datetime(d.year, first_month, 1),
+                datetime(d.year, last_month, monthrange(d.year, last_month)[1], 23, 59, 59))
+
+    def _start_of(self, args_str: str, ctx: DAXContext, period: str) -> Any:
+        """STARTOFMONTH/QUARTER/YEAR: the first date of the dates column in the
+        period that contains the earliest date in context."""
         table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
         if not dates:
             return []
-        min_date = min(dates)
-        start = datetime(min_date.year, min_date.month, 1)
-        return self._make_date_table_result(table_name, col_name, [start])
+        lo, hi = self._period_bounds(min(dates), period)
+        inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
+        return self._make_date_table_result(table_name, col_name, [min(inside)] if inside else [])
+
+    def _end_of(self, args_str: str, ctx: DAXContext, period: str) -> Any:
+        """ENDOFMONTH/QUARTER/YEAR: the last date of the dates column in the
+        period that contains the latest date in context."""
+        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        if not dates:
+            return []
+        lo, hi = self._period_bounds(max(dates), period)
+        inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
+        return self._make_date_table_result(table_name, col_name, [max(inside)] if inside else [])
+
+    def _fn_startofmonth(self, args_str: str, ctx: DAXContext) -> Any:
+        """STARTOFMONTH(dates) — first date of the month."""
+        return self._start_of(args_str, ctx, 'MONTH')
 
     def _fn_endofmonth(self, args_str: str, ctx: DAXContext) -> Any:
         """ENDOFMONTH(dates) — last date of the month."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
-        if not dates:
-            return []
-        max_date = max(dates)
-        _, last_day = monthrange(max_date.year, max_date.month)
-        end = datetime(max_date.year, max_date.month, last_day)
-        return self._make_date_table_result(table_name, col_name, [end])
+        return self._end_of(args_str, ctx, 'MONTH')
 
     def _fn_startofquarter(self, args_str: str, ctx: DAXContext) -> Any:
         """STARTOFQUARTER(dates) — first date of the quarter."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
-        if not dates:
-            return []
-        min_date = min(dates)
-        q_start_month = ((min_date.month - 1) // 3) * 3 + 1
-        start = datetime(min_date.year, q_start_month, 1)
-        return self._make_date_table_result(table_name, col_name, [start])
+        return self._start_of(args_str, ctx, 'QUARTER')
 
     def _fn_endofquarter(self, args_str: str, ctx: DAXContext) -> Any:
         """ENDOFQUARTER(dates) — last date of the quarter."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
-        if not dates:
-            return []
-        max_date = max(dates)
-        q_end_month = ((max_date.month - 1) // 3 + 1) * 3
-        _, last_day = monthrange(max_date.year, q_end_month)
-        end = datetime(max_date.year, q_end_month, last_day)
-        return self._make_date_table_result(table_name, col_name, [end])
+        return self._end_of(args_str, ctx, 'QUARTER')
 
     def _fn_startofyear(self, args_str: str, ctx: DAXContext) -> Any:
         """STARTOFYEAR(dates) — first date of the year."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
-        if not dates:
-            return []
-        min_date = min(dates)
-        start = datetime(min_date.year, 1, 1)
-        return self._make_date_table_result(table_name, col_name, [start])
+        return self._start_of(args_str, ctx, 'YEAR')
 
     def _fn_endofyear(self, args_str: str, ctx: DAXContext) -> Any:
         """ENDOFYEAR(dates) — last date of the year."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
-        if not dates:
-            return []
-        max_date = max(dates)
-        end = datetime(max_date.year, 12, 31)
-        return self._make_date_table_result(table_name, col_name, [end])
+        return self._end_of(args_str, ctx, 'YEAR')
 
     # =========================================================================
     # Time Intelligence — Opening/Closing Balance
     # =========================================================================
+    # CLOSINGBALANCEx(e, d) evaluates e at ENDOFx(d); OPENINGBALANCEx(e, d) at
+    # the last date of the column BEFORE the period (BLANK when there is none).
+    # Both REPLACE the date table's filters, as CALCULATE with a date filter
+    # does: Desktop's OPENINGBALANCEMONTH for 2014 / Period 3 is Period 2's
+    # value, which a kept Period filter would have made BLANK.
+
+    def _balance_at(self, args_str: str, ctx: DAXContext, period: str, opening: bool) -> Any:
+        args = self._split_args(args_str)
+        if len(args) < 2:
+            return 0
+        expr = args[0].strip()
+        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
+        if not dates:
+            return self._eval_expr(expr, ctx)
+        if opening:
+            lo, _hi = self._period_bounds(min(dates), period)
+            before = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if d < lo]
+            if not before:
+                return None
+            at = self._make_date_table_result(table_name, col_name, [max(before)])
+        else:
+            at = self._end_of(args[1], ctx, period)
+            if not at:
+                return None
+        return self._total_over_dates(expr, at, ctx)
 
     def _fn_openingbalancemonth(self, args_str: str, ctx: DAXContext) -> Any:
-        """OPENINGBALANCEMONTH(expression, dates, filter) — evaluate at last date of previous month."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        min_date = min(dates)
-        # End of previous month
-        eop = datetime(min_date.year, min_date.month, 1) - timedelta(days=1)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eop.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """OPENINGBALANCEMONTH(expression, dates, filter) — at the last date before the month."""
+        return self._balance_at(args_str, ctx, 'MONTH', opening=True)
 
     def _fn_closingbalancemonth(self, args_str: str, ctx: DAXContext) -> Any:
-        """CLOSINGBALANCEMONTH(expression, dates, filter) — evaluate at last date of current month."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        max_date = max(dates)
-        _, last_day = monthrange(max_date.year, max_date.month)
-        eom = datetime(max_date.year, max_date.month, last_day)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eom.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """CLOSINGBALANCEMONTH(expression, dates, filter) — at the last date of the month."""
+        return self._balance_at(args_str, ctx, 'MONTH', opening=False)
 
     def _fn_openingbalancequarter(self, args_str: str, ctx: DAXContext) -> Any:
-        """OPENINGBALANCEQUARTER(expression, dates, filter) — evaluate at last date before quarter."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        min_date = min(dates)
-        q_start_month = ((min_date.month - 1) // 3) * 3 + 1
-        eoq = datetime(min_date.year, q_start_month, 1) - timedelta(days=1)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoq.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """OPENINGBALANCEQUARTER(expression, dates, filter) — at the last date before the quarter."""
+        return self._balance_at(args_str, ctx, 'QUARTER', opening=True)
 
     def _fn_closingbalancequarter(self, args_str: str, ctx: DAXContext) -> Any:
-        """CLOSINGBALANCEQUARTER(expression, dates, filter) — evaluate at last date of quarter."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        max_date = max(dates)
-        q_end_month = ((max_date.month - 1) // 3 + 1) * 3
-        _, last_day = monthrange(max_date.year, q_end_month)
-        eoq = datetime(max_date.year, q_end_month, last_day)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoq.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """CLOSINGBALANCEQUARTER(expression, dates, filter) — at the last date of the quarter."""
+        return self._balance_at(args_str, ctx, 'QUARTER', opening=False)
 
     def _fn_openingbalanceyear(self, args_str: str, ctx: DAXContext) -> Any:
-        """OPENINGBALANCEYEAR(expression, dates, filter) — evaluate at last date of previous year."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        min_date = min(dates)
-        eoy = datetime(min_date.year - 1, 12, 31)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoy.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """OPENINGBALANCEYEAR(expression, dates, filter) — at the last date before the year."""
+        return self._balance_at(args_str, ctx, 'YEAR', opening=True)
 
     def _fn_closingbalanceyear(self, args_str: str, ctx: DAXContext) -> Any:
-        """CLOSINGBALANCEYEAR(expression, dates, filter) — evaluate at last date of year."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return 0
-        expr = args[0].strip()
-        table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
-        if not dates:
-            return self._eval_expr(expr, ctx)
-        max_date = max(dates)
-        eoy = datetime(max_date.year, 12, 31)
-        new_ctx = ctx.with_filters({f"{table_name}.{col_name}": [eoy.strftime('%Y-%m-%d')]})
-        return self._eval_expr(expr, new_ctx)
+        """CLOSINGBALANCEYEAR(expression, dates, filter) — at the last date of the year."""
+        return self._balance_at(args_str, ctx, 'YEAR', opening=False)
 
     # =========================================================================
     # Time Intelligence — Date Range Functions
