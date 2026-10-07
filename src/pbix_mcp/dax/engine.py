@@ -3311,7 +3311,7 @@ class DAXEngine:
         This implements the row context → filter context transition."""
         meta_keys = {'__table__', '__column__', '__value__', '__row__'}
         table_name = row_item.get('__table__', '')
-        filters = {}
+        filters: dict[str, list] = {}
         for k, v in row_item.items():
             if k in meta_keys or v is None:
                 continue

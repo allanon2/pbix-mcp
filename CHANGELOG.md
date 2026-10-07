@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.111] - 2026-10-07
+
+### Fixed — `ISINSCOPE` through a context transition (PR #77, by @allanon2)
+
+- In DAX an iterator's row becomes a filter — and its columns come into scope
+  for `ISINSCOPE` — once `CALCULATE` or a measure reference performs the
+  context transition. This engine applies the row → filter step eagerly, so
+  ISINSCOPE could not tell the iterated row from any other filter and answered
+  FALSE. `_make_row_context` now tags the row's filter values
+  (`RowContextValues`). ISINSCOPE is TRUE for them after the transition and,
+  before it, answers from the enclosing context. ISINSCOPE also parses its
+  argument as a column reference, so a row context cannot collapse it to the
+  row's value.
+- Verified against Power BI Desktop (2.152, over ADOMD) with 15
+  context-transition shapes at five groupings.
+  `SUMX(VALUES(c), IF(CALCULATE(ISINSCOPE(c)), 1, 0))` and the
+  measure-reference form are 4 at the total, as in Desktop (were 0), and
+  `SUMX(T, …)` is 6 (was 0). A row context without a transition stays out of
+  scope, and `REMOVEFILTERS` / `ALL` after the transition take the column out
+  of scope, as Desktop does. **130 cells fixed through `pbix_evaluate_dax`
+  and 112 through `pbix_evaluate_dax_grouped`, with no cell changed among the
+  5,121 compared**, including the whole 0.9.110 review set.
+- The merge annotates `_make_row_context`'s filter dict so mypy stays at 135.
+
+### Known gap — tracked
+
+- **#80** — `KEEPFILTERS` on the iterated column after the transition still
+  drops the column from scope. Desktop shows 1 per region (4 at the total);
+  here it is 0, as before this release.
+
 ## [0.9.110] - 2026-10-07
 
 ### Fixed — DAX engine: four contributed fixes (PRs #69, #70, #71, #73, by @allanon2)
