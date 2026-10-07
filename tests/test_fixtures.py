@@ -178,7 +178,8 @@ class TestPackageImports:
 
     def test_version(self):
         from pbix_mcp import __version__
-        assert __version__ == "0.9.105"
+        # pivot-studio branch: upstream 0.9.105 plus fixes, versioned 0.9.105+pivotstudio.N
+        assert __version__.split("+pivotstudio.")[0] == "0.9.105"
 
 
 class TestRealPBIXFixture:
