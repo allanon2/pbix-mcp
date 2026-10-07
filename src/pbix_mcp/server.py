@@ -1037,8 +1037,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "",
         props = {}
         if "show" in bd: props["show"] = _pbi_lit(bd["show"])
         if "color" in bd: props["color"] = _solid_color(bd["color"])
-        if "radius" in bd: props["radius"] = _pbi_lit(float(bd["radius"]))
-        if "width" in bd: props["width"] = _pbi_lit(float(bd["width"]))
+        # Container numbers are D literals with no fractional part when
+        # integral, as Desktop writes them (issue #84): '0D', not '0.0D'.
+        if "radius" in bd: props["radius"] = _pbi_double_lit(bd["radius"])
+        if "width" in bd: props["width"] = _pbi_double_lit(bd["width"])
         _add_vc("border", props)
 
     # --- dropShadow ---
@@ -1049,25 +1051,27 @@ def _build_format_objects(fmt: dict, visual_type: str = "",
         if "color" in ds: props["color"] = _solid_color(ds["color"])
         if "position" in ds: props["position"] = _pbi_lit(ds["position"])
         if "preset" in ds: props["preset"] = _pbi_lit(ds["preset"])
-        if "angle" in ds: props["angle"] = _pbi_lit(float(ds["angle"]))
-        if "blur" in ds: props["shadowBlur"] = _pbi_lit(float(ds["blur"]))
-        if "distance" in ds: props["shadowDistance"] = _pbi_lit(float(ds["distance"]))
-        if "spread" in ds: props["shadowSpread"] = _pbi_lit(float(ds["spread"]))
-        if "transparency" in ds: props["transparency"] = _pbi_lit(float(ds["transparency"]))
+        if "angle" in ds: props["angle"] = _pbi_double_lit(ds["angle"])
+        if "blur" in ds: props["shadowBlur"] = _pbi_double_lit(ds["blur"])
+        if "distance" in ds: props["shadowDistance"] = _pbi_double_lit(ds["distance"])
+        if "spread" in ds: props["shadowSpread"] = _pbi_double_lit(ds["spread"])
+        if "transparency" in ds: props["transparency"] = _pbi_double_lit(ds["transparency"])
         _add_vc("dropShadow", props)
 
     # --- padding ---
     if "padding" in fmt:
         pd = fmt["padding"]
         props = {}
+        # D literals, not Int64: Desktop writes padding as '0D' / '10D', and
+        # int() silently dropped a fraction (7.5 -> '7L'). Issue #84.
         if isinstance(pd, (int, float)):
             for side in ("top", "bottom", "left", "right"):
-                props[side] = _pbi_lit(int(pd))
+                props[side] = _pbi_double_lit(pd)
         else:
-            if "top" in pd: props["top"] = _pbi_lit(int(pd["top"]))
-            if "bottom" in pd: props["bottom"] = _pbi_lit(int(pd["bottom"]))
-            if "left" in pd: props["left"] = _pbi_lit(int(pd["left"]))
-            if "right" in pd: props["right"] = _pbi_lit(int(pd["right"]))
+            if "top" in pd: props["top"] = _pbi_double_lit(pd["top"])
+            if "bottom" in pd: props["bottom"] = _pbi_double_lit(pd["bottom"])
+            if "left" in pd: props["left"] = _pbi_double_lit(pd["left"])
+            if "right" in pd: props["right"] = _pbi_double_lit(pd["right"])
         _add_vc("padding", props)
 
     # --- spacing ---
@@ -1075,10 +1079,10 @@ def _build_format_objects(fmt: dict, visual_type: str = "",
         sp = fmt["spacing"]
         props = {}
         props["customizeSpacing"] = _pbi_lit(True)
-        if "belowTitle" in sp: props["spaceBelowTitle"] = _pbi_lit(int(sp["belowTitle"]))
-        if "belowSubTitle" in sp: props["spaceBelowSubTitle"] = _pbi_lit(int(sp["belowSubTitle"]))
-        if "belowTitleArea" in sp: props["spaceBelowTitleArea"] = _pbi_lit(int(sp["belowTitleArea"]))
-        if "vertical" in sp: props["verticalSpacing"] = _pbi_lit(int(sp["vertical"]))
+        if "belowTitle" in sp: props["spaceBelowTitle"] = _pbi_double_lit(sp["belowTitle"])
+        if "belowSubTitle" in sp: props["spaceBelowSubTitle"] = _pbi_double_lit(sp["belowSubTitle"])
+        if "belowTitleArea" in sp: props["spaceBelowTitleArea"] = _pbi_double_lit(sp["belowTitleArea"])
+        if "vertical" in sp: props["verticalSpacing"] = _pbi_double_lit(sp["vertical"])
         _add_vc("spacing", props)
 
     # --- divider ---
@@ -13124,7 +13128,8 @@ def _relationships_from_metadata(conn) -> list:
         "       COALESCE(fc.ExplicitName, fc.InferredName) AS fc, "
         "       tt.Name AS tt, "
         "       COALESCE(tc.ExplicitName, tc.InferredName) AS tc, "
-        "       r.IsActive, r.CrossFilteringBehavior "
+        "       r.IsActive, r.CrossFilteringBehavior, "
+        "       r.FromCardinality, r.ToCardinality "
         "FROM Relationship r "
         "JOIN [Table] ft ON r.FromTableID = ft.ID "
         "JOIN [Column] fc ON r.FromColumnID = fc.ID "
@@ -13135,6 +13140,8 @@ def _relationships_from_metadata(conn) -> list:
         "ToTable": r["tt"] or "", "ToColumn": r["tc"] or "",
         "IsActive": 1 if r["IsActive"] is None else r["IsActive"],
         "CrossFilteringBehavior": r["CrossFilteringBehavior"] or 1,
+        "FromCardinality": r["FromCardinality"] or 2,
+        "ToCardinality": r["ToCardinality"] or 1,
     } for r in rows]
 
 
@@ -13643,6 +13650,10 @@ def _get_dax_context(alias: str) -> dict:
             # Carry cross-filter direction so the engine honors bidirectional
             # (CrossFilteringBehavior=2) relationships. 1 = single (default).
             'CrossFilteringBehavior': r.get('CrossFilteringBehavior', 1),
+            # 1 = one, 2 = many: decides which tables get DAX's blank row
+            # (none for many-to-many, both sides of a 1:1 -- issue #82).
+            'FromCardinality': r.get('FromCardinality') or 2,
+            'ToCardinality': r.get('ToCardinality') or 1,
         })
 
     # Load all user-facing tables
@@ -14239,8 +14250,15 @@ def pbix_evaluate_dax_per_dimension(
         if col_idx < 0:
             return ToolResponse.error(f"Column '{dim_col}' not found in '{dim_table}'", PBIXMCPError.code).to_text()
 
-        unique_vals = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
-        unique_vals.sort(key=lambda x: str(x))
+        # BLANK is a value like any other: stored blanks, and the dimension's
+        # blank row when the base context keeps it (issue #82).
+        unique_vals = list(dict.fromkeys(row[col_idx] for row in tbl['rows']))
+        if None not in unique_vals and dax_engine.DAXContext(
+                ctx['tables'], ctx['measure_defs'], ctx['date_table'],
+                ctx['date_column'], base_fc,
+                ctx.get('relationships')).blank_row_visible(dim_table):
+            unique_vals.append(None)
+        unique_vals.sort(key=lambda x: (x is None, str(x)))
 
         lines = [f"DAX per {dimension} ({len(unique_vals)} values, showing {min(len(unique_vals), max_values)}):\n"]
 
@@ -14273,14 +14291,16 @@ def pbix_evaluate_dax_per_dimension(
                     fallback_measures, ctx['tables'], ctx['measure_defs'],
                     fc, ctx['date_table'], ctx['date_column'],
                     ctx.get('relationships'), group_keys={dimension},
-                    selected_filters=base_fc
+                    selected_filters=base_fc,
+                    # the marked date tables, as the grouped tool (#79, #86)
+                    date_tables=ctx.get('date_tables')
                 )
             else:
                 fb = {}
             results = {m: (fast[m].get(val) if m in fast else fb.get(m))
                        for m in measure_names}
 
-            row_str = f"{str(val):<25s}"
+            row_str = f"{'(Blank)' if val is None else str(val):<25s}"
             for m in measure_names:
                 v = results.get(m)
                 if isinstance(v, float):
@@ -14397,11 +14417,18 @@ def pbix_evaluate_dax_grouped(
             keys.append((f"{d.table}.{d.column}", d.table, d.column,
                          tbl['columns'].index(d.column), tbl))
 
-        # Distinct group keys, in a stable order.
+        # Distinct group keys, in a stable order. BLANK is a group like any
+        # other: the rows holding a blank, plus -- when the base context keeps
+        # it -- the table's blank row, where the fact rows whose key matches no
+        # dimension row land (Desktop: (Blank) = 20 next to X/Y/Z, issue #82).
+        _blank_ctx = dax_engine.DAXContext(
+            ctx['tables'], ctx['measure_defs'], ctx['date_table'],
+            ctx['date_column'], base_fc, rels)
         if len(keys) == 1:
             _ref, _t, _c, idx, tbl = keys[0]
-            uniq = list(dict.fromkeys(
-                r[idx] for r in tbl['rows'] if r[idx] is not None))
+            uniq = list(dict.fromkeys(r[idx] for r in tbl['rows']))
+            if None not in uniq and _blank_ctx.blank_row_visible(_t):
+                uniq.append(None)
         else:
             if len({k[1] for k in keys}) > 1:
                 return ToolResponse.error(
@@ -14410,10 +14437,15 @@ def pbix_evaluate_dax_grouped(
             tbl = keys[0][4]
             idxs = [k[3] for k in keys]
             uniq = list(dict.fromkeys(
-                tuple(r[i] for i in idxs) for r in tbl['rows']
-                if all(r[i] is not None for i in idxs)))
-        uniq.sort(key=lambda v: tuple(str(x) for x in v)
-                  if isinstance(v, tuple) else str(v))
+                tuple(r[i] for i in idxs) for r in tbl['rows']))
+            _none = tuple(None for _ in idxs)
+            if _none not in uniq and _blank_ctx.blank_row_visible(keys[0][1]):
+                uniq.append(_none)
+
+        def _group_order(v):
+            parts = v if isinstance(v, tuple) else (v,)
+            return tuple((x is None, str(x)) for x in parts)
+        uniq.sort(key=_group_order)
         total = len(uniq)
         capped = uniq[:max_groups]
 

@@ -1090,7 +1090,12 @@ def _to_serial(v) -> float:
 
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
-    date when both parse as dates, else as text."""
+    date when both parse as dates, else as text. A BLANK side compares as the
+    other side's zero (see _blank_zero_of): BLANK = 0 and BLANK < 1 are TRUE."""
+    if target is None and cell is not None:
+        target = _blank_zero_of(cell)
+    elif cell is None and target is not None:
+        cell = _blank_zero_of(target)
     a_num, b_num = _as_number(cell), _as_number(target)
     if a_num is not None and b_num is not None:
         a, b = a_num, b_num
@@ -1138,6 +1143,106 @@ def _relative_date_bounds(spec: dict):
 
 _SHARED_FILTER_CACHES: dict = {}
 _SHARED_FILTER_CACHE_MAX = 4
+
+
+# Relationship sets seen so far -> a small id (see DAXContext._rels_sig).
+_RELS_SIG_IDS: dict = {}
+
+
+_REL_INDEX_CACHE: dict = {}
+_REL_INDEX_CACHE_MAX = 16
+
+
+def _relationship_indexes(relationships: list) -> tuple:
+    """The relationship lookups a DAXContext propagates with, built once per
+    relationship LIST rather than once per context.
+
+    A context is created per iterated row -- a FILTER over 40,000 rows builds
+    ~50,000 -- and rebuilding these for each one was the largest single cost
+    of such a measure (issue #82 added two more of them). Nothing mutates them
+    after construction, and the list itself is held so its id cannot be
+    reused. USERELATIONSHIP / CROSSFILTER build a NEW list, so they get their
+    own entry.
+
+    Returns (rel_index, rel_dir, rel_adj, one_side_of, rels_sig).
+    """
+    hit = _REL_INDEX_CACHE.get(id(relationships))
+    if hit is not None and hit[0] is relationships:
+        cached: tuple = hit[1]
+        return cached
+    # { (fromTable, toTable): { fromCol, toCol } }, both orientations
+    rel_index: dict = {}
+    rel_dir: dict = {}
+    for rel in relationships:
+        if rel.get('IsActive'):
+            ft = rel.get('FromTable', '')
+            tt = rel.get('ToTable', '')
+            fc = rel.get('FromColumn', '')
+            tc = rel.get('ToColumn', '')
+            if ft and tt and fc and tc:
+                rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
+                rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+                # Directional copy: a filter flows ONE -> MANY (ToTable ->
+                # FromTable) by default; the reverse edge exists only for a
+                # bidirectional relationship. The symmetric index above
+                # stays, but propagation may only take the reverse
+                # direction for EXPANDED keys (see _expanded_keys).
+                rel_dir[(ft, tt)] = {'from_col': fc, 'to_col': tc}
+                if rel.get('CrossFilteringBehavior') == 2:
+                    rel_dir[(tt, ft)] = {'from_col': tc, 'to_col': fc}
+    # Directed adjacency for MULTI-HOP (snowflake) filter propagation.
+    # A filter propagates along the default cross-filter direction: from the
+    # "one" side (ToTable) to the "many" side (FromTable). Each edge carries
+    # the join columns on both endpoints so a filter can be chained hop by
+    # hop. Bidirectional relationships (CrossFilteringBehavior == 2) also add
+    # the reverse edge. Only used when no DIRECT relationship exists, so the
+    # existing single-hop behaviour is untouched.
+    #   rel_adj[a] = [ (b, col_on_a, col_on_b), ... ]
+    #   -> allowed values of a[col_on_a] restrict b[col_on_b]
+    rel_adj: dict = {}
+    for rel in relationships:
+        if not rel.get('IsActive'):
+            continue
+        ft = rel.get('FromTable', '')
+        tt = rel.get('ToTable', '')
+        fc = rel.get('FromColumn', '')
+        tc = rel.get('ToColumn', '')
+        if not (ft and tt and fc and tc):
+            continue
+        # one -> many (dim -> fact): ToTable -> FromTable
+        rel_adj.setdefault(tt, []).append((ft, tc, fc))
+        if rel.get('CrossFilteringBehavior') == 2:
+            # bidirectional: also many -> one
+            rel_adj.setdefault(ft, []).append((tt, fc, tc))
+    # (many table, one table) for every active relationship, so a hop knows
+    # which end is the dimension; a 1:1 is a "one" side both ways.
+    one_side_of: set = set()
+    for rel in relationships:
+        if rel.get('IsActive'):
+            ft, tt = rel.get('FromTable', ''), rel.get('ToTable', '')
+            one_side_of.add((ft, tt))
+            if rel.get('FromCardinality') == 1 and rel.get('ToCardinality') == 1:
+                one_side_of.add((tt, ft))
+    # The relationship set itself, interned to a small int. It is part of the
+    # cross-filter memo key: that memo lives on the model-wide cache, which
+    # USERELATIONSHIP / CROSSFILTER contexts share with a DIFFERENT set
+    # (issue #83).
+    rels_sig: int | None
+    try:
+        sig = tuple(
+            (r.get('FromTable'), r.get('FromColumn'), r.get('ToTable'),
+             r.get('ToColumn'), r.get('IsActive'),
+             r.get('CrossFilteringBehavior'), r.get('FromCardinality'),
+             r.get('ToCardinality'))
+            for r in relationships)
+        rels_sig = _RELS_SIG_IDS.setdefault(sig, len(_RELS_SIG_IDS))
+    except (AttributeError, TypeError):
+        rels_sig = None
+    out = (rel_index, rel_dir, rel_adj, one_side_of, rels_sig)
+    if len(_REL_INDEX_CACHE) >= _REL_INDEX_CACHE_MAX:
+        _REL_INDEX_CACHE.pop(next(iter(_REL_INDEX_CACHE)), None)
+    _REL_INDEX_CACHE[id(relationships)] = (relationships, out)
+    return out
 
 
 def _shared_filter_cache(tables) -> dict:
@@ -1513,50 +1618,178 @@ class DAXContext:
         # hanging the whole tool. Reset per outermost measure in evaluate_measure.
         self._eval_calls = 0
         self._max_eval_calls = 3_000_000
-        # Build relationship index: { (fromTable, toTable): { fromCol, toCol } }
-        self._rel_index = {}
-        self._rel_dir: dict = {}
+        # Relationship lookups (see _relationship_indexes), shared by every
+        # context over the same relationship list.
+        (self._rel_index, self._rel_dir, self._rel_adj, self._one_side_of,
+         self._rels_sig) = _relationship_indexes(self.relationships)
+
+    # ---- DAX's blank (unknown) row -------------------------------------------
+    # When a relationship joins a row whose key matches no row of the one side
+    # (or whose key is blank), Power BI gives the one-side table a BLANK ROW and
+    # attributes those rows to it (issue #82). Measured on Desktop 2.152 over
+    # ADOMD: the row exists for active AND inactive relationships, for both
+    # sides of a 1:1, never for many-to-many, and it carries one level up a
+    # snowflake (its own keys are blank). VALUES, ALL, ALLSELECTED, FILTERS and
+    # column predicates see it; DISTINCT, ALLNOBLANKROW, a bare table reference,
+    # COUNTROWS(T), DISTINCTCOUNT, COUNTA and MIN/MAX do not.
+
+    def blank_row_tables(self) -> frozenset:
+        """The tables that carry a blank row in this model.
+
+        Memoized on the model-wide cache per relationship set: finding them
+        scans each relationship's many side once.
+        """
+        cache = self._filter_idx_cache
+        key = ('blank-row-tables', self._rels_sig)
+        if self._rels_sig is not None:
+            hit: frozenset | None = cache.get(key)
+            if hit is not None:
+                return hit
+        edges = []
         for rel in self.relationships:
-            if rel.get('IsActive'):
-                ft = rel.get('FromTable', '')
-                tt = rel.get('ToTable', '')
-                fc = rel.get('FromColumn', '')
-                tc = rel.get('ToColumn', '')
-                if ft and tt and fc and tc:
-                    self._rel_index[(ft, tt)] = {'from_col': fc, 'to_col': tc}
-                    self._rel_index[(tt, ft)] = {'from_col': tc, 'to_col': fc}
-                    # Directional copy: a filter flows ONE -> MANY (ToTable ->
-                    # FromTable) by default; the reverse edge exists only for a
-                    # bidirectional relationship. The symmetric index above
-                    # stays, but propagation may only take the reverse
-                    # direction for EXPANDED keys (see _expanded_keys).
-                    self._rel_dir[(ft, tt)] = {'from_col': fc, 'to_col': tc}
-                    if rel.get('CrossFilteringBehavior') == 2:
-                        self._rel_dir[(tt, ft)] = {'from_col': tc, 'to_col': fc}
-        # Directed adjacency for MULTI-HOP (snowflake) filter propagation.
-        # A filter propagates along the default cross-filter direction: from the
-        # "one" side (ToTable) to the "many" side (FromTable). Each edge carries
-        # the join columns on both endpoints so a filter can be chained hop by
-        # hop. Bidirectional relationships (CrossFilteringBehavior == 2) also add
-        # the reverse edge. Only used when no DIRECT relationship exists, so the
-        # existing single-hop behaviour is untouched.
-        #   _rel_adj[a] = [ (b, col_on_a, col_on_b), ... ]
-        #   -> allowed values of a[col_on_a] restrict b[col_on_b]
-        self._rel_adj: dict = {}
-        for rel in self.relationships:
-            if not rel.get('IsActive'):
+            ft, fc = rel.get('FromTable'), rel.get('FromColumn')
+            tt, tc = rel.get('ToTable'), rel.get('ToColumn')
+            if not (ft and fc and tt and tc):
                 continue
-            ft = rel.get('FromTable', '')
-            tt = rel.get('ToTable', '')
-            fc = rel.get('FromColumn', '')
-            tc = rel.get('ToColumn', '')
-            if not (ft and tt and fc and tc):
-                continue
-            # one -> many (dim -> fact): ToTable -> FromTable
-            self._rel_adj.setdefault(tt, []).append((ft, tc, fc))
-            if rel.get('CrossFilteringBehavior') == 2:
-                # bidirectional: also many -> one
-                self._rel_adj.setdefault(ft, []).append((tt, fc, tc))
+            fcard = rel.get('FromCardinality') or 2
+            tcard = rel.get('ToCardinality') or 1
+            if fcard == 2 and tcard == 2:
+                continue                      # many-to-many: no blank row
+            edges.append((ft, fc, tt, tc))
+            if fcard == 1 and tcard == 1:
+                edges.append((tt, tc, ft, fc))
+        blank: set = set()
+        unmatched: dict = {}
+        changed = True
+        while changed:
+            changed = False
+            for edge in edges:
+                ft, fc, tt, tc = edge
+                if tt in blank:
+                    continue
+                if edge not in unmatched:
+                    unmatched[edge] = self._has_unmatched_keys(ft, fc, tt, tc)
+                # A blank row of the many side has a blank key, which matches
+                # no row here unless this table holds a blank key itself.
+                if unmatched[edge] or (
+                        ft in blank and 'None' not in self._key_aliases(tt, tc)):
+                    blank.add(tt)
+                    changed = True
+        out = frozenset(blank)
+        if self._rels_sig is not None:
+            cache[key] = out
+        return out
+
+    def _key_aliases(self, table_name: str, col_name: str) -> frozenset:
+        """Every spelling of every key in table_name[col_name] (see
+        _join_key_aliases), memoized on the model-wide cache."""
+        tbl = self.tables.get(table_name)
+        if not tbl:
+            return frozenset()
+        idx = self._find_col_idx(tbl['columns'], col_name)
+        if idx < 0:
+            return frozenset()
+        key = (id(tbl), 'key-aliases', idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            acc: set = set()
+            for r in tbl['rows']:
+                acc |= _join_key_aliases(r[idx])
+            hit = self._filter_idx_cache[key] = frozenset(acc)
+        return hit
+
+    def _has_unmatched_keys(self, many_table, many_col, one_table, one_col) -> bool:
+        mtbl = self.tables.get(many_table)
+        if not mtbl or not self.tables.get(one_table):
+            return False
+        mi = self._find_col_idx(mtbl['columns'], many_col)
+        if mi < 0:
+            return False
+        keys = self._key_aliases(one_table, one_col)
+        return any(str(r[mi]) not in keys for r in mtbl['rows'])
+
+    def _unmatched_key_strs(self, many_table: str, many_idx: int,
+                            one_table: str, one_col: str) -> frozenset:
+        """The many side's keys that reach one_table's blank row, plus 'None'
+        (a blank key), as the str() spellings a cross filter holds."""
+        mtbl = self.tables.get(many_table)
+        if not mtbl:
+            return frozenset({'None'})
+        key = (id(mtbl), 'unmatched', many_idx, one_table, one_col)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            keys = self._key_aliases(one_table, one_col)
+            out = {str(r[many_idx]) for r in mtbl['rows']}
+            hit = self._filter_idx_cache[key] = frozenset(
+                {k for k in out if k not in keys} | {'None'})
+        return hit
+
+    def _filters_admit_blank(self, col_filters) -> bool:
+        """Do ALL these (column, values) filters keep a row whose every value
+        is BLANK? That is whether they keep the table's blank row."""
+        for _col, values in col_filters:
+            try:
+                if not make_value_matcher(values)(None):
+                    return False
+            except (ValueError, TypeError):
+                return False
+        return True
+
+    def blank_row_visible(self, table_name: str) -> bool:
+        """Is table_name's blank row in the current filter context?
+
+        It is when the table has one, every direct filter on the table keeps a
+        BLANK value, and every filter reaching the table through a relationship
+        admits it ('None' in the allowed keys -- see _hop_keys).
+        """
+        if table_name not in self.blank_row_tables():
+            return False
+        tbl = self.tables.get(table_name)
+        if not tbl:
+            return False
+        direct = []
+        for fk, values in self.filter_context.items():
+            t, _, c = fk.partition('.')
+            if t == table_name and self._find_col_idx(tbl['columns'], c) >= 0:
+                direct.append((c, values))
+        if not self._filters_admit_blank(direct):
+            return False
+        return all('None' in allowed
+                   for allowed, _idx in self._get_cross_table_filters(table_name))
+
+    def blank_row_dict(self, table_name: str) -> dict:
+        """The blank row as a full-row dict (every column BLANK)."""
+        row: dict = {'__table__': table_name, '__row__': True, '__blank_row__': True}
+        for c in (self.tables.get(table_name) or {}).get('columns', []):
+            row[c] = None
+        return row
+
+    def _hop_keys(self, cur_name: str, cur_rows: list, cur_blank: bool,
+                  cur_idx: int, nxt_name: str, nxt_idx: int) -> set:
+        """The keys of nxt_name[nxt_idx] that the filtered rows of cur_name
+        select across one relationship, blank row included.
+
+        Across a one -> many hop, a visible blank row of the one side selects
+        the many-side rows whose key matches nothing (and blank keys). Across a
+        many -> one hop (bidirectional or an expanded table filter), the one
+        side's blank row is selected when a surviving row's key matches
+        nothing. Either way the blank row travels as 'None'.
+        """
+        allowed: set = set()
+        for r in cur_rows:
+            allowed |= _join_key_aliases(r[cur_idx])
+        cur_tbl = self.tables.get(cur_name) or {}
+        nxt_tbl = self.tables.get(nxt_name) or {}
+        cur_col = (cur_tbl.get('columns') or [None])[cur_idx] if cur_tbl else None
+        nxt_col = (nxt_tbl.get('columns') or [None])[nxt_idx] if nxt_tbl else None
+        if (nxt_name, cur_name) in self._one_side_of:
+            if cur_blank and cur_col is not None:
+                allowed |= self._unmatched_key_strs(nxt_name, nxt_idx, cur_name, cur_col)
+        elif nxt_col is not None and nxt_name in self.blank_row_tables():
+            keys = self._key_aliases(nxt_name, nxt_col)
+            if cur_blank or any(str(r[cur_idx]) not in keys for r in cur_rows):
+                allowed.add('None')
+        return allowed
 
     @staticmethod
     def _auto_detect_date_table(tables: dict, relationships: list | None = None) -> str:
@@ -1678,11 +1911,14 @@ class DAXContext:
 
         ck = None
         try:
+            if self._rels_sig is None:
+                raise TypeError
             ck = (id(tbl), 'xtf', tuple(sorted(
                 (k, self._filter_sig(v)) for k, v in self.filter_context.items())),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
                 tuple(sorted(k for k in self._expanded_keys
-                             if k in self.filter_context)))
+                             if k in self.filter_context)),
+                self._rels_sig)
         except TypeError:
             ck = None
         if ck is not None:
@@ -1771,19 +2007,24 @@ class DAXContext:
 
             # Filter dim table rows by all filters on that table
             filtered_dim_rows = src_tbl['rows']
+            applied = []
             for src_col, values in col_filters:
                 col_idx = self._find_col_idx(src_tbl['columns'], src_col)
                 if col_idx >= 0:
                     _m = make_value_matcher(values)
                     filtered_dim_rows = [r for r in filtered_dim_rows if _m(r[col_idx])]
+                    applied.append((src_col, values))
+            # The source's blank row survives when every filter on it keeps
+            # BLANK; it then selects the target rows no source row matches.
+            src_blank = (src_table in self.blank_row_tables()
+                         and self._filters_admit_blank(applied))
 
             # Get allowed join key values. Append even an EMPTY set: an empty
             # dimension selection must filter the fact to zero rows (BLANK), not
             # be dropped (which would leave the fact unfiltered -> grand total).
             # Mirrors the multi-hop path's empty-set handling.
-            allowed_keys = set()
-            for r in filtered_dim_rows:
-                allowed_keys |= _join_key_aliases(r[dim_join_idx])
+            allowed_keys = self._hop_keys(src_table, filtered_dim_rows, src_blank,
+                                          dim_join_idx, table_name, fact_join_idx)
             result_filters.append((allowed_keys, fact_join_idx))
 
         return result_filters
@@ -1823,48 +2064,40 @@ class DAXContext:
         """
         # Start from the source dimension rows filtered by its own column filters.
         frontier_rows = src_tbl['rows']
+        applied = []
         for src_col, values in col_filters:
             idx = self._find_col_idx(src_tbl['columns'], src_col)
             if idx >= 0:
                 _m = make_value_matcher(values)
                 frontier_rows = [r for r in frontier_rows if _m(r[idx])]
-        # Selecting BLANK selects DAX's unknown member: the rows on the far side
-        # of the relationship whose key matches NO row of this dimension. No real
-        # dimension row matches it, so it must be resolved at the join instead.
-        wants_blank = any(
-            isinstance(v, (list, tuple, set, frozenset)) and any(x is None for x in v)
-            for _c, v in col_filters)
+                applied.append((src_col, values))
+        # The blank row travels hop by hop (see _hop_keys): the source's survives
+        # when its filters keep BLANK, and the next table's when the hop's keys
+        # admit it. A fact row two hops down an unmatched key therefore lands on
+        # the blank row of every table above it (issue #82).
+        cur_name = path[0][0] if path else ''
+        cur_blank = (cur_name in self.blank_row_tables()
+                     and self._filters_admit_blank(applied))
         frontier_tbl = src_tbl
-        first_hop = True
         for (cur_name, nxt_name, col_cur, col_nxt) in path:
             cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
             if cur_idx < 0:
                 return None
-            allowed_keys = set()
-            for r in frontier_rows:
-                allowed_keys |= _join_key_aliases(r[cur_idx])
             nxt_tbl = self.tables.get(nxt_name)
             if not nxt_tbl:
                 return None
             nxt_idx = self._find_col_idx(nxt_tbl['columns'], col_nxt)
             if nxt_idx < 0:
                 return None
-            if wants_blank and first_hop:
-                # Resolve the unknown member: keys present on the far side that
-                # match no row of this dimension. Adding them to allowed_keys
-                # selects exactly the rows DAX attributes to the blank row.
-                member_keys = set()
-                for r in frontier_tbl['rows']:
-                    member_keys |= _join_key_aliases(r[cur_idx])
-                for r in nxt_tbl['rows']:
-                    if str(r[nxt_idx]) not in member_keys:
-                        allowed_keys |= _join_key_aliases(r[nxt_idx])
-            first_hop = False
+            allowed_keys = self._hop_keys(cur_name, frontier_rows, cur_blank,
+                                          cur_idx, nxt_name, nxt_idx)
             if nxt_name == target_table:
                 # Final hop: emit the filter for the fact table (empty set is OK).
                 return (allowed_keys, nxt_idx)
             # Intermediate hop: restrict the next table's rows and continue.
             frontier_rows = [r for r in nxt_tbl['rows'] if str(r[nxt_idx]) in allowed_keys]
+            cur_blank = (nxt_name in self.blank_row_tables()
+                         and 'None' in allowed_keys)
             frontier_tbl = nxt_tbl
         return None
 
@@ -2175,6 +2408,26 @@ class DAXContext:
         # the same measure for the same 261 employees in two different VARs paid
         # for all of it twice.
         ctx._measure_cache = self._measure_cache
+        return ctx
+
+    def with_relationships(self, relationships: list) -> 'DAXContext':
+        """The same evaluation over a different relationship set
+        (USERELATIONSHIP, CROSSFILTER).
+
+        It used to be a bare DAXContext, which dropped the grouping, the marked
+        date tables, the slicer selection, the culture, the measure home
+        tables and the ALL snapshots, so ISINSCOPE, ALLSELECTED and friends
+        answered for a different query (issue #83). The measure memo is NOT
+        shared: its key does not carry the relationships.
+        """
+        ctx = self.with_filters({})
+        fresh = DAXContext(self.tables, self.measures, self.date_table,
+                           self.date_column, self.filter_context, relationships)
+        for attr in ('relationships', '_rel_index', '_rel_dir', '_rel_adj',
+                     '_one_side_of', '_rels_sig'):
+            setattr(ctx, attr, getattr(fresh, attr))
+        ctx.date_tables = dict(self.date_tables)
+        ctx._measure_cache = {}
         return ctx
 
     def without_filters(self, keys: list) -> 'DAXContext':
@@ -3329,9 +3582,16 @@ class DAXEngine:
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
         This implements the row context → filter context transition."""
-        meta_keys = {'__table__', '__column__', '__value__', '__row__'}
+        meta_keys = {'__table__', '__column__', '__value__', '__row__',
+                     '__blank_row__'}
         table_name = row_item.get('__table__', '')
         filters: dict[str, list] = {}
+        if row_item.get('__blank_row__'):
+            # The blank row of ALL(T) / VALUES(T): every column BLANK, which
+            # the propagation resolves to the rows that match no row of T.
+            for k in row_item:
+                if k not in meta_keys:
+                    filters[f"{table_name}.{k}"] = RowContextValues([None])
         for k, v in row_item.items():
             if k in meta_keys or v is None:
                 continue
@@ -3346,8 +3606,10 @@ class DAXEngine:
             # it left the context UNFILTERED, so iterating a dimension that has an
             # unknown member evaluated the measure once over the whole model and
             # AVERAGEX came out double. The propagation resolves [None] to the
-            # rows whose key matches no dimension row.
-            filters[f"{table_name}.{col}"] = [None]
+            # rows whose key matches no dimension row. It is the iterated row,
+            # so it stays in scope like any other (Desktop: ISINSCOPE TRUE on
+            # the blank row after a transition, #80 / #82).
+            filters[f"{table_name}.{col}"] = RowContextValues([None])
         new_ctx = ctx.with_filters(filters)
         # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
         # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
@@ -3708,7 +3970,8 @@ class DAXEngine:
         sel.model_columns = ctx.model_columns
         return sel
 
-    def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool):
+    def _multi_column_all(self, ref: str, ctx: DAXContext, selected: bool,
+                          no_blank_row: bool = False):
         """ALL/ALLSELECTED over SEVERAL columns -> their distinct combinations.
 
         Both used an UNANCHORED regex on the raw argument text, so every column
@@ -3750,6 +4013,15 @@ class DAXEngine:
             rd = {'__table__': table_name, '__row__': True}
             for (_t, c), v in zip(cols, key):
                 rd[c] = v
+            out.append(rd)
+        # The blank row's combination: every column BLANK (issue #82).
+        blank_key = tuple(None for _ in idxs)
+        if blank_key not in seen and not no_blank_row and (
+                self._selected_ctx(ctx).blank_row_visible(table_name) if selected
+                else table_name in ctx.blank_row_tables()):
+            rd = {'__table__': table_name, '__row__': True}
+            for _t, c in cols:
+                rd[c] = None
             out.append(rd)
         return out
 
@@ -4392,10 +4664,32 @@ class DAXEngine:
                 continue
 
             # TREATAS — evaluated in the OUTER context (issue #49), applied
-            # to the cumulative new_ctx.
-            if filter_arg.upper().startswith('TREATAS'):
-                result = self._eval_expr(filter_arg, ctx)
-                if isinstance(result, dict) and '__treatas__' in result:
+            # to the cumulative new_ctx. _fn_treatas returns a
+            # ('__TREATAS__', (table, column), values) marker, which this branch
+            # never recognised (it looked for a dict), so EVERY
+            # CALCULATE(e, TREATAS(...)) applied no filter and returned the
+            # unfiltered total (issue #85). The values replace the column's
+            # filter like any filter argument -- KEEPFILTERS intersects -- and
+            # an empty table filters to nothing.
+            _tkf, _tinner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+            if _tinner.upper().startswith('TREATAS'):
+                result = self._eval_expr(_tinner, ctx)
+                if (isinstance(result, tuple) and len(result) == 3
+                        and result[0] == '__TREATAS__'):
+                    (_tt, _tc), _tvals = result[1], result[2]
+                    key = f"{_tt}.{_tc}"
+                    value: Any = list(dict.fromkeys(_tvals))
+                    if _tkf and key not in applied_here:
+                        outer = ctx.filter_context.get(key)
+                        if outer is not None:
+                            value = _keep_scope_tag(outer, {"all": [outer, value]})
+                    if key in applied_here:
+                        value = {"all": [applied_here[key], value]}
+                    applied_here[key] = value
+                    new_ctx = new_ctx.with_filters({key: value})
+                elif isinstance(result, list) and not result:
+                    return None
+                elif isinstance(result, dict) and '__treatas__' in result:
                     extra = {}
                     for fk, fv in result.items():
                         if fk != '__treatas__':
@@ -4746,6 +5040,16 @@ class DAXEngine:
             negate = not negate
             inner = peeled
 
+        # ISBLANK(T[C]) / NOT ISBLANK(T[C]): applied no filter at all, so the
+        # unfiltered total came back (issue #82).
+        isb, isb_inner = self._peel_call(inner, ('ISBLANK',))
+        if isb:
+            cm = _WHOLE_TCOL_RE.match(isb_inner)
+            if cm:
+                key = f"{(cm.group(1) or cm.group(2) or '').strip()}.{cm.group(3).strip()}"
+                return (key, {"is_blank": not negate}, keep)
+            return ()
+
         m = _CALC_PRED_RE.match(inner)
         rev = None if m else _CALC_PRED_REV_RE.match(inner)
         if rev:
@@ -4764,16 +5068,25 @@ class DAXEngine:
                                           m.group(2).strip(),
                                           m.group(3), m.group(4).strip())
             val = self._eval_expr(val_text, ctx, var_scope)
-            if val is None:
-                return ()
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
                       '>=': '<', '<': '>='}[op]
             key = f"{tbl}.{col}"
+            if val is None:
+                # T[C] = BLANK() is a real filter: BLANK, and the zero of the
+                # column's type, since BLANK = 0 and BLANK = "" are TRUE. It
+                # used to apply no filter (issue #82); _compare does the
+                # coercion.
+                return (key, {"op": op, "value": None}, keep)
             # Plain equality keeps the historical In-set list form: it is what
             # every existing caller and test expects, and make_value_matcher
             # treats a list as string membership.
             if op == '=':
+                if _blank_zero_of(val) == val:
+                    # T[C] = 0 (or "", FALSE) keeps BLANK too: FILTER(ALL(T[C]),
+                    # T[C] = 0) tests BLANK = 0, which is TRUE (Desktop: a
+                    # numeric key's blank row is in ZD[Key] = 0).
+                    return (key, [val, None], keep)
                 return (key, [val], keep)
             return (key, {"op": op, "value": val}, keep)
 
@@ -4821,10 +5134,7 @@ class DAXEngine:
             new_rels.append(r)
         if not changed:
             return ctx
-        _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
-                          ctx.date_column, ctx.filter_context, new_rels)
-        _nc._filter_idx_cache = ctx._filter_idx_cache
-        return _nc
+        return ctx.with_relationships(new_rels)
 
     def _apply_crossfilter(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
         """CROSSFILTER(col1, col2, direction): override the cross-filter
@@ -4855,10 +5165,7 @@ class DAXEngine:
             new_rels.append(r)
         if not changed:
             return ctx
-        _nc = DAXContext(ctx.tables, ctx.measures, ctx.date_table,
-                          ctx.date_column, ctx.filter_context, new_rels)
-        _nc._filter_idx_cache = ctx._filter_idx_cache
-        return _nc
+        return ctx.with_relationships(new_rels)
 
     @staticmethod
     def _rebase_filter_delta(base: DAXContext, shifted: DAXContext,
@@ -5010,12 +5317,15 @@ class DAXEngine:
         """REMOVEFILTERS — returns a marker for CALCULATE to process."""
         return ('__REMOVEFILTERS__', args_str.strip())
 
-    def _fn_all(self, args_str: str, ctx: DAXContext) -> Any:
+    def _fn_all(self, args_str: str, ctx: DAXContext,
+                no_blank_row: bool = False) -> Any:
         """ALL — when used inside CALCULATE returns a marker; when used as a
         table expression (e.g. ALL('table'[column])) returns all distinct
-        values of that column ignoring any active filters."""
+        values of that column ignoring any active filters. The table's blank
+        row is included unless ``no_blank_row`` (ALLNOBLANKROW)."""
         ref = args_str.strip()
-        multi = self._multi_column_all(ref, ctx, selected=False)
+        multi = self._multi_column_all(ref, ctx, selected=False,
+                                       no_blank_row=no_blank_row)
         if multi is not None:
             return multi
         # Try to parse as a column reference: 'table'[column]
@@ -5029,15 +5339,15 @@ class DAXEngine:
             if tbl:
                 col_idx = ctx._find_col_idx(tbl['columns'], col_name)
                 if col_idx >= 0:
-                    # Return list of {column: value} dicts for iteration
-                    all_values = list(set(row[col_idx] for row in tbl['rows'] if row[col_idx] is not None))
-                    out = [{'__table__': table_name, '__column__': col_name,
-                            '__value__': v} for v in all_values]
-                    if self._has_unknown_member(table_name, col_name, col_idx,
-                                                tbl, ctx):
-                        out.append({'__table__': table_name,
-                                    '__column__': col_name, '__value__': None})
-                    return out
+                    # Every distinct value, a stored BLANK included (Desktop:
+                    # ALLNOBLANKROW(RD[Name]) keeps the real blank, so ALL
+                    # must), plus the blank row's BLANK (issue #82).
+                    all_values = list(dict.fromkeys(row[col_idx] for row in tbl['rows']))
+                    if (None not in all_values and not no_blank_row
+                            and table_name in ctx.blank_row_tables()):
+                        all_values.append(None)
+                    return [{'__table__': table_name, '__column__': col_name,
+                             '__value__': v} for v in all_values]
 
         # Table-level ALL: ALL('TableName') — return all rows as multi-column row dicts
         table_name = ref.strip("'").strip()
@@ -5051,6 +5361,8 @@ class DAXEngine:
                 for ci, col_name in enumerate(cols):
                     row_dict[col_name] = row[ci] if ci < len(row) else None
                 result.append(row_dict)
+            if not no_blank_row and table_name in ctx.blank_row_tables():
+                result.append(ctx.blank_row_dict(table_name))
             return result
 
         # Fallback: marker for CALCULATE
@@ -5162,41 +5474,6 @@ class DAXEngine:
     _DATEADD_ARGS_RE = re.compile(
         r"'?([^'\[]+)'?\s*\[([^\]]+)\]\s*,\s*(-?\d+)\s*,\s*(\w+)", re.IGNORECASE)
 
-    def _has_unknown_member(self, table_name: str, col_name: str, col_idx: int,
-                            tbl: dict, ctx: DAXContext) -> bool:
-        """Does this dimension column need DAX's BLANK (unknown) member?
-
-        When a related table holds a key that matches no row here, the engine
-        adds a blank row to the dimension and attributes those facts to it. In
-        Agents_Performance one DimStore row points at EmployeeKey 245, which does
-        not exist in DimEmployee, so Desktop's ALL(DimEmployee[EmployeeKey])
-        yields 294 members and AVERAGEX over it divides by 262 non-blank, not 261.
-        Omitting the member made every "Employees Avg ..." measure differ.
-
-        Memoized: the far side can be a fact table, and this is called per ALL().
-        """
-        key = (id(tbl), 'unknown-member', col_idx)
-        hit = ctx._filter_idx_cache.get(key)
-        if hit is not None:
-            return bool(hit)
-        member_keys = {str(r[col_idx]) for r in tbl['rows']}
-        found = False
-        for rel in (ctx.relationships or []):
-            if (rel.get('ToTable') != table_name
-                    or str(rel.get('ToColumn') or '').lower() != col_name.lower()):
-                continue
-            ftbl = ctx.tables.get(rel.get('FromTable'))
-            if not ftbl:
-                continue
-            fi = ctx._find_col_idx(ftbl['columns'], rel.get('FromColumn'))
-            if fi < 0:
-                continue
-            if any(str(r[fi]) not in member_keys for r in ftbl['rows']):
-                found = True
-                break
-        ctx._filter_idx_cache[key] = found
-        return found
-
     def _fn_dateadd(self, args_str: str, ctx: DAXContext) -> Any:
         """DATEADD(<dates>, offset, interval) as a real TABLE.
 
@@ -5228,20 +5505,42 @@ class DAXEngine:
                 for v in self._dateadd_dates(dt, dc, -1, 'YEAR', ctx)]
 
     def _fn_values(self, args_str: str, ctx: DAXContext) -> Any:
-        ref = self._eval_expr(args_str.strip(), ctx)
+        arg = args_str.strip()
+        tname = arg.strip("'")
+        if tname in ctx.tables and not _WHOLE_TCOL_RE.match(arg):
+            # VALUES(<table>): the visible rows -- duplicates kept, unlike
+            # DISTINCT -- plus the blank row when it is visible (Desktop:
+            # VALUES(BD) 4 rows, DISTINCT(BD) 3). It used to return nothing.
+            rows = self._eval_tail(arg, ctx) or []
+            if ctx.blank_row_visible(tname):
+                rows = rows + [ctx.blank_row_dict(tname)]
+            return rows
+        ref = self._eval_expr(arg, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             # Order-preserving dedup: Desktop iterates VALUES in data order, and
             # hash-set order made CONCATENATEX output nondeterministic.
-            values = list(dict.fromkeys(ctx.get_column_data(ref[0], ref[1])))
+            values = self._values_with_blank(ref[0], ref[1], ctx)
             # Return as row-dict list so CONCATENATEX / FILTER / iterators work
             return [{'__table__': ref[0], '__column__': ref[1], '__value__': v} for v in values]
         return []
+
+    @staticmethod
+    def _values_with_blank(table_name: str, col_name: str, ctx: DAXContext) -> list:
+        """VALUES(T[C]) as a list: the visible distinct values, plus BLANK
+        when T's blank row is visible (issue #82). Also what HASONEVALUE and
+        SELECTEDVALUE count."""
+        values = list(dict.fromkeys(ctx.get_column_data(table_name, col_name)))
+        if None not in values and ctx.blank_row_visible(table_name):
+            values.append(None)
+        return values
 
     def _fn_selectedvalue(self, args_str: str, ctx: DAXContext) -> Any:
         args = self._split_args(args_str)
         ref = self._eval_expr(args[0].strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = list(set(ctx.get_column_data(ref[0], ref[1])))
+            # IF(HASONEVALUE(c), VALUES(c), alt): the one value may be the
+            # blank row's, and then the answer is BLANK, not alt (issue #82).
+            values = self._values_with_blank(ref[0], ref[1], ctx)
             if len(values) == 1:
                 return values[0]
         default = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
@@ -6235,8 +6534,9 @@ class DAXEngine:
             ridx = ctx._find_col_idx(rtbl.get('columns', []), rc)
             if ridx < 0:
                 return []
-            vals = list(dict.fromkeys(
-                r[ridx] for r in ctx.get_filtered_rows(rt)))
+            # The base rows whose key matches no row of rt group under BLANK
+            # (Desktop: COUNTROWS(SUMMARIZE(BF, BD[Name])) = 4, issue #82).
+            vals = self._values_with_blank(rt, rc, ctx)
             axes.append([(f"{rt}.{rc}", rc, v) for v in vals])
         if not axes:
             return []
@@ -6355,12 +6655,47 @@ class DAXEngine:
         if tail:
             inner += ", " + ", ".join(a.strip() for a in tail)
         result = self._fn_summarize(inner, ctx)
+        if isinstance(result, list):
+            result = self._summarizecolumns_blank_group(
+                result, group_refs, tail, ctx)
         if rollup_subtotal and isinstance(result, list):
             sub = {'__table__': group_refs[0][0], '__row__': True}
             for _t, _c in group_refs:
                 sub[_c] = None
             result = result + [sub]
         return result
+
+    def _summarizecolumns_blank_group(self, result: list, group_refs: list,
+                                      tail: list, ctx: DAXContext) -> list:
+        """SUMMARIZECOLUMNS' (Blank) group: the group-by table's blank row,
+        kept, like any group, only when an expression is non-blank on it
+        (Desktop: BD[Name] grouped gives (Blank) = 20, issue #82)."""
+        tables = {t for t, _c in group_refs}
+        if len(tables) != 1:
+            return result
+        table_name = next(iter(tables))
+        if not ctx.blank_row_visible(table_name):
+            return result
+        if any(isinstance(r, dict) and all(r.get(c) is None for _t, c in group_refs)
+               for r in result):
+            return result
+        exts = []
+        rest = [a.strip() for a in tail]
+        while rest and not rest[0].startswith('"'):
+            rest.pop(0)
+        for i in range(0, len(rest) - 1, 2):
+            exts.append((rest[i].strip('"'), rest[i + 1]))
+        bctx = ctx.with_filters({f"{table_name}.{c}": [None] for _t, c in group_refs})
+        vals = {name: self._eval_expr(expr, bctx) for name, expr in exts}
+        if exts and all(v is None for v in vals.values()):
+            return result
+        row: dict = {'__table__': table_name}
+        for _t, c in group_refs:
+            row[c] = None
+        row.update(vals)
+        row['__column__'] = group_refs[0][1]
+        row['__value__'] = None
+        return result + [row]
 
     def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
         """SELECTCOLUMNS(table, name, expression, ...) — select/rename columns."""
@@ -6757,20 +7092,12 @@ class DAXEngine:
             # groups: 'quoted name' | bare name | column
             table_name = (col_match.group(1) or col_match.group(2) or '').strip()
             col_name = col_match.group(3).strip()
-            values = self._selected_ctx(ctx).get_column_data(table_name, col_name)
-            unique = [v for v in set(values) if v is not None]
-            out = [{'__table__': table_name, '__column__': col_name,
-                    '__value__': v} for v in unique]
-            # ALLSELECTED spans the whole column, so it carries DAX's BLANK
-            # (unknown) member too when a related table holds an unmatched key.
-            tbl = ctx.tables.get(table_name)
-            if tbl:
-                ci = ctx._find_col_idx(tbl['columns'], col_name)
-                if ci >= 0 and self._has_unknown_member(table_name, col_name,
-                                                        ci, tbl, ctx):
-                    out.append({'__table__': table_name,
-                                '__column__': col_name, '__value__': None})
-            return out
+            # The selected values, BLANK included when the selection keeps
+            # the table's blank row (Desktop: ALLSELECTED(BD[Name]) = 4).
+            values = self._values_with_blank(table_name, col_name,
+                                             self._selected_ctx(ctx))
+            return [{'__table__': table_name, '__column__': col_name,
+                     '__value__': v} for v in values]
         return ('__ALLSELECTED__', ref)
 
     def _fn_keepfilters(self, args_str: str, ctx: DAXContext) -> Any:
@@ -6784,8 +7111,7 @@ class DAXEngine:
         """HASONEVALUE(column) — check if exactly one distinct value in filter context."""
         ref = self._eval_expr(args_str.strip(), ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = list(set(ctx.get_column_data(ref[0], ref[1])))
-            return len(values) == 1
+            return len(self._values_with_blank(ref[0], ref[1], ctx)) == 1
         return False
 
     def _fn_hasonefilter(self, args_str: str, ctx: DAXContext) -> Any:
@@ -7577,10 +7903,10 @@ class DAXEngine:
         return False
 
     def _fn_allnoblankrow(self, args_str: str, ctx: DAXContext):
-        # This engine never materialises the blank (unknown) member row, so
-        # ALLNOBLANKROW is ALL over stored rows -- which is exactly what
-        # Desktop's goldens on the fixture show (K: 4 rows; K[grp]: 3 values).
-        return self._fn_all(args_str, ctx)
+        # ALL over the stored rows: the blank row is left out, a stored BLANK
+        # value is not (Desktop: ALLNOBLANKROW(RD[Name]) = 3 with one real
+        # blank; ALLNOBLANKROW(BD) = 3 next to ALL(BD) = 4).
+        return self._fn_all(args_str, ctx, no_blank_row=True)
 
     def _fn_filters(self, args_str: str, ctx: DAXContext):
         """FILTERS(column) -- the directly-filtered values of the column, or
@@ -7601,6 +7927,10 @@ class DAXEngine:
             if idx < 0:
                 return None
             vals = list(dict.fromkeys(row[idx] for row in tbl['rows']))
+            # every value of the column, the blank row's included (Desktop:
+            # COUNTROWS(FILTERS(BD[Name])) = 4 with no filter, issue #82)
+            if None not in vals and t in ctx.blank_row_tables():
+                vals.append(None)
         return [{'__table__': t, '__column__': c, '__value__': v} for v in vals]
 
     def _fn_topnskip(self, args_str: str, ctx: DAXContext):
@@ -10153,7 +10483,9 @@ class DAXEngine:
                     row_ctx = ctx
                     result = self._eval_expr(row_expr, ctx)
                 if result is None:
-                    continue
+                    # BLANK joins as "" -- the delimiter stays (Desktop:
+                    # CONCATENATEX(VALUES(BD[Name]), BD[Name], ",") = "X,Y,Z,").
+                    result = ''
                 if order_expr is not None:
                     key = self._eval_expr(order_expr, row_ctx)
                     parts.append((key, str(result)))
@@ -11474,9 +11806,11 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
             if not ok or fact_col_idx is None:
                 continue
             for row in base_rows:
-                v = key_to_value.get(str(row[fact_col_idx]))
-                if v is not None:
-                    buckets.setdefault(v, []).append(row)
+                k = str(row[fact_col_idx])
+                if k in key_to_value:
+                    # BLANK is a group of its own: the rows that reach the
+                    # dimension's blank row (issue #82)
+                    buckets.setdefault(key_to_value[k], []).append(row)
             key_is_str = False
 
         # --- aggregate each bucket with the real engine (empty filter) ---

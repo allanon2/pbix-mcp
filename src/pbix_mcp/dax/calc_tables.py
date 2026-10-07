@@ -1907,7 +1907,8 @@ def evaluate_calc_table_expression(
     if not all(isinstance(r, dict) for r in result):
         return None, "expression did not evaluate to a row set"
 
-    meta = {"__table__", "__column__", "__value__", "__row__"}
+    # __blank_row__ marks the blank row ALL(T) / VALUES(T) can carry (#82)
+    meta = {"__table__", "__column__", "__value__", "__row__", "__blank_row__"}
     # Single-column shape produced by DISTINCT()/VALUES(). Only when the rows
     # carry NO named columns of their own — some results (DATATABLE, SUMMARIZE)
     # set __column__/__value__ *alongside* real named columns, and treating
@@ -2347,7 +2348,7 @@ def _convert_dax_result(result: list, tdef: dict) -> Optional[dict]:
     if not result or not isinstance(result[0], dict):
         return None
 
-    meta_keys = {'__table__', '__column__', '__value__'}
+    meta_keys = {'__table__', '__column__', '__value__', '__blank_row__'}
     sample = result[0]
     result_cols = [k for k in sample.keys() if k not in meta_keys]
 

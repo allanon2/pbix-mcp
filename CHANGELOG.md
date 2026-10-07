@@ -5,6 +5,147 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.113] - 2026-10-07
+
+### Fixed — the builder stores an unmatched fact key the way Desktop does (issue #81)
+
+- **What was wrong:** a fact key with no row in the dimension was joined to
+  the dimension's **first** row, so its values were silently added to a real
+  member.
+  - The relationship index (R$) holds one slot per distinct key, pointing at
+    the dimension row.
+  - An unmatched key fell back to row 0, which was written as row 1.
+  - Desktop writes 0 there, the blank member. That was read back from the same
+    model after Desktop refreshed it.
+- **`RelationshipIndexStorage.Flags` is now 1 when any rows reach the blank
+  member,** through an unmatched key or a blank key. Without the flag the rows
+  do land on the blank member, but `VALUES` does not show it.
+  - A census of the Desktop-authored corpus agrees: the flag sits on the
+    relationships with unmatched or blank keys. In Adventure Works it is set
+    only on `Sales[ShipDateKey]`, the one relationship with blank keys.
+- **Verified in Power BI Desktop** (2.152, ADOMD): 147 queries give the same
+  answers on the built file and after Desktop's own full refresh. They cover
+  integer, string, blank-key, inactive, bidirectional, snowflake, 1:1 and
+  many-to-many relationships.
+
+### Fixed — the DAX engine models the blank (unknown) member (issue #82)
+
+- When a relationship joins a row whose key matches no row of the one side,
+  Power BI gives that table a **blank row** and puts those rows on it. The
+  engine had it only for `ALL` over the key column and for multi-hop filters.
+  Measured on Desktop, it now models where the row exists and who sees it:
+  - **Which tables get it:** active and inactive relationships, and both
+    sides of a 1:1. Never for many-to-many. It is carried one level up a
+    snowflake.
+  - **Shown by:** `VALUES` (column and table), `ALL`, `ALLSELECTED`, `FILTERS`,
+    column predicates, `SUMMARIZE` over the fact, `SELECTEDVALUE` /
+    `HASONEVALUE`, and grouping.
+  - **Hidden from:** `DISTINCT`, `ALLNOBLANKROW`, a bare table reference,
+    `COUNTROWS(T)`, `DISTINCTCOUNT`, `COUNTA` and `MIN` / `MAX`.
+  - **Filters that keep BLANK** select the rows on it, directly or across hops.
+  - **Over a bidirectional relationship,** fact rows on unmatched keys narrow
+    the dimension to the blank row.
+  - **ISINSCOPE is TRUE on the blank row after a context transition.** This
+    closes what #80 left open.
+- **Three CALCULATE filters applied no filter at all:** `ISBLANK(T[C])`,
+  `NOT ISBLANK(T[C])` and `T[C] = BLANK()`. They now filter, with DAX's
+  coercion:
+  - `BLANK() = 0` and `BLANK() = ""` are TRUE, so `T[Key] = 0` keeps the blank
+    row as well;
+  - `ISBLANK` is strict.
+- **`VALUES(<table>)` returned nothing.** It now returns the visible rows,
+  duplicates kept, plus the blank row.
+- **Corrected along the way,** each one measured:
+  - `ALL(column)` dropped stored BLANK values. Desktop keeps them, and so does
+    `ALLNOBLANKROW`.
+  - `CONCATENATEX` skipped a BLANK instead of joining it as `""`. Desktop gives
+    `"X,Y,Z,"`.
+  - A comparison against BLANK now uses the other side's zero, so
+    `BLANK() < 1` is TRUE.
+- **Faster, not slower:** an evaluation context no longer rebuilds the
+  relationship indexes. They are now built once per relationship list. A
+  `FILTER` over 40,000 rows creates about 50,000 contexts, and rebuilding the
+  indexes for each one was the largest single cost of such a measure. On the
+  AI sample, `Forecast` takes 3.8 s against 5.1 s on 0.9.112, and
+  `Close %` 2.9 s against 4.5 s. On Agents Performance all 102 measures give
+  the same values as on 0.9.112, and none is slower.
+- **Result:**
+  - **147 of 147** Desktop queries match; 0.9.112 matched 49.
+  - The #78–#80 harness, rebuilt with the fixed builder, matches **all 5,954
+    cells** through `pbix_evaluate_dax` and **all 5,890** through the grouped
+    tool. 0.9.112's engine misses 10 and 5 of them. On the file 0.9.112's
+    builder wrote, the same harness had two cells off because of #81; on the
+    rebuilt file, none are.
+
+### Fixed — results under `USERELATIONSHIP` / `CROSSFILTER` no longer leak into other evaluations (issue #83)
+
+- **The leak:** the relationship-propagation memo is model-wide and outlives
+  a call, and its key left out the relationship set. So a `USERELATIONSHIP`
+  context and a plain one served each other's results. For example,
+  `CALCULATE([QTotal], QD[Name] = "Q1")` answered 1 instead of 7 after a
+  `USERELATIONSHIP` query. The key now includes the relationship set.
+- **The context:** the one built for `USERELATIONSHIP` / `CROSSFILTER` kept
+  only the filters. It now keeps the grouping, the selection, the culture, the
+  measure home tables and the `ALL` snapshots. In a grouped query under
+  `USERELATIONSHIP`, Desktop gives `ISINSCOPE` TRUE and `ALLSELECTED` = 3, and
+  so does the engine now.
+
+### Fixed — `TREATAS` as a `CALCULATE` filter (issue #85)
+
+- **It was never applied.** `_fn_treatas` returns a tuple marker, while
+  CALCULATE looked for a dict that nothing produces. So
+  `CALCULATE(e, TREATAS(...))` returned the unfiltered value.
+- **It now behaves as in Desktop:**
+  - it replaces the column's filter, and `KEEPFILTERS` intersects;
+  - two filters on one column intersect;
+  - an empty table filters to nothing.
+
+  All 12 shapes measured in Desktop match.
+
+### Fixed — `pbix_evaluate_dax_per_dimension` applies marked date tables and lists the BLANK group (issue #86)
+
+- **Marked date tables:** the per-value fallback did not pass the model's
+  marked date tables, which is the gap #79 closed in the grouped tool. By
+  month, `DM_le` was 496 / 120 / (null) where Desktop gives 616 / 616 / 616.
+- **The BLANK group:** the tool now lists it as `(Blank)`, as the grouped tool
+  does.
+
+### Fixed — container formatting numbers are spelled as Desktop spells them (issue #84)
+
+- **Padding and spacing** were written as Int64 literals, and `int()` silently
+  dropped a fraction: padding 7.5 was stored as `'7L'`. They are now `D`
+  literals.
+- **Border and drop-shadow** numbers were Python's float repr (`'1.0D'`). They
+  now drop the fractional part when it is zero, as Desktop does (`'1D'`).
+- **Measured on Desktop-authored files.** In the 36 such files in the local
+  corpus, these properties are integral `D` literals: padding 892 of 892,
+  spacing 226 of 226, border 76 of 76, drop-shadow 164 of 169. All five
+  exceptions are in one file. OpenBI's 25-file census (its doc 45) found the
+  same for padding.
+
+### Changed — visible to callers
+
+- **`pbix_evaluate_dax_grouped` and `pbix_evaluate_dax_per_dimension` can now
+  return a BLANK group.** It covers stored blanks and the blank row. Its key
+  is `null` in the grouped tool's JSON and `(Blank)` in the per-dimension
+  text, and it is sorted last.
+- **Relationships carry cardinality:** `ModelReader.relationships` and the
+  DAX context's relationship dicts now include `FromCardinality` /
+  `ToCardinality`.
+
+- **Pinned by 162 tests; 111 fail on 0.9.112:**
+
+  | test file | tests | fail on 0.9.112 |
+  |---|---|---|
+  | `tests/test_issue81_orphan_keys_blank_member.py` | 5 | 3 |
+  | `tests/test_issue82_blank_member.py` | 133 | 86 |
+  | `tests/test_issue83_relationship_cache.py` | 6 | 6 |
+  | `tests/test_issue84_container_literals.py` | 3 | 3 |
+  | `tests/test_issue85_treatas_filter.py` | 12 | 11 |
+  | `tests/test_issue86_per_dimension_tool.py` | 3 | 2 |
+
+  The tests that pass on 0.9.112 are controls, or cells it already had right.
+
 ## [0.9.112] - 2026-10-07
 
 ### Fixed — a date filter clears the date table's other filters only where Power BI does (issue #78; PRs #68, #72 by @allanon2)

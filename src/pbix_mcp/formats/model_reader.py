@@ -195,7 +195,8 @@ class ModelReader:
         Get all relationships in the data model.
 
         Returns list of dicts with keys: FromTableName, FromColumnName,
-        ToTableName, ToColumnName, IsActive, CrossFilteringBehavior.
+        ToTableName, ToColumnName, IsActive, CrossFilteringBehavior,
+        FromCardinality, ToCardinality.
         """
         if "relationships" in self._metadata_cache:
             return self._metadata_cache["relationships"]
@@ -214,7 +215,9 @@ class ModelReader:
                    tt.Name AS ToTableName,
                    COALESCE(tc.ExplicitName, tc.InferredName) AS ToColumnName,
                    r.IsActive,
-                   r.CrossFilteringBehavior
+                   r.CrossFilteringBehavior,
+                   r.FromCardinality,
+                   r.ToCardinality
             FROM [Relationship] r
             JOIN [Column] fc ON r.FromColumnID = fc.ID
             JOIN [Table] ft ON fc.TableID = ft.ID

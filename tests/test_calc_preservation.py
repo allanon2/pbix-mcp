@@ -278,8 +278,12 @@ class TestRebuildDoesNotReadTheWholeModel:
             os.unlink(tmp)
 
         assert rels, "fixture has no relationships"
+        # Cardinality decides which tables carry DAX's blank row (#82).
         expected = {"FromTable", "FromColumn", "ToTable", "ToColumn",
-                    "IsActive", "CrossFilteringBehavior"}
+                    "IsActive", "CrossFilteringBehavior",
+                    "FromCardinality", "ToCardinality"}
+        assert {k for r in server._get_dax_context(alias)["relationships"]
+                for k in r} == expected
         for r in rels:
             assert set(r) == expected, r
             # Endpoints must resolve — calculated-table and auto-date columns

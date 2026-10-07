@@ -3909,11 +3909,24 @@ def _modify_metadata_and_encode(
             from_row_count = len(fk_dict_order) + DATA_ID_OFFSET
 
             # Build R$ INDEX: 3 padding zeros + 1-based TO row per dictionary
-            # entry, in data_id order
+            # entry, in data_id order. A key with no TO row (a referential-
+            # integrity violation) gets slot 0, the TO table's blank member —
+            # Desktop's own encoding, read back from a model it refreshed
+            # (#81). It used to fall back to row 0 + 1, joining every
+            # unmatched key to the dimension's FIRST row.
             index_values: list[int] = [0] * DATA_ID_OFFSET
+            unmatched = 0
             for fk_val in fk_dict_order:
-                matched_idx = to_key_index.get(fk_val, 0)
-                index_values.append(matched_idx + 1)  # 1-based row index
+                matched_idx = to_key_index.get(fk_val)
+                if matched_idx is None:
+                    unmatched += 1
+                    index_values.append(0)
+                else:
+                    index_values.append(matched_idx + 1)  # 1-based row index
+            # RelationshipIndexStorage.Flags = 1 when some FROM rows reach the
+            # blank member: an unmatched key, or a blank key (data_id 2, a
+            # padding slot). Desktop sets it on refresh in both cases.
+            ris_flags = 1 if unmatched or any(v is None for v in fk_values) else 0
 
             # R$ table naming: table name does NOT include .tbl suffix
             rel_name_spaced = rel_name.replace("-", " ")
@@ -4148,12 +4161,13 @@ def _modify_metadata_and_encode(
 
             # No StorageFile for dictionary — R$ INDEX uses Type=0 (no dict)
 
-            # Update RelationshipIndexStorage with SystemTableID and RecordCount
+            # Update RelationshipIndexStorage with SystemTableID, RecordCount
+            # and the blank-member flag
             c.execute(
                 """UPDATE RelationshipIndexStorage
-                   SET SystemTableID = ?, RecordCount = ?
+                   SET SystemTableID = ?, RecordCount = ?, Flags = ?
                    WHERE ID = ?""",
-                (r_table_id, from_row_count, ris_id),
+                (r_table_id, from_row_count, ris_flags, ris_id),
             )
 
             # Encode R$ INDEX using direct NoSplit<N> encoding

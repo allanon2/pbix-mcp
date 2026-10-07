@@ -40,6 +40,17 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
+**Updated 2026-10-07 (0.9.113): docs 1-45 and GitHub issues #1-#86 are closed;
+the issue queue is empty.**
+
+- #77 (PR, @allanon2) -- ISINSCOPE through a context transition -- 0.9.111;
+- #78, #79, #80 -- the marked-date-table rule, the grouped tool, KEEPFILTERS
+  scope -- 0.9.112;
+- #81, #82, #83, #85, #86 -- the blank (unknown) member in the builder and the
+  engine, the USERELATIONSHIP cache leak, TREATAS in CALCULATE, the
+  per-dimension tool -- 0.9.113;
+- doc 45 = GitHub #84 (padding written as an Int64 literal) -- 0.9.113.
+
 ## Audit note: the #43 case-fold is correct, and now visible
 
 The sweep flagged that `'abc'`/`'ABC'`/`'Abc'` all read back as `'abc'` with
@@ -211,6 +222,48 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **doc 45 (GH #84)** -- CLOSED (0.9.113). Padding and spacing were written as
+  Int64 literals (`'8L'`, and 7.5 truncated to `'7L'`), border and drop-shadow
+  numbers as `'1.0D'`. Desktop writes integral D literals for all four cards
+  (892 / 226 / 76 / 164 of 169 in 36 Desktop-authored files). Regression:
+  tests/test_issue84_container_literals.py.
+- **GH #86** -- CLOSED (0.9.113). `pbix_evaluate_dax_per_dimension` ignored
+  marked date tables -- the gap #79 closed in the grouped tool -- and left out
+  the BLANK group. Regression: tests/test_issue86_per_dimension_tool.py.
+- **GH #85** -- CLOSED (0.9.113). `CALCULATE(e, TREATAS(...))` applied no
+  filter (a marker-shape mismatch), so the unfiltered value came back. It now
+  replaces the column's filter (KEEPFILTERS intersects; an empty table filters
+  to nothing). 12 Desktop-measured shapes. Regression:
+  tests/test_issue85_treatas_filter.py.
+- **GH #83** -- CLOSED (0.9.113). The model-wide relationship-propagation memo
+  was keyed without the relationship set, so USERELATIONSHIP / CROSSFILTER
+  results and plain ones served each other -- across calls. Their context also
+  dropped the grouping and the selection. Regression:
+  tests/test_issue83_relationship_cache.py.
+- **GH #82** -- CLOSED (0.9.113). The engine's blank (unknown) member: the
+  blank row Power BI adds when a relationship holds unmatched or blank keys
+  was missing from VALUES, ALL, filters that keep BLANK, grouping, inactive /
+  bidirectional / 1:1 relationships and snowflakes; ISBLANK / `= BLANK()`
+  CALCULATE filters applied no filter. 147 of 147 Desktop queries match (was
+  49). Regression: tests/test_issue82_blank_member.py.
+- **GH #81** -- CLOSED (0.9.113). The builder joined an unmatched fact key to
+  the dimension's FIRST row; it now writes Desktop's encoding (R$ slot 0 and
+  RelationshipIndexStorage.Flags 1), identical before and after a Desktop
+  refresh on 147 queries. Regression:
+  tests/test_issue81_orphan_keys_blank_member.py.
+- **GH #80** -- CLOSED (0.9.112; the blank-row remainder in 0.9.113).
+  KEEPFILTERS kept a column in scope only for the plain-predicate form on a
+  grouped column. Regression: tests/test_issue80_keepfilters_scope.py.
+- **GH #79** -- CLOSED (0.9.112). `pbix_evaluate_dax_grouped` ignored marked
+  date tables and answered ISINSCOPE FALSE on its own grouped columns.
+  Regression: tests/test_issue79_grouped_tool.py.
+- **GH #78** -- CLOSED (0.9.112). A date filter clears the date table's other
+  filters only where Power BI does: a marked date table's date column, or a
+  DateTime relationship column. Regression:
+  tests/test_issue78_date_table_rule.py.
+- **GH #77** -- MERGED (0.9.111, PR by @allanon2). ISINSCOPE through a context
+  transition. Regression: tests/test_isinscope_context_transition.py.
 
 - **GH #76** -- CLOSED (0.9.109). `report_filter_json` was written verbatim:
   the documented `{target, operator, values}` example produced
