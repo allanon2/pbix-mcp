@@ -25,6 +25,21 @@ expectation, not an engine defect — see below.
 Re-run the audit before claiming the queue is clear. `gh issue list` covers only
 the GitHub tracker; these docs are a separate stream.
 
+**Updated 2026-10-07 (0.9.109): docs 1-44 and GitHub issues #1-#76 are closed;
+the issue queue is empty.** Since the audit above:
+
+- doc 44 = GitHub #67 (`fontColor` on title/subtitle/legend, unread keys
+  reported) — closed in 0.9.106;
+- #74 — the `outline` follow-up flagged while closing #67 — closed in 0.9.107;
+- #75 — build warnings never reached an MCP caller, which completes #43's
+  0.9.105 visibility fix (see the audit note below) — closed in 0.9.108;
+- #76 — the `report_filter_json` follow-up queued in #52 and never landed —
+  closed in 0.9.109.
+
+From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
+and release notes cite it — so a change can be followed from the CHANGELOG
+alone.
+
 ## Audit note: the #43 case-fold is correct, and now visible
 
 The sweep flagged that `'abc'`/`'ABC'`/`'Abc'` all read back as `'abc'` with
@@ -43,7 +58,12 @@ unqualified success. So the build now emits, for each affected column, a
 example pair, and stating that they store as one value using the first spelling.
 Behaviour is unchanged; only the silence is. Regression:
 `tests/test_case_fold_warning.py` (incl. a negative control and a
-non-string-column control). The `pbix_doctor` DBCC-style validator that the same
+non-string-column control).
+
+**Correction (2026-10-07):** that warning went to Python's `warnings` stream
+only, which an MCP caller never sees — over MCP the fold stayed silent
+(`success: true, warnings: []`) until **0.9.108 (#75)**, which forwards every
+build warning about the call's own data into the response. The `pbix_doctor` DBCC-style validator that the same
 report asked for is present (`check_string_dictionaries`,
 `check_name_collisions`, `check_dictionary_widths`).
 
@@ -192,6 +212,29 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #76** -- CLOSED (0.9.109). `report_filter_json` was written verbatim:
+  the documented `{target, operator, values}` example produced
+  schema-invalid bookmarks (no `name`, three disallowed keys). Now converted
+  to Desktop's filter container, typed to the column; a full container passes
+  through, anything else is refused. Desktop-verified that a bookmark filters
+  ONLY through a report-level filter card on that column, so a missing card is
+  added (unselected) and reported. Regression:
+  tests/test_issue76_bookmark_report_filters.py + a PBIR conformance case.
+- **GH #75** -- CLOSED (0.9.108). Builder warnings (case-fold #43, row fields
+  that are not columns, a hierarchy a rebuild dropped, relationship type
+  mismatch / orphan keys) went to Python's `warnings` only; every MCP tool
+  answered `warnings: []`. Now forwarded, scoped to the tables the call
+  touched. Regression: tests/test_issue75_build_warnings_reach_mcp.py.
+- **GH #74** -- CLOSED (0.9.107). `outline` colour and width never applied on
+  any visual: `outline.color` on visuals whose card names it `lineColor`, the
+  stroke on the selector-less entry where Desktop reads it only from
+  `{"id": "default"}`, and a card written on visuals that have none (tables,
+  charts). Desktop-verified on all seven outline visuals. Regression:
+  tests/test_outline_card.py.
+- **doc 44 (GH #67)** -- CLOSED (0.9.106). `fontColor` dropped on
+  title/subtitle/legend; the legend wrote a property no legend reads
+  (`labelColor` is right); keys a card does not read are now reported.
+  Regression: tests/test_issue67_font_color_and_ignored_keys.py.
 - **findings-24 (GH #26)** -- CLOSED (0.9.79). ALLSELECTED semantics under
   grouped evaluation: the engine now distinguishes group-by filters from the
   caller's slicer (`DAXContext.group_keys` + `selected_filters` threaded
