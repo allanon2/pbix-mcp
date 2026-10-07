@@ -1341,6 +1341,26 @@ def _substitute_row_refs(expr: str, table_name: str, row_item: dict) -> str:
     return out
 
 
+class GroupByValues(list):
+    """A filter_context In-set that came from the QUERY'S GROUPING (a row of a
+    SUMMARIZECOLUMNS / visual axis), not from a slicer or a CALCULATE filter.
+
+    ISINSCOPE asks exactly that question, so the provenance travels with the
+    values: CALCULATE builds fresh plain lists when it replaces or removes a
+    column's filter, which drops the tag, and leaves an untouched column's list
+    as it was. Verified against Power BI Desktop 2.157: ISINSCOPE is TRUE for a
+    grouped column, FALSE for one that is only filtered (TREATAS) or whose
+    filter a CALCULATE replaced (``IT Area = "BU Support"``, even on that very
+    row) or removed (REMOVEFILTERS / ALL / ALLSELECTED()), and stays TRUE when
+    another column's filter is removed.
+    """
+
+
+class GroupByPredicate(dict):
+    """The GroupByValues tag for a predicate-form filter (e.g. the BLANK group's
+    ``{"is_blank": True}``)."""
+
+
 class DAXContext:
     """Execution context for DAX evaluation — holds table data and filter state."""
 
@@ -4459,6 +4479,11 @@ class DAXEngine:
                     outer = ctx.filter_context.get(key)
                     if outer is not None:
                         value = {"all": [outer, value]}
+                        if isinstance(outer, (GroupByValues, GroupByPredicate)):
+                            # Intersecting keeps the grouping in scope: Desktop
+                            # answers CALCULATE(ISINSCOPE(c), KEEPFILTERS(c = v))
+                            # TRUE on every grouped row (replacing it: FALSE).
+                            value = GroupByPredicate(value)
                 if key in applied_here:
                     value = {"all": [applied_here[key], value]}
                 applied_here[key] = value
@@ -5667,20 +5692,28 @@ class DAXEngine:
     def _fn_isinscope(self, args_str: str, ctx: DAXContext) -> Any:
         """ISINSCOPE(column) — is the column a GROUPING level of this query?
 
-        Always FALSE here, and that is the faithful answer, not a stub: ISINSCOPE
-        asks about the query's group-by axes, which a single-cell measure
-        evaluation has none of. It is NOT the same question as ISFILTERED --
-        Desktop, over the same model, answers
+        TRUE when the column's current filter is the query's own grouping
+        (GroupByValues / GroupByPredicate, see there): the caller says which
+        filter_context keys are group-by axes (``group_by`` on
+        pbix_evaluate_dax / evaluate_measures_smart). A single-cell evaluation
+        with no grouping answers FALSE, as Desktop's grand total does.
+
+        It is NOT the same question as ISFILTERED -- Desktop, over the same model,
+        answers
 
             CALCULATE(ISINSCOPE('Risk'[Location]), 'Risk'[Location] = "x")  FALSE
             CALCULATE(ISFILTERED('Risk'[Location]), 'Risk'[Location] = "x")  TRUE
 
-        so delegating to ISFILTERED would flip every filtered evaluation the
-        wrong way. Desktop's grand total also answers FALSE, which is the cell
-        this engine reproduces. The argument is still evaluated so a malformed
-        reference is not silently accepted.
+        and a column the query filters without grouping it is ISFILTERED but not
+        ISINSCOPE. KEEPFILTERS on a grouped column keeps it in scope. Not
+        modelled: Desktop also puts a column in scope through a context
+        transition (CALCULATE(ISINSCOPE(c)) inside an iteration over c); that
+        answers FALSE here.
         """
-        self._eval_expr(args_str.strip(), ctx)
+        ref = self._eval_expr(args_str.strip(), ctx)
+        if isinstance(ref, tuple) and len(ref) == 2:
+            return isinstance(ctx.filter_context.get(f"{ref[0]}.{ref[1]}"),
+                              (GroupByValues, GroupByPredicate))
         return False
 
     def _fn_error(self, args_str: str, ctx: DAXContext) -> Any:
@@ -11306,6 +11339,15 @@ def _find_selectedvalue_targets(expr: str) -> list:
     return targets
 
 
+def _tag_group_by(value):
+    """Tag one filter_context value as the query's grouping (GroupByValues)."""
+    if isinstance(value, dict):
+        return GroupByPredicate(value)
+    if isinstance(value, (list, tuple, set)):
+        return GroupByValues(value)
+    return GroupByValues([value])
+
+
 def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
                             date_table: str | None = None, date_column: str | None = None,
@@ -11313,8 +11355,14 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             simulate_row_context: bool = True,
                             measure_tables: dict | None = None,
                             model_columns: dict | None = None,
-                            culture: str | None = None) -> dict:
+                            culture: str | None = None,
+                            group_by: set | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
+
+    ``group_by`` names the filter_context keys that are the query's GROUPING
+    (one SUMMARIZECOLUMNS / visual row), as opposed to slicer filters: their
+    values are tagged GroupByValues for ISINSCOPE, and they become the context's
+    group_keys (with the rest as selected_filters) as in grouped evaluation.
 
     When a measure returns BLANK and its expression uses SELECTEDVALUE on a
     parameter table, this tries evaluating with each possible value to find
@@ -11329,7 +11377,13 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     simulate_row_context=False for Desktop-identical evaluation; pbix_evaluate_dax
     does so unless the caller opts in.
     """
+    if group_by:
+        filter_context = {key: (_tag_group_by(v) if key in group_by else v)
+                          for key, v in (filter_context or {}).items()}
     ctx = DAXContext(tables, measures, date_table, date_column, filter_context, relationships)
+    if group_by:
+        ctx.group_keys = set(group_by)
+        ctx.selected_filters = {key: v for key, v in filter_context.items() if key not in group_by}
     # A measure's home table is the only thing that can disambiguate an
     # unqualified [Column] several tables share -- see _resolve_bare_column.
     ctx.measure_tables = measure_tables or {}
