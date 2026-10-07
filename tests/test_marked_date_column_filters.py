@@ -57,3 +57,19 @@ def test_filters_written_by_the_same_calculate_are_kept():
 
 def test_filters_on_other_columns_do_not_trigger_it():
     assert _ev("CALCULATE(SUM('Date'[v]), 'Date'[Month] = 2)", {"Date.Year": [2024]}) == 2
+
+
+# KEEPFILTERS: measured on the same sample and on a DAILY marked table (Revenue Opportunities):
+# it intersects instead of replacing, so the marked-table rule does not apply and an existing
+# filter on the date column itself is kept.
+
+def test_keepfilters_on_the_date_column_keeps_the_tables_other_filters():
+    expr = "CALCULATE(SUM('Date'[v]), KEEPFILTERS('Date'[Date] <= DATE(2024, 6, 1)))"
+    assert _ev(expr, MAR) == 3                     # the month's own value, not 1 + ... + 6
+
+
+def test_keepfilters_running_total_intersects_with_the_date_filter():
+    expr = ("CALCULATE(SUM('Date'[v]), KEEPFILTERS(FILTER(ALL('Date'[Date]), "
+            "'Date'[Date] <= MAX('Date'[Date]))))")
+    assert _ev(expr, {"Date.Date": [datetime(2024, 3, 1)]}) == 3   # that day only
+    assert _ev(expr, MAR) == 3
