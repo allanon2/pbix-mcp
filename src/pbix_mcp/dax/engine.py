@@ -1619,6 +1619,7 @@ class DAXContext:
         # CALCULATE and evaluate_measure clear it (they ARE the transition).
         self._outer_ctx: Optional['DAXContext'] = None
         self._measure_cache: dict = {}
+        self._measure_cache_unsupported: dict = {}   # cache key -> unsupported functions it hit
         self._eval_stack: set = set()  # Prevent circular refs
         # Bound total sub-expression evaluations per top-level measure so a
         # pathological/non-terminating measure degrades to BLANK instead of
@@ -2415,6 +2416,7 @@ class DAXContext:
         # the same measure for the same 261 employees in two different VARs paid
         # for all of it twice.
         ctx._measure_cache = self._measure_cache
+        ctx._measure_cache_unsupported = self._measure_cache_unsupported
         return ctx
 
     def with_relationships(self, relationships: list) -> 'DAXContext':
@@ -2435,6 +2437,7 @@ class DAXContext:
             setattr(ctx, attr, getattr(fresh, attr))
         ctx.date_tables = dict(self.date_tables)
         ctx._measure_cache = {}
+        ctx._measure_cache_unsupported = {}
         return ctx
 
     def without_filters(self, keys: list) -> 'DAXContext':
@@ -2461,6 +2464,12 @@ class DAXEngine:
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
         self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
+        # The same, per measure: a function hit while evaluating measure M is
+        # recorded for M and for every measure whose evaluation reached M (the
+        # ordered path below), so a caller can tell WHICH measure of a call
+        # depended on it instead of attributing a call-wide set.
+        self.unsupported_by_measure: dict[str, set[str]] = {}
+        self._measure_path: list[tuple[str, set[str]]] = []   # (measure, what its evaluation hit)
         # Measures abandoned on the wall-clock budget. They return BLANK like
         # any other failure, and BLANK is ALSO what a legitimately empty measure
         # returns -- so without this the caller cannot tell "no value" from "we
@@ -2939,6 +2948,12 @@ class DAXEngine:
             'CROSSFILTER': self._fn_crossfilter,
         }
 
+    def _note_unsupported(self, func_name: str) -> None:
+        self.unsupported_functions.add(func_name)
+        for m, hit in self._measure_path:
+            hit.add(func_name)
+            self.unsupported_by_measure.setdefault(m, set()).add(func_name)
+
     def evaluate_measure(self, measure_name: str, ctx: DAXContext) -> Any:
         """Evaluate a named measure in the given context."""
         # DAX identifiers are CASE-INSENSITIVE. Canonicalize to the model's own
@@ -2984,6 +2999,12 @@ class DAXEngine:
         except Exception:
             cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
+            # Replay what the cached evaluation hit, for the measures that
+            # reach it now (the value is reused, so is its dependency).
+            for f in ctx._measure_cache_unsupported.get(cache_key, ()):
+                for m, hit in self._measure_path + [(measure_name, set())]:
+                    hit.add(f)
+                    self.unsupported_by_measure.setdefault(m, set()).add(f)
             return ctx._measure_cache[cache_key]
 
         # Prevent circular references
@@ -3027,10 +3048,13 @@ class DAXEngine:
         _prev_outer = getattr(ctx, '_outer_ctx', None)
         ctx._outer_ctx = None
         self._home_tables.append(ctx.measure_tables.get(measure_name))
+        hit: set[str] = set()
+        self._measure_path.append((measure_name, hit))
         try:
             result = _scalarize(self._eval_expr(expr.strip(), ctx))
             if cache_key:
                 ctx._measure_cache[cache_key] = result
+                ctx._measure_cache_unsupported[cache_key] = frozenset(hit)
             return result
         except Exception as _exc:
             # A DEADLINE abort must not be swallowed here. Returning None for a
@@ -3052,6 +3076,7 @@ class DAXEngine:
         finally:
             ctx._outer_ctx = _prev_outer
             self._home_tables.pop()
+            self._measure_path.pop()
             ctx._eval_stack.discard(measure_name)
             self._eval_depth -= 1
             if self._eval_depth == 0:
@@ -3121,7 +3146,7 @@ class DAXEngine:
                 fn = self._func_map.get(func_name)
                 if fn:
                     return fn(args_text, ctx)
-                self.unsupported_functions.add(func_name)
+                self._note_unsupported(func_name)
                 import logging
                 logging.getLogger("pbix_mcp.dax").debug(
                     "Unsupported DAX function: %s", func_name)
@@ -5737,7 +5762,7 @@ class DAXEngine:
             e = int((end - epoch).total_seconds())
             s = int((start - epoch).total_seconds())
             return e // unit - s // unit
-        self.unsupported_functions.add(f"DATEDIFF interval {interval}")
+        self._note_unsupported(f"DATEDIFF interval {interval}")
         return None
 
     # DAX date format tokens -> strftime. Ordered longest-first so "MMMM" isn't
