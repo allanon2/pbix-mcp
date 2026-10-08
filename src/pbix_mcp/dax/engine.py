@@ -936,6 +936,67 @@ def _as_date_strict(v):
     return None
 
 
+def _as_datetime_strict(v):
+    """A date or datetime as a datetime (a date is midnight), for EQUALITY: a
+    string counts only when the whole of it is an ISO date or date-time."""
+    if isinstance(v, datetime):
+        return v.replace(tzinfo=None)
+    if isinstance(v, date):
+        return datetime(v.year, v.month, v.day)
+    if isinstance(v, str):
+        s = v.strip()
+        if _as_date_str_strict(s) is None and "T" not in s and ":" not in s:
+            return None
+        try:
+            return datetime.fromisoformat(s).replace(tzinfo=None)
+        except ValueError:
+            d = _as_date_str_strict(s)
+            return datetime(d.year, d.month, d.day) if d is not None else None
+    return None
+
+
+def _cell_keys(v, dateish: bool = True) -> tuple:
+    """The keys a cell is indexed under in a value map, as DAX compares values.
+
+    Text is case-insensitive and stays text: '01' and '1' are different keys
+    (the old str()/float() aliasing merged them into one filter value), and so
+    are 09:00 and 17:00 on one day (the old ISO-date alias merged a datetime
+    into its calendar day). Numbers compare by value across int/float storage
+    (issue #39). A string that is a whole ISO date or date-time is also a
+    moment, for the columns that carry dates as text."""
+    if v is None:
+        return (("blank",),)
+    if isinstance(v, bool):
+        return (("bool", v),)
+    if isinstance(v, (int, float)):
+        return (("num", float(v)),)
+    if isinstance(v, (datetime, date)):
+        return (("moment", _as_datetime_strict(v)),)
+    if isinstance(v, str):
+        m = _as_datetime_strict(v) if dateish else None
+        return (("text", v.casefold()),) + ((("moment", m),) if m is not None else ())
+    return (("text", str(v).casefold()),)
+
+
+def _filter_keys(v) -> set:
+    """The value-map keys a filter value selects. A number also selects its
+    text spelling and a numeric string its number, as callers pass either
+    (a Double column filtered by '2024', a text code by 7); a date-time string
+    selects its moment. Never a date-only alias of a time of day."""
+    keys = set(_cell_keys(v))
+    if v == 'None':
+        keys.add(("blank",))   # the engine's own spelling of BLANK in internal filter sets
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        fv = float(v)
+        keys.add(("text", (str(int(fv)) if fv.is_integer() else str(fv)).casefold()))
+    elif isinstance(v, str):
+        try:
+            keys.add(("num", float(v)))
+        except ValueError:
+            pass
+    return keys
+
+
 def _as_datetime(v):
     """Best-effort datetime coercion from a value or ISO-ish string."""
     if isinstance(v, datetime):
@@ -1354,34 +1415,43 @@ def make_value_matcher(spec):
     if not isinstance(spec, dict):
         values = spec if isinstance(spec, (list, tuple, set)) else [spec]
         allowed = {str(v) for v in values}
+        # DAX compares TEXT case-insensitively: TREATAS({"europe"}, T[Region])
+        # selects "Europe". Exact str() membership selected nothing.
+        allowed_text = {v.casefold() for v in values if isinstance(v, str)}
         # A date reaches us in more than one representation and str() of two
         # equal dates need not match: a Date table column holds datetime
         # objects, while DATESMTD/DATESYTD and caller-supplied filter_context
         # entries produce ISO strings -- '2009-12-01 00:00:00' vs '2009-12-01'.
         # That mismatch made CALCULATE([Sales], DATESMTD(...)) select ZERO rows
-        # and return BLANK where Desktop returns $19,260,877. _as_date only
-        # accepts date/datetime/ISO-ish text, never a bare number, so a numeric
-        # filter cannot be reinterpreted as a date serial by accident.
-        allowed_dates = {d for d in (_as_date_strict(v) for v in values)
-                         if d is not None}
+        # and return BLANK where Desktop returns $19,260,877. Equal means the
+        # same DATETIME, though, not the same day: matching by calendar date
+        # merged 09:00 and 17:00 on one day into one filter value. A date-only
+        # entry is midnight, as in DAX. Never a bare number, so a numeric filter
+        # cannot be reinterpreted as a date serial by accident.
+        allowed_moments = {d for d in (_as_datetime_strict(v) for v in values)
+                           if d is not None}
         # NUMBERS have the same problem (issue #39): a Double column's cells
         # str() as '2024.0' while the filter literal str()s as '2024', so
         # CALCULATE(expr, T[Year]=2024) selected ZERO rows and returned BLANK
         # where the explicit FILTER form (numeric comparison) answers 350.
-        # Match numerically whenever both sides parse as numbers. Bools are
-        # excluded: True must not silently equal 1.0.
+        # Match numerically when the CELL is a number. A text cell is text in
+        # DAX: '01' must not select 1 (nor '1.0'). Bools are excluded: True must
+        # not silently equal 1.0.
         allowed_numbers = _numeric_filter_set(values)
-        if not allowed_dates and not allowed_numbers:
-            return lambda cell: str(cell) in allowed
 
         def _match_full(cell):
             if str(cell) in allowed:
                 return True
-            if _numeric_member(cell, allowed_numbers):
-                return True
-            if allowed_dates:
-                cd = _as_date_strict(cell)
-                return cd is not None and cd in allowed_dates
+            if isinstance(cell, str):
+                if cell.casefold() in allowed_text:
+                    return True
+            elif (allowed_numbers and isinstance(cell, (int, float))
+                    and not isinstance(cell, bool)):
+                if float(cell) in allowed_numbers:
+                    return True
+            if allowed_moments:
+                cm = _as_datetime_strict(cell)
+                return cm is not None and cm in allowed_moments
             return False
 
         return _match_full
@@ -2310,6 +2380,56 @@ class DAXContext:
             acc |= f
         return frozenset(acc)
 
+    def _typed_index_map(self, tbl: dict, col_idx: int) -> dict:
+        """``{typed key: frozenset(row indices)}`` for one column, built once:
+        the value as DAX compares it (``_cell_keys``). Used for a filter on the
+        column itself; relationship joins keep the str()-keyed map above, whose
+        key spellings the join machinery produces."""
+        key = (id(tbl), 'tmap', col_idx)
+        tmap = self._filter_idx_cache.get(key)
+        if tmap is None:
+            rows = tbl['rows']
+            dateish = False   # sample first: a date parse per text cell is costly
+            for row in rows[:64]:
+                v = row[col_idx]
+                if v is None:
+                    continue
+                if isinstance(v, (datetime, date)):
+                    dateish = True
+                elif isinstance(v, str):
+                    dateish = _as_date_str_strict(v.strip()) is not None
+                break
+            acc: dict = {}
+            for i, row in enumerate(rows):
+                for k in _cell_keys(row[col_idx], dateish):
+                    acc.setdefault(k, []).append(i)
+            tmap = {k: frozenset(v) for k, v in acc.items()}
+            self._filter_idx_cache[key] = tmap
+        return tmap
+
+    def _indices_for_column_filter(self, tbl: dict, col_idx: int, allowed):
+        """Row indices an In-SET filter on the column itself selects, as DAX
+        compares values: text case-insensitively and never as a number, numbers
+        by value, datetimes as moments (not calendar days). None for a
+        structured predicate (the caller uses the matcher)."""
+        if isinstance(allowed, dict):
+            return None
+        values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
+            else [allowed]
+        tmap = self._typed_index_map(tbl, col_idx)
+        keys = set()
+        for v in values:
+            keys |= _filter_keys(v)
+        found = [tmap[k] for k in keys if k in tmap]
+        if not found:
+            return frozenset()
+        if len(found) == 1:
+            return found[0]
+        acc: set = set()
+        for f in found:
+            acc |= f
+        return frozenset(acc)
+
     def _surviving_indices(self, table_name: str, tbl: dict):
         """Indices of ``tbl['rows']`` that satisfy the filter context, or None
         when nothing filters this table.
@@ -2332,7 +2452,7 @@ class DAXContext:
             filt_idx = self._find_col_idx(cols, parts[1])
             if filt_idx < 0:
                 continue
-            hit = self._indices_for_values(tbl, filt_idx, allowed)
+            hit = self._indices_for_column_filter(tbl, filt_idx, allowed)
             if hit is None:
                 sig = self._filter_sig(allowed)
                 key = (id(tbl), 'd', filt_idx, sig) if sig is not None else None
