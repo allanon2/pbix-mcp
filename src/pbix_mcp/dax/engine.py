@@ -40,6 +40,7 @@ import os
 import random
 import re
 import statistics
+import threading
 import time
 from calendar import monthrange
 from datetime import date, datetime, timedelta, timezone
@@ -1151,6 +1152,11 @@ def _relative_date_bounds(spec: dict):
 _SHARED_FILTER_CACHES: dict = {}
 _SHARED_FILTER_CACHE_MAX = 4
 
+# Guards the bounded module-level caches' insert-and-evict steps, which
+# evaluations on different threads (see _engine) may run at once. Lookups stay
+# lock-free: the caches only ever hold values derived from their keys.
+_CACHE_LOCK = threading.Lock()
+
 
 # Relationship sets seen so far -> a small id (see DAXContext._rels_sig).
 _RELS_SIG_IDS: dict = {}
@@ -1242,12 +1248,15 @@ def _relationship_indexes(relationships: list) -> tuple:
              r.get('CrossFilteringBehavior'), r.get('FromCardinality'),
              r.get('ToCardinality'))
             for r in relationships)
-        rels_sig = _RELS_SIG_IDS.setdefault(sig, len(_RELS_SIG_IDS))
+        with _CACHE_LOCK:
+            rels_sig = _RELS_SIG_IDS.setdefault(sig, len(_RELS_SIG_IDS))
     except (AttributeError, TypeError):
         rels_sig = None
     out = (rel_index, rel_dir, rel_adj, one_side_of, rels_sig)
     if len(_REL_INDEX_CACHE) >= _REL_INDEX_CACHE_MAX:
-        _REL_INDEX_CACHE.pop(next(iter(_REL_INDEX_CACHE)), None)
+        with _CACHE_LOCK:
+            if _REL_INDEX_CACHE:
+                _REL_INDEX_CACHE.pop(next(iter(_REL_INDEX_CACHE)), None)
     _REL_INDEX_CACHE[id(relationships)] = (relationships, out)
     return out
 
@@ -1275,9 +1284,12 @@ def _shared_filter_cache(tables) -> dict:
         return {}
     hit = _SHARED_FILTER_CACHES.get(fp)
     if hit is None:
-        if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
-            _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
-        hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
+        with _CACHE_LOCK:
+            hit = _SHARED_FILTER_CACHES.get(fp)
+            if hit is None:
+                if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
+                    _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
+                hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
     return hit
 
 
@@ -11616,7 +11628,38 @@ class DAXEngine:
 # API for the backend
 # =========================================================================
 
-_engine = DAXEngine()
+class _ThreadLocalEngine:
+    """The module's engine, one DAXEngine per thread.
+
+    A DAXEngine carries per-evaluation state (the deadline and depth, the
+    ALLSELECTED snapshots, unsupported functions, errors), which the server
+    reads back after each call. A single shared instance made two concurrent
+    evaluations corrupt each other, so a host had to serialise every call
+    behind one lock. Each thread now gets its own instance on first use."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def _get(self) -> DAXEngine:
+        eng = getattr(self._local, "engine", None)
+        if eng is None:
+            eng = self._local.engine = DAXEngine()
+        return eng
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        if name == "_local":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._get(), name, value)
+
+
+_engine = _ThreadLocalEngine()
+
+# Capability flag: evaluations on different threads don't share state.
+THREAD_SAFE_EVALUATION = True
 
 
 def evaluate_measure(measure_name: str, tables: dict, measures: dict,
