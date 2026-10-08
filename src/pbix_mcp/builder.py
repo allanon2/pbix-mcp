@@ -1097,8 +1097,13 @@ class PBIXBuilder:
             "linguisticSchemaSyncVersion": 2,
             "defaultDrillFilterOtherVisuals": True,
             "objects": {},
+            # useStylableVisualContainerHeader: "Use the modern visual header
+            # with updated styling options", on in every report Desktop saves
+            # since 2019. Without it Desktop draws the legacy visual container,
+            # which insets every visual's content further than current files.
             "settings": {"useNewFilterPaneExperience": True,
-                         "allowChangeFilterTypes": True},
+                         "allowChangeFilterTypes": True,
+                         "useStylableVisualContainerHeader": True},
         }
         layout = {
             "id": 0,
