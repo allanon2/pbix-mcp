@@ -1095,6 +1095,20 @@ def _to_serial(v) -> float:
     return _dax_serial(dt)
 
 
+def _expanded_tables(table: str, relationships) -> set:
+    """`table` and the tables in its expanded table: the ONE sides it reaches
+    through active relationships, following FromTable (many) -> ToTable (one)."""
+    out, todo = {table}, [table]
+    while todo:
+        cur = todo.pop()
+        for rel in relationships or []:
+            if (rel.get('IsActive') and rel.get('FromTable') == cur
+                    and rel.get('ToTable') and rel['ToTable'] not in out):
+                out.add(rel['ToTable'])
+                todo.append(rel['ToTable'])
+    return out
+
+
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
     date when both parse as dates, else as text. A BLANK side compares as the
@@ -4617,13 +4631,23 @@ class DAXEngine:
                         #  ALLSELECTED(EventEdges))` must still see the
                         # component filter that reaches EventEdges through
                         # EventTypes, so the measure reads 0, not 440.
+                        #
+                        # The table here is its EXPANDED table: the one-side
+                        # tables it reaches through active many-to-one
+                        # relationships are part of it. A grouping filter on
+                        # such a dimension (not an outer selection) goes too.
+                        # MS_Perf_Analyzer's Timeline table groups by
+                        # RootActions and EventTypes columns with no outer
+                        # filter, and Desktop's own visual query answers the
+                        # second edge's [MS Since First Edge] as 440, not 0.
                         outer_sel = self._selected_filters()
+                        expanded = _expanded_tables(table, new_ctx.relationships)
                         new_ctx = new_ctx.without_filters(
                             [k for k in new_ctx.filter_context
-                             if k.startswith(f"{table}.")
+                             if k.split('.', 1)[0] in expanded
                              and k not in outer_sel])
                         restore = {k: v for k, v in outer_sel.items()
-                                   if k.startswith(f"{table}.")
+                                   if k.split('.', 1)[0] in expanded
                                    and new_ctx.filter_context.get(k) != v}
                         if restore:
                             new_ctx = new_ctx.with_filters(restore)
