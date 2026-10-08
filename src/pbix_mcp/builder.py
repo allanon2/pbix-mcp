@@ -707,6 +707,14 @@ _SETTINGS_JSON = '{"Version":4,"ReportSettings":{},"QueriesSettings":{"TypeDetec
 _METADATA_JSON = '{"Version":5,"AutoCreatedRelationships":[],"CreatedFrom":"Cloud","CreatedFromRelease":"2024.03"}'.encode("utf-16-le")
 
 
+# Implicit aggregation functions (semanticQuery QueryAggregateFunction) and the
+# queryRef prefix Desktop names them by.
+_AGGREGATE_CODES = {"sum": 0, "average": 1, "distinctCount": 2, "min": 3, "max": 4,
+                    "countNonNull": 5, "median": 6, "stdDev": 7, "variance": 8}
+_AGGREGATE_REF_NAMES = {0: "Sum", 1: "Avg", 2: "DistinctCount", 3: "Min", 4: "Max",
+                        5: "CountNonNull", 6: "Median", 7: "StandardDeviation", 8: "Variance"}
+
+
 class PBIXBuilder:
     """Build a valid PBIX file from scratch."""
 
@@ -939,11 +947,28 @@ class PBIXBuilder:
         self,
         name: str = "Page 1",
         visuals: list[dict] | None = None,
+        *,
+        filters: list[dict] | None = None,
+        interactions: list[dict] | None = None,
     ) -> "PBIXBuilder":
-        """Add a report page with optional visuals."""
+        """Add a report page with optional visuals.
+
+        Each visual is {"type", "name", "config", ...}. Besides the config
+        shapes of ``_build_visual_bindings`` (card, slicer, table columns,
+        category + measure), ``config={"roles": {role: [field, ...]}}`` binds
+        any roles (a matrix's Rows/Columns/Values, a chart's Series, implicit
+        aggregations). A visual may also carry ``objects`` (its formatting
+        objects, e.g. subTotals or a slicer's general.filter selection) and
+        ``filters`` (visual-level filters, as Desktop writes them).
+
+        ``filters`` are the page's filters; ``interactions`` the section's
+        visual interactions, [{"source": name, "target": name, "type": code}].
+        """
         self._pages.append({
             "name": name,
             "visuals": visuals or [],
+            "filters": filters or [],
+            "interactions": interactions or [],
         })
         return self
 
@@ -1017,6 +1042,13 @@ class PBIXBuilder:
                         container["query"] = json.dumps(q, ensure_ascii=False)
                         container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
                         container["filters"] = "[]"
+                # Formatting objects (subTotals, a slicer's general.filter, ...)
+                # and visual-level filters, as Desktop writes them (legacy layout:
+                # filters are a JSON string on the container).
+                if vis.get("objects"):
+                    single_visual["objects"] = vis["objects"]
+                if vis.get("filters") is not None:
+                    container["filters"] = json.dumps(vis["filters"], ensure_ascii=False)
                 container["config"] = json.dumps({
                     "name": vis.get("name", f"visual_{j}"),
                     "singleVisual": single_visual,
@@ -1029,6 +1061,11 @@ class PBIXBuilder:
                 "width": page.get("width", 1280),
                 "height": page.get("height", 720),
                 "visualContainers": containers,
+                # Page-level filters, and visual interactions as the section
+                # config's `relationships` ([{"source", "target", "type"}]).
+                "filters": json.dumps(page.get("filters") or [], ensure_ascii=False),
+                **({"config": json.dumps({"relationships": page["interactions"]}, ensure_ascii=False)}
+                   if page.get("interactions") else {}),
             })
 
         # Report-level config, matching Desktop-authored files field-for-field
@@ -1080,10 +1117,12 @@ class PBIXBuilder:
         def _alias_for(entity: str) -> str:
             """Get or create a short alias for a table/entity."""
             if entity not in from_sources:
-                from_sources[entity] = entity[0].lower()
-                # Handle alias collisions
-                base = from_sources[entity]
-                existing = set(from_sources.values()) - {base}
+                # Handle alias collisions. (The taken set must not include this
+                # entity's own new entry: computing it AFTER assigning, minus the
+                # candidate, emptied it, so "Region" and "Range" both got "r" and
+                # the visual's query referred to one source twice.)
+                existing = set(from_sources.values())
+                base = entity[0].lower()
                 suffix = 0
                 while base in existing:
                     suffix += 1
@@ -1119,8 +1158,44 @@ class PBIXBuilder:
             })
             return query_ref
 
+        def _add_aggregation(table: str, column: str, function: str) -> str:
+            """Add an implicit aggregation of a column, return its queryRef."""
+            code = _AGGREGATE_CODES.get(function)
+            if code is None:
+                raise ValueError(f"unknown aggregation {function!r}; expected one of {sorted(_AGGREGATE_CODES)}")
+            alias = _alias_for(table)
+            query_ref = f"{_AGGREGATE_REF_NAMES[code]}({table}.{column})"
+            if query_ref not in [x["Name"] for x in selects]:
+                selects.append({
+                    "Aggregation": {"Expression": {"Column": {"Expression": {"SourceRef": {"Source": alias}},
+                                                              "Property": column}},
+                                    "Function": code},
+                    "Name": query_ref,
+                })
+            return query_ref
+
+        # --- Any visual: explicit roles --------------------------------------
+        # {"roles": {"Rows": [...], "Columns": [...], "Values": [...]}}, each
+        # field {"table", "column"} | {"measure"} | {"table", "column",
+        # "aggregation": "sum" | "average" | "distinctCount" | "min" | "max" |
+        # "countNonNull" | "median" | "stdDev" | "variance"}. Covers what the
+        # shapes below don't: a matrix's Rows and Columns, chart Series,
+        # several values, implicit aggregations of any function.
+        if "roles" in cfg:
+            for role, fields in cfg["roles"].items():
+                items = []
+                for f in fields:
+                    if "measure" in f:
+                        ref = _add_measure(f["measure"])
+                    elif f.get("aggregation"):
+                        ref = _add_aggregation(f["table"], f["column"], f["aggregation"])
+                    else:
+                        ref = _add_column(f["table"], f["column"])
+                    items.append({"queryRef": ref, "active": True})
+                projections[role] = items
+
         # --- Card: single measure -----------------------------------------
-        if visual_type == "card" and "measure" in cfg:
+        elif visual_type == "card" and "measure" in cfg:
             ref = _add_measure(cfg["measure"])
             projections["Values"] = [{"queryRef": ref, "active": True}]
 
