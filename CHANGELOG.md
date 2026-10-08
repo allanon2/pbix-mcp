@@ -5,6 +5,92 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.120] - 2026-10-08
+
+Three fixes reported by OpenBI's port of the engine (OpenBI docs 48 and 49), plus one found while verifying them.
+
+- **ROUND and ISFILTERED:** checked against Power BI Desktop 2.152 over ADOMD. All 32 cells match; 0.9.119 got 19 of them wrong.
+- **ISFILTERED / ISCROSSFILTERED battery:** 276 cells, all matching Desktop except the 6 that belong to #114. 0.9.119 got 75 wrong.
+- **PBIR groups:** checked on a Desktop-authored PBIR report, which Desktop opens after an edit.
+- **No regressions:** across 402 Desktop-measured probes, 0.9.120 fixes 95 cells and gets none wrong that 0.9.119 got right.
+
+The batteries also exposed five older engine defects, filed as #114–#118 and still open:
+- a table filter does not act on its expanded table (#114);
+- a context transition over a fact row does not filter its dimensions (#115);
+- a table expression in a row context sees only the current row (#116);
+- SUMMARIZE by a related column (#117);
+- ALLSELECTED drops explicit filters (#118).
+
+### Fixed — ROUND rounds half away from zero (issue #110)
+
+- **What was wrong:** `ROUND` was Python's `round()`, which rounds a tie to the even neighbour and works on the binary double. Desktop rounds half away from zero, on the decimal value:
+
+  | expression | Desktop 2.152 | 0.9.119 |
+  |---|---|---|
+  | `ROUND(2.5, 0)` | 3 | 2 |
+  | `ROUND(-2.5, 0)` | -3 | -2 |
+  | `ROUND(0.5, 0)` | 1 | 0 |
+  | `ROUND(1250, -2)` | 1300 | 1200 |
+  | `ROUND(5, -1)` | 10 | 0 |
+  | `ROUND(1.005, 2)` | 1.01 | 1.0 |
+  | `ROUND(0.125, 2)` | 0.13 | 0.12 |
+  | `ROUND(2.675, 2)` | 2.68 | 2.67 |
+  | `ROUND(1.45, 1)` | 1.5 | 1.4 |
+
+- **The fix:** ROUND rounds the shortest decimal form of the number half away from zero, the same arithmetic `FORMAT` already used. Negative digits round to tens and hundreds, and a whole number stays whole. `ROUNDUP` and `ROUNDDOWN` were already right and are unchanged.
+- **Pinned** by `tests/test_issue110_round_half_away.py`: 20 tests, 13 fail on 0.9.119. The 7 that pass are values where the two rules agree, such as `ROUND(15, -1)` = 20 and `ROUND(2.345, 2)` = 2.35, plus a BLANK guard.
+
+### Fixed — ISFILTERED(<table>) sees a filter on the table's columns (issue #111)
+
+- **What was wrong:** a bare table name evaluated to the table's rows, so `ISFILTERED(<table>)` never matched a filter and was always FALSE. Desktop 2.152 answers TRUE to all of these, and 0.9.119 answered FALSE:
+  - `CALCULATE(ISFILTERED(Orders), Orders[Revenue] > 100)`, and the quoted `'Orders'`;
+  - `CALCULATE(ISFILTERED(Orders), Orders[Revenue] > 100, ALL(Orders))`;
+  - `CALCULATE(ISFILTERED(Dim), Dim[Zone] = "z1")`;
+  - `ISFILTERED(Dim)` on every row of a grouping by `Dim[Zone]`.
+- **The fix:** a table name, bare or quoted, is recognised before it is evaluated. `ISFILTERED(<table>)` is TRUE when any of the table's columns has a direct filter, including a TREATAS filter on several columns (#103).
+- **Unchanged, as in Desktop:** a filter that only reaches the table through a relationship does not count. `CALCULATE(ISFILTERED(Orders), Dim[Zone] = "z1")` stays FALSE, and so does `ISFILTERED(Orders)` under a grouping by `Dim[Zone]`.
+- **Still open (#114):** Desktop also counts a table filter's expanded table as a direct filter. `ISFILTERED(Dim)` is TRUE under `FILTER(Orders, ...)`, and the engine still says FALSE.
+- **Pinned** by `tests/test_issue111_isfiltered_table.py`: 9 tests, 6 fail on 0.9.119. The 3 that pass are the column form, the unfiltered table and the cross-filter case.
+
+### Fixed — ISCROSSFILTERED sees every filter that reaches the table (issue #113)
+
+- **What was wrong:** like ISFILTERED, `ISCROSSFILTERED(<table>)` was never TRUE. The column form also missed a filter on another column of its own table, and a filter on column combinations. Desktop 2.152 answers TRUE and 0.9.119 answered FALSE to, for example:
+  - `CALCULATE(ISCROSSFILTERED(Orders), Orders[Revenue] > 100)`;
+  - `CALCULATE(ISCROSSFILTERED(Orders[Revenue]), Orders[Region] = "N")`;
+  - `CALCULATE(ISCROSSFILTERED(Orders), Dim[Zone] = "z1")`, where the one side filters the many side;
+  - `CALCULATE(ISCROSSFILTERED(Dim), FILTER(Orders, ...))`;
+  - a filter crossing a bidirectional relationship;
+  - `TREATAS({("N", "z1")}, Dim[Region], Dim[Zone])`, which reaches `Orders`.
+- **The fix:** both functions share one argument parser, which recognises a table by its name and reads a column as a reference, without evaluating it. Then:
+  - `ISCROSSFILTERED(<table or column>)` is TRUE when anything filters the table: a direct filter on any of its columns, a filter on column combinations that reaches it, or a relationship that carries another table's filter to it. Desktop answers the column form exactly as the table form.
+  - Inside an iterator, both functions read the filter context outside it until CALCULATE or a measure reference makes the row a filter. Desktop: `CALCULATE(SUMX(Orders, IF(ISFILTERED(Orders[Revenue]), 1, 0)), Orders[Revenue] > 100)` is 2 (0.9.119: 0), and without the outer filter it is 0.
+- **Unchanged, as in Desktop:** these stay FALSE:
+  - a column filter on the many side does not cross a single-direction relationship: `CALCULATE(ISCROSSFILTERED(Dim), Orders[Revenue] > 100)`;
+  - `ALL(Orders)`;
+  - `REMOVEFILTERS(Orders)` over an outer filter on `Orders`.
+
+  A filter key naming a column the table does not have filters nothing, so it does not count. That keeps `CALCULATE(ISFILTERED(Orders), SUMMARIZE(Orders, Dim[Zone]))` FALSE, as in Desktop, while #117 is open.
+- **Pinned** by `tests/test_issue113_iscrossfiltered.py`: 236 tests, every expected value Desktop's. **64 fail on 0.9.119.** They cover:
+  - the battery, as 210 single cells plus 5 grouped rows;
+  - 21 edges: iterators, nested ALL / ALLEXCEPT / REMOVEFILTERS, and table expressions as filters.
+
+  The 6 cells that belong to #114 are left out.
+
+### Fixed — PBIR visual groups survive the classic layout (issue #112)
+
+- **What was wrong:** the PBIR reader dropped a visual's `parentGroupName` and a group's `visualGroup`, so a PBIR report's groups disappeared:
+  - every grouped visual read back as top-level, with its group-relative position. A matrix inside a group at (325, 502) was drawn at the page's top-left.
+  - every group read back as a visual with an empty `singleVisual`.
+
+  The Ecommerce Conversion Dashboard template groups 10 of its 22 visuals, and 0.9.119 read none of them as grouped.
+- **The fix:** the reader builds the classic shape Desktop writes (all 138 groups in the local corpus):
+  - a child gets `config.parentGroupName` and keeps its group-relative x/y; `pbix_get_visual_positions` adds the group's origin back;
+  - a group gets `config.singleVisualGroup` `{displayName, groupMode, isHidden}` and no `singleVisual`.
+
+  PBIR spells the mode `"ScaleMode"` / `"ScrollMode"`; classic stores Desktop's enum number (0 / 1). The PBIR writer writes these fields back only when they change: a visual moved into or out of a group, or a group renamed, re-moded, hidden or shown.
+- **Measured:** on the template, a save without edits leaves every `visual.json` as it was. Renaming a group and ungrouping a child changes exactly those two files, and Desktop 2.152 opens and renders the edited report.
+- **Pinned** by `tests/test_issue112_pbir_groups.py`: 4 tests, 3 fail on 0.9.119. The one that passes is the guard that a save without edits changes nothing.
+
 ## [0.9.119] - 2026-10-08
 
 Three fixes found while verifying 0.9.118. Each is checked against Power BI Desktop 2.152 over ADOMD, through the 0.9.118 battery extended to 44 queries:

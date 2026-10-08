@@ -2051,6 +2051,54 @@ class DAXContext:
                     todo.append(nxt)
         return frozenset(out)
 
+    def is_directly_filtered(self, table: str, column: str | None = None) -> bool:
+        """ISFILTERED's test: a DIRECT filter on ``table[column]``, or on any
+        column of ``table`` when ``column`` is None -- a filter on the column
+        itself, or a filter on column combinations (TREATAS onto several
+        columns) that names it. A filter that only reaches ``table`` through
+        a relationship is a cross filter: ISFILTERED(Orders) stays FALSE under
+        Dim[Zone] = "z1" (Power BI Desktop 2.152 over ADOMD).
+
+        Not modelled yet: a TABLE filter argument filters every column of its
+        EXPANDED table directly -- Desktop says ISFILTERED(Dim[Zone]) is TRUE
+        under FILTER(Orders, ...) -- because this engine keeps a table filter
+        as filters on the table's own columns (see _expanded_keys).
+
+        A key naming a column the table does not have filters nothing
+        (_surviving_indices skips it), so it is no filter here either."""
+        tl, cl = table.lower(), (column.lower() if column is not None else None)
+        tbl = self.tables.get(table)
+        for k, v in self.filter_context.items():
+            if k.startswith(_TUPLE_FILTER_PREFIX):
+                if any(str(t).lower() == tl and (cl is None or str(c).lower() == cl)
+                       for t, c in v.get('tuple_columns') or []):
+                    return True
+                continue
+            t, sep, c = k.partition('.')
+            if (sep and t.lower() == tl and (cl is None or c.lower() == cl)
+                    and (tbl is None or self._find_col_idx(tbl['columns'], c) >= 0)):
+                return True
+        return False
+
+    def is_cross_filtered(self, table: str) -> bool:
+        """ISCROSSFILTERED's test: anything filters ``table`` -- a direct
+        filter on any of its columns (is_directly_filtered), a filter on
+        column combinations that reaches it through its expanded table, or a
+        filter on another table that a relationship carries to it (one to
+        many, both ways, or a table filter's many to one). Desktop 2.152
+        answers the column form exactly as the table form: a filter on
+        Orders[Region] cross-filters Orders[Revenue] (issue #113)."""
+        if self.is_directly_filtered(table):
+            return True
+        tbl = self.tables.get(table)
+        if not tbl:
+            return False
+        for k, v in self.filter_context.items():
+            if (k.startswith(_TUPLE_FILTER_PREFIX)
+                    and self._tuple_filter_indices(table, tbl, v) is not None):
+                return True
+        return bool(self._get_cross_table_filters(table))
+
     def without_columns(self, drop, keep_keys=()) -> 'DAXContext':
         """This context (always a NEW one) without the filters on the columns
         ``drop(table, column)`` selects; filters keyed in ``keep_keys`` stay.
@@ -4858,10 +4906,24 @@ class DAXEngine:
         return abs(val) if isinstance(val, (int, float)) else None
 
     def _fn_round(self, args_str: str, ctx: DAXContext) -> Any:
+        """ROUND(number, digits) -- half AWAY from zero, on the decimal value
+        (issue #110). Python's round() takes a tie to the even neighbour and
+        works on the binary double: ROUND(2.5, 0) was 2, ROUND(1250, -2) 1200
+        and ROUND(1.005, 2) 1.0, where DAX gives 3, 1300 and 1.01. Negative
+        digits round to tens, hundreds, ... The arithmetic is FORMAT's
+        (_format_number, pinned off Desktop)."""
         args = self._split_args(args_str)
         val = self._eval_expr(args[0].strip(), ctx)
         digits = int(self._eval_expr(args[1].strip(), ctx)) if len(args) > 1 else 0
-        return round(val, digits) if isinstance(val, (int, float)) else None
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        try:
+            q = decimal.Decimal(repr(val)).quantize(
+                decimal.Decimal(1).scaleb(-digits), rounding=decimal.ROUND_HALF_UP,
+                context=decimal.Context(prec=60))
+        except (decimal.InvalidOperation, ValueError):
+            return val          # NaN / infinity: nothing to round
+        return int(q) if isinstance(val, int) and digits <= 0 else float(q)
 
     def _fn_rounddown(self, args_str: str, ctx: DAXContext) -> Any:
         """ROUNDDOWN(number, digits) — toward ZERO, not toward -infinity.
@@ -7752,30 +7814,58 @@ class DAXEngine:
                 return len(ctx.filter_context[filter_key]) == 1
         return False
 
-    def _fn_isfiltered(self, args_str: str, ctx: DAXContext) -> Any:
-        """ISFILTERED(column_or_table) — check if column/table has any direct filter."""
-        ref = self._eval_expr(args_str.strip(), ctx)
+    def _filter_test_target(self, args_str: str, ctx: DAXContext):
+        """ISFILTERED / ISCROSSFILTERED's argument -> (table, column or None),
+        or None when it names neither.
+
+        A TABLE is recognised by its NAME before anything is evaluated: a bare
+        table name evaluates to its rows, so the table form never matched
+        (issues #111, #113). A column is parsed, not evaluated, so a row
+        context cannot collapse it to the current row's value."""
+        arg = args_str.strip()
+        name = (arg[1:-1].replace("''", "'")
+                if len(arg) > 1 and arg[0] == arg[-1] == "'" else arg)
+        table = ctx.model_table(name)
+        if '[' not in arg and table in ctx.tables:
+            return table, None
+        ref = self._parse_column_ref(arg)
+        if ref is None:
+            ref = self._eval_expr(arg, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            filter_key = f"{ref[0]}.{ref[1]}"
-            return filter_key in ctx.filter_context
-        # Table-only reference (string) — check if any filter matches the table
-        if isinstance(ref, str):
-            table_name = ref.strip("'\"")
-            return any(k.split('.')[0] == table_name for k in ctx.filter_context)
-        return False
+            return ctx.model_table(str(ref[0])), str(ref[1])
+        if isinstance(ref, str) and ref:
+            return ctx.model_table(ref.strip("'\"")), None   # a table without loaded rows
+        return None
+
+    @staticmethod
+    def _transitioned(ctx: DAXContext) -> DAXContext:
+        """The filter context as the last CALCULATE / measure reference left
+        it. An iterator's row is in filter_context before any transition
+        (RowContextValues), but a row context alone filters nothing: Desktop
+        2.152, SUMX(Orders, IF(ISFILTERED(Orders[Revenue]), 1, 0)) is 0 and
+        SUMX(Orders, CALCULATE(IF(ISFILTERED(Orders[Revenue]), 1, 0))) is 3."""
+        outer = getattr(ctx, '_outer_ctx', None)
+        while outer is not None:
+            ctx, outer = outer, getattr(outer, '_outer_ctx', None)
+        return ctx
+
+    def _fn_isfiltered(self, args_str: str, ctx: DAXContext) -> Any:
+        """ISFILTERED(column_or_table) -- a DIRECT filter on the column, or on
+        any column of the table (DAXContext.is_directly_filtered).
+
+        CALCULATE(ISFILTERED(Orders), Orders[Revenue] > 100) was FALSE where
+        DAX says TRUE (issue #111)."""
+        target = self._filter_test_target(args_str, ctx)
+        return self._transitioned(ctx).is_directly_filtered(*target) if target else False
 
     def _fn_iscrossfiltered(self, args_str: str, ctx: DAXContext) -> Any:
-        """ISCROSSFILTERED(column) — check if column is cross-filtered via relationships."""
-        ref = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(ref, tuple) and len(ref) == 2:
-            # Check direct filter
-            filter_key = f"{ref[0]}.{ref[1]}"
-            if filter_key in ctx.filter_context:
-                return True
-            # Check cross-table filters
-            cross_filters = ctx._get_cross_table_filters(ref[0])
-            return len(cross_filters) > 0
-        return False
+        """ISCROSSFILTERED(column_or_table) -- anything filters the table:
+        directly, or through a relationship (DAXContext.is_cross_filtered).
+        The column form is the table form, as in Desktop. The table form was
+        never TRUE, and the column form missed a filter on another column of
+        its own table and a filter on column combinations (issue #113)."""
+        target = self._filter_test_target(args_str, ctx)
+        return self._transitioned(ctx).is_cross_filtered(target[0]) if target else False
 
     def _fn_userelationship(self, args_str: str, ctx: DAXContext) -> Any:
         """USERELATIONSHIP(column1, column2) — activate an inactive relationship.

@@ -40,9 +40,30 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-08 (0.9.119): docs 1-47 and GitHub issues/PRs #1-#109 are
-closed; the queues are empty.** 0.9.119 closes the three gaps found while
-verifying 0.9.118:
+**Updated 2026-10-08 (0.9.120): docs 1-49 and GitHub issues/PRs #1-#113 are
+closed; #114-#118 are open.** 0.9.120 closes docs 48 and 49, found by OpenBI's
+port of the engine:
+
+- doc 48 = #110: ROUND rounds half away from zero, on the decimal value;
+- doc 48 = #111: ISFILTERED(<table>) sees a direct filter on the table's
+  columns;
+- doc 49 = #112: a PBIR report's visual groups survive the classic layout, and
+  the PBIR writer round-trips them;
+- #113, found verifying #111: ISCROSSFILTERED sees every filter that reaches
+  the table.
+
+The Desktop batteries for #111/#113 exposed five older engine defects, filed
+as open issues:
+
+- #114: a table filter argument does not act on its expanded table;
+- #115: a context transition over a fact row does not filter its dimensions;
+- #116: in a row context, a table expression over the iterated table sees only
+  the current row;
+- #117: SUMMARIZE by a related table's column (groups and lineage);
+- #118: ALLSELECTED removes the measure's own CALCULATE filters.
+
+As of 0.9.119, docs 1-47 and #1-#109 were closed. 0.9.119 closes the three
+gaps found while verifying 0.9.118:
 
 - #107: text compares case-insensitively in expressions.
 - #108: iterating a CROSSJOIN reads every table's columns.
@@ -251,6 +272,24 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 49 (GH #112)** -- CLOSED (0.9.120). The PBIR reader dropped
+  `parentGroupName` and `visualGroup`, so grouped visuals read back as
+  top-level at their group-relative positions. Now a child carries
+  `parentGroupName` and a group carries `singleVisualGroup` (groupMode
+  ScaleMode = 0, ScrollMode = 1, isHidden), as Desktop writes classic groups.
+  The writer puts changes back into visual.json, and Desktop opens the edited
+  template. Regression: tests/test_issue112_pbir_groups.py.
+- **GH #113** -- CLOSED (0.9.120). ISCROSSFILTERED(<table>) was never TRUE,
+  and the column form missed its own table's other columns and filters on
+  column combinations. Both functions now share one argument parser and answer
+  from the filter context outside an iterator. Desktop-verified, a 276-cell
+  battery. Regression: tests/test_issue113_iscrossfiltered.py.
+- **doc 48 (GH #110, #111)** -- CLOSED (0.9.120). ROUND was Python's round
+  (ties to even, on the double). It now rounds half away from zero on the
+  decimal value. ISFILTERED(<table>) was always FALSE; it is now TRUE under a
+  direct filter on any of the table's columns. Desktop-verified, 32 of 32
+  cells. Regression: tests/test_issue110_round_half_away.py,
+  tests/test_issue111_isfiltered_table.py.
 - **doc 47 (GH #93)** -- CLOSED (0.9.117). The fill colour was written on the
   selector-less entry, which Desktop does not read on shape / actionButton /
   pageNavigator / bookmarkNavigator: now `show` selector-less and fillColor /

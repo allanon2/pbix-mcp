@@ -14697,6 +14697,12 @@ def _pbir_rewrite_sourcerefs(node, alias_for):
     return node
 
 
+# A visual group's layout mode: PBIR writes the name, classic the number
+# (Power BI Desktop's own enum, desktop.min.js: ScaleMode = 0, ScrollMode = 1).
+_PBIR_GROUP_MODES = {"ScaleMode": 0, "ScrollMode": 1}
+_PBIR_GROUP_MODE_NAMES = {v: k for k, v in _PBIR_GROUP_MODES.items()}
+
+
 def _pbir_visual_to_container(vdata: dict) -> dict:
     """Convert one PBIR ``visual.json`` into a legacy visualContainer.
 
@@ -14757,7 +14763,26 @@ def _pbir_visual_to_container(vdata: dict) -> dict:
         }
 
     pos = vdata.get("position") or {}
-    config: dict = {"name": vdata.get("name", ""), "singleVisual": visual_obj}
+    config: dict = {"name": vdata.get("name", "")}
+    group = vdata.get("visualGroup")
+    if isinstance(group, dict):
+        # A visual GROUP: the classic container carries singleVisualGroup and
+        # no singleVisual (138 of 138 Desktop-authored groups in the corpus).
+        # PBIR names the mode ("ScaleMode"); classic stores Desktop's enum
+        # number (desktop.min.js: ScaleMode = 0, ScrollMode = 1).
+        svg = {k: v for k, v in group.items() if k != "groupMode"}
+        mode = group.get("groupMode")
+        svg["groupMode"] = (_PBIR_GROUP_MODES.get(mode, 0) if isinstance(mode, str)
+                            else (mode if mode is not None else 0))
+        if vdata.get("isHidden"):
+            svg["isHidden"] = True
+        config["singleVisualGroup"] = svg
+    else:
+        config["singleVisual"] = visual_obj
+    if vdata.get("parentGroupName"):
+        # A grouped visual. Its position is relative to the group's origin in
+        # PBIR and in classic alike (pbix_get_visual_positions adds it back).
+        config["parentGroupName"] = vdata["parentGroupName"]
     if pos:
         config["layouts"] = [{"id": 0, "position": dict(pos)}]
 
@@ -14774,8 +14799,8 @@ def _pbir_visual_to_container(vdata: dict) -> dict:
         "height": pos.get("height", 0),
         "tabOrder": pos.get("tabOrder", 0),
     }
-    if vdata.get("isHidden"):
-        container["isHidden"] = True
+    if vdata.get("isHidden") and not isinstance(group, dict):
+        container["isHidden"] = True   # a group's is singleVisualGroup.isHidden
     vfilters = (vdata.get("filterConfig") or {}).get("filters")
     if vfilters:
         container["filters"] = json.dumps(vfilters)
@@ -15246,6 +15271,27 @@ def _pbir_patch_visual(orig: dict, container: dict) -> dict:
     if name:
         out["name"] = name
 
+    # Grouping (issue #112): a child's parentGroupName and a group's
+    # visualGroup, written only when the caller changed them (a visual moved
+    # into or out of a group, a new or renamed group) so the file's own
+    # spelling survives otherwise.
+    parent = cfg.get("parentGroupName")
+    if parent != baseline_cfg.get("parentGroupName"):
+        if parent:
+            out["parentGroupName"] = parent
+        else:
+            out.pop("parentGroupName", None)
+    svg = cfg.get("singleVisualGroup")
+    if svg != baseline_cfg.get("singleVisualGroup"):
+        if isinstance(svg, dict):
+            group = {k: v for k, v in svg.items() if k not in ("groupMode", "isHidden")}
+            mode = svg.get("groupMode", 0)
+            group["groupMode"] = (_PBIR_GROUP_MODE_NAMES.get(mode, "ScaleMode")
+                                  if isinstance(mode, int) else mode)
+            out["visualGroup"] = group
+        else:
+            out.pop("visualGroup", None)
+
     # Only persist geometry the caller actually CHANGED. The reader defaults
     # missing keys (e.g. tabOrder -> 0), and writing those back would invent
     # fields the original file never had.
@@ -15306,7 +15352,9 @@ def _pbir_patch_visual(orig: dict, container: dict) -> dict:
     if visual or "visual" in out:
         out["visual"] = visual
 
-    if container.get("isHidden"):
+    # A group's hidden state is singleVisualGroup.isHidden in classic and the
+    # visual.json's isHidden in PBIR.
+    if (svg.get("isHidden") if isinstance(svg, dict) else container.get("isHidden")):
         out["isHidden"] = True
     else:
         out.pop("isHidden", None)
