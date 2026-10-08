@@ -40,9 +40,11 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-08 (0.9.116): docs 1-46 and GitHub issues/PRs #1-#92 are
+**Updated 2026-10-08 (0.9.117): docs 1-47 and GitHub issues/PRs #1-#93 are
 closed; the queues are empty.** 0.9.116 closes doc 46 = #92 (whole-number
-doubles spelled '13D', as Desktop does, for every property).
+doubles spelled '13D', as Desktop does, for every property); 0.9.117 closes
+doc 47 = #93 (the fill card's state split on shape, actionButton and the
+navigators).
 Earlier, as of 0.9.115: 0.9.114 adds #87 (CALCULATE applies its
 modifiers before its filter arguments) and #88 (a deterministic row-context
 simulation); 0.9.115 merges PRs #89 (bare [Column] in the grouped tools) and
@@ -228,6 +230,11 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 47 (GH #93)** -- CLOSED (0.9.117). The fill colour was written on the
+  selector-less entry, which Desktop does not read on shape / actionButton /
+  pageNavigator / bookmarkNavigator: now `show` selector-less and fillColor /
+  transparency on {"id": "default"}; Desktop renders the requested colour.
+  Regression: tests/test_issue93_fill_states.py.
 - **doc 46 (GH #92)** -- CLOSED (0.9.116). Font sizes, background
   transparency and every other float literal were written '13.0D'; Desktop
   writes all 6,204 whole-number D literals in 37 Desktop-authored reports bare

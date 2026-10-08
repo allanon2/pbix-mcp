@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.117] - 2026-10-08
+
+### Fixed — a fill colour is written where Desktop reads it (issue #93)
+
+- **What was wrong:** `pbix_format_visual` wrote `{"fill": {color,
+  transparency, show}}` as one selector-less entry on every visual. On
+  `shape`, `actionButton`, `pageNavigator` and `bookmarkNavigator`, the fill
+  card is per interaction state, as their outline is (#74). Desktop reads
+  `fillColor` and `transparency` only from the state entries, so the
+  requested fill was dropped and the call answered success.
+  - Desktop 2.152 painted a shape in the theme's default blue and left the
+    button and page navigator unfilled.
+- **The fix:** on those four visuals `show` now goes on the selector-less
+  entry, and `fillColor` / `transparency` on `{"id": "default"}`. Desktop then
+  renders the requested `#F2C80F` on the shape, the button and the
+  navigator's page button.
+- **Other visuals:** the legacy `basicShape` has no states and keeps its single
+  selector-less entry, as does every other visual.
+- **`fillColor` is accepted alongside `color`.** Power BI's own name wins, and
+  a `color` it beats is reported as unread.
+- **Measured:**
+  - Desktop's report theme schema (5.71) declares a fill card on exactly these
+    four visuals.
+  - In the 37 Desktop-authored reports of the local corpus, the colour is
+    never selector-less: shape `fillColor` 50 times on `{"id": "default"}`,
+    actionButton 36, bookmarkNavigator 1.
+- **Pinned** by `tests/test_issue93_fill_states.py`: 6 tests, 5 fail on
+  0.9.116. The one that passes is the `basicShape` control, unchanged.
+
 ## [0.9.116] - 2026-10-08
 
 ### Fixed — every whole-number double is spelled as Desktop spells it (issue #92)

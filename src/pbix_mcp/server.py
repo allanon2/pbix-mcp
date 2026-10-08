@@ -888,6 +888,19 @@ _OUTLINE_CARD_VISUALS = frozenset({
     "advancedSlicerVisual", "bookmarkNavigator", "pageNavigator",
 })
 
+#: Visuals whose `fill` card is per interaction STATE (issue #93), the same
+#: split as their outline: `show` on the selector-less entry, fillColor /
+#: transparency on {"id": "default"} (or hover, press, selected ...). The
+#: report theme schema Desktop ships declares a fill card on exactly these
+#: four, and Desktop-authored files never put the colour selector-less --
+#: shape fillColor 50 / transparency 14 on {"id": "default"}, actionButton
+#: 36 / 69, bookmarkNavigator 1 / 1. A selector-less fillColor is not read:
+#: Desktop paints the theme's default colour. The legacy basicShape has no
+#: states and keeps one selector-less fill entry.
+_FILL_STATE_VISUALS = frozenset({
+    "shape", "actionButton", "bookmarkNavigator", "pageNavigator",
+})
+
 #: For visuals WITHOUT an outline card: where Power BI keeps the outline
 #: instead (same schema), so the caller is pointed at the right card rather
 #: than told only that nothing was written.
@@ -1495,11 +1508,26 @@ def _build_format_objects(fmt: dict, visual_type: str = "",
     # --- fill (shape fill) ---
     if "fill" in fmt:
         fl = fmt["fill"]
-        props = {}
-        if "color" in fl: props["fillColor"] = _solid_color(fl["color"])
-        if "transparency" in fl: props["transparency"] = _pbi_lit(float(fl["transparency"]))
-        if "show" in fl: props["show"] = _pbi_lit(fl["show"])
-        _add("fill", props)
+        paint = {}
+        # Power BI's name first; a `color` it beats stays unread, so reported.
+        if "fillColor" in fl: paint["fillColor"] = _solid_color(fl["fillColor"])
+        elif "color" in fl: paint["fillColor"] = _solid_color(fl["color"])
+        if "transparency" in fl: paint["transparency"] = _pbi_lit(float(fl["transparency"]))
+        show_props = {}
+        if "show" in fl: show_props["show"] = _pbi_lit(fl["show"])
+        if visual_type in _FILL_STATE_VISUALS:
+            # The split Desktop writes and reads (_FILL_STATE_VISUALS): one
+            # selector-less entry used to carry the colour, which Desktop
+            # ignored -- the shape rendered in the theme's default colour while
+            # the call answered success (issue #93).
+            fill_entries: list[dict] = []
+            if show_props:
+                fill_entries.append({"properties": show_props})
+            if paint:
+                fill_entries.append({"properties": paint, "selector": {"id": "default"}})
+            _add_entries("fill", fill_entries)
+        else:
+            _add("fill", {**paint, **show_props})
 
     # --- line (line charts) ---
     if "line" in fmt:
