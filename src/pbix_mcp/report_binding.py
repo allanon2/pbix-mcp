@@ -40,6 +40,14 @@ _NUMERIC_TYPES = {"Int64", "Double", "Decimal"}
 _AGG_SUM = 0
 _AGG_AVERAGE = 1
 _AGG_COUNTNONNULL = 5
+# Every QueryAggregateFunction and the queryRef name Desktop gives it, as its
+# own customVisualsHost.js defines them (enum Sum=0 .. Variance=8; visitAggr
+# writes "<Name>(Entity.Property)"). Code 2, "Count", is the field well's
+# "Count (Distinct)"; the well's plain "Count" is CountNonNull (5).
+QUERY_AGGREGATES: dict[int, str] = {
+    0: "Sum", 1: "Avg", 2: "Count", 3: "Min", 4: "Max", 5: "CountNonNull",
+    6: "Median", 7: "StandardDeviation", 8: "Variance",
+}
 # Coordinates must never be summed: Desktop's default summarization for
 # latitude/longitude is AVERAGE (summing coordinates of two cities lands the
 # point in the ocean). Applies to the map field wells that only ever hold

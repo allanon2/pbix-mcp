@@ -706,6 +706,16 @@ _SETTINGS_JSON = '{"Version":4,"ReportSettings":{},"QueriesSettings":{"TypeDetec
 # Metadata JSON in UTF-16-LE
 _METADATA_JSON = '{"Version":5,"AutoCreatedRelationships":[],"CreatedFrom":"Cloud","CreatedFromRelease":"2024.03"}'.encode("utf-16-le")
 
+# Implicit aggregations a visual role field may ask for -> QueryAggregateFunction
+# (see report_binding.QUERY_AGGREGATES for the codes and Desktop's names).
+# "count" is refused: Desktop's enum calls code 2 "Count" while its field well
+# calls code 5 "Count", so the word alone cannot say which is meant.
+_ROLE_AGGREGATIONS = {
+    "sum": 0, "avg": 1, "average": 1, "distinctcount": 2, "countdistinct": 2,
+    "min": 3, "max": 4, "countnonnull": 5, "median": 6, "standarddeviation": 7,
+    "stddev": 7, "variance": 8, "var": 8,
+}
+
 
 class PBIXBuilder:
     """Build a valid PBIX file from scratch."""
@@ -939,11 +949,32 @@ class PBIXBuilder:
         self,
         name: str = "Page 1",
         visuals: list[dict] | None = None,
+        *,
+        filters: list[dict] | None = None,
+        interactions: list[dict] | None = None,
     ) -> "PBIXBuilder":
-        """Add a report page with optional visuals."""
+        """Add a report page with optional visuals.
+
+        A visual is ``{"type", "name", "config", "x", "y", "width", "height"}``.
+        ``config`` takes a card's ``{"measure"}``, a slicer's ``{"column"}``,
+        a table's ``{"columns": [...]}``, a chart's ``{"category", "measure"}``,
+        or ``{"roles": {role: [field, ...]}}`` for any visual and role (a
+        matrix's Rows / Columns / Values, a chart's Category / Series / Y).
+        A role field is ``{"measure": M}``, ``{"table": T, "column": C}``, or
+        that plus ``"aggregation"``: sum, average, distinctCount, min, max,
+        countNonNull, median, stdDev, variance.
+
+        A visual may also carry ``objects`` (its formatting objects, written as
+        given, e.g. ``{"subTotals": [...]}``) and ``filters`` (visual-level
+        filters, Desktop's filter JSON). ``filters`` here are the page's;
+        ``interactions`` are ``[{"source": visual name, "target": visual
+        name, "type": n}]`` (Desktop's section ``relationships``).
+        """
         self._pages.append({
             "name": name,
             "visuals": visuals or [],
+            "filters": filters or [],
+            "interactions": interactions or [],
         })
         return self
 
@@ -1017,19 +1048,33 @@ class PBIXBuilder:
                         container["query"] = json.dumps(q, ensure_ascii=False)
                         container["dataTransforms"] = json.dumps(dt, ensure_ascii=False)
                         container["filters"] = "[]"
+                # Formatting objects and visual-level filters, as Desktop
+                # stores them (filters: a JSON string on the container).
+                if vis.get("objects"):
+                    single_visual["objects"] = vis["objects"]
+                if vis.get("filters"):
+                    container["filters"] = json.dumps(vis["filters"], ensure_ascii=False)
                 container["config"] = json.dumps({
                     "name": vis.get("name", f"visual_{j}"),
                     "singleVisual": single_visual,
                 })
                 containers.append(container)
-            sections.append({
+            section = {
                 "displayName": page["name"],
                 "name": f"ReportSection{i + 1}",
                 "ordinal": i,
                 "width": page.get("width", 1280),
                 "height": page.get("height", 720),
                 "visualContainers": containers,
-            })
+                # Page filters: a JSON string, on every Desktop-authored page.
+                "filters": json.dumps(page.get("filters") or [], ensure_ascii=False),
+            }
+            if page.get("interactions"):
+                # Visual interactions live in the section config's
+                # `relationships` ({"source", "target", "type"} by visual name).
+                section["config"] = json.dumps(
+                    {"relationships": page["interactions"]}, ensure_ascii=False)
+            sections.append(section)
 
         # Report-level config, matching Desktop-authored files field-for-field
         # (ledger issues-4; ground truth MS_AI_Sample / GeoSales). "version" is
@@ -1080,15 +1125,17 @@ class PBIXBuilder:
         def _alias_for(entity: str) -> str:
             """Get or create a short alias for a table/entity."""
             if entity not in from_sources:
-                from_sources[entity] = entity[0].lower()
-                # Handle alias collisions
-                base = from_sources[entity]
-                existing = set(from_sources.values()) - {base}
+                # The aliases already taken, BEFORE this entity's: the old
+                # code assigned first and then took the candidate back out of
+                # the taken set, so it never saw a collision and 'Region' and
+                # 'Range' were both "r" -- one source referred to twice.
+                taken = set(from_sources.values())
+                base = alias = (entity[:1] or "t").lower()
                 suffix = 0
-                while base in existing:
+                while alias in taken:
                     suffix += 1
-                    base = entity[0].lower() + str(suffix)
-                from_sources[entity] = base
+                    alias = f"{base}{suffix}"
+                from_sources[entity] = alias
             return from_sources[entity]
 
         def _add_measure(measure_name: str) -> str:
@@ -1119,8 +1166,49 @@ class PBIXBuilder:
             })
             return query_ref
 
+        def _add_aggregation(table: str, column: str, how: str) -> str:
+            """Add an implicit aggregation of a column, return its queryRef."""
+            from pbix_mcp.report_binding import QUERY_AGGREGATES
+            code = _ROLE_AGGREGATIONS.get(str(how).replace("_", "").lower())
+            if code is None:
+                raise ValueError(
+                    f"aggregation {how!r}: expected one of sum, average, "
+                    "distinctCount, min, max, countNonNull, median, stdDev, "
+                    "variance ('count' is ambiguous: Desktop's field-well Count "
+                    "is countNonNull, its Count (Distinct) is distinctCount)")
+            alias = _alias_for(table)
+            query_ref = f"{QUERY_AGGREGATES[code]}({table}.{column})"
+            if all(s.get("Name") != query_ref for s in selects):
+                selects.append({
+                    "Aggregation": {
+                        "Expression": {"Column": {
+                            "Expression": {"SourceRef": {"Source": alias}},
+                            "Property": column}},
+                        "Function": code,
+                    },
+                    "Name": query_ref,
+                })
+            return query_ref
+
+        # --- Any visual: explicit roles -------------------------------------
+        # {"roles": {"Rows": [...], "Columns": [...], "Values": [...]}}: what
+        # the fixed shapes below cannot say -- a matrix's Rows and Columns, a
+        # chart's Series, several values, any implicit aggregation.
+        if isinstance(cfg.get("roles"), dict):
+            for role, fields in cfg["roles"].items():
+                items = []
+                for f in fields:
+                    if "measure" in f:
+                        ref = _add_measure(f["measure"])
+                    elif f.get("aggregation"):
+                        ref = _add_aggregation(f["table"], f["column"], f["aggregation"])
+                    else:
+                        ref = _add_column(f["table"], f["column"])
+                    items.append({"queryRef": ref, "active": True})
+                projections[role] = items
+
         # --- Card: single measure -----------------------------------------
-        if visual_type == "card" and "measure" in cfg:
+        elif visual_type == "card" and "measure" in cfg:
             ref = _add_measure(cfg["measure"])
             projections["Values"] = [{"queryRef": ref, "active": True}]
 

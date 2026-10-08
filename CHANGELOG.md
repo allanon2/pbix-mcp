@@ -5,6 +5,100 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.118] - 2026-10-08
+
+Seven fixes. Six come from pull requests by @allanon2 (#94–#99), reviewed read-only, reproduced and solved here; the seventh, #101, was found while verifying them.
+
+Every engine change is checked against Power BI Desktop 2.152 over ADOMD: 41 queries and 1,941 cells through two tool paths (`pbix_evaluate_dax` and `pbix_evaluate_dax_grouped`). All of them match, except 14 cells that belong to #107 and #108, filed for the next release.
+
+### Fixed — ALLSELECTED(Table) acts on the table's expanded table (issue #100, PR #94 by @allanon2)
+
+- **What was wrong:** as a CALCULATE modifier, `ALLSELECTED(Fact)` dropped the grouping filters on `Fact`'s own columns only. DAX drops them on the table's **expanded** table, so a visual grouped by a dimension column kept that grouping. The standard share-of-total measure, `DIVIDE(SUM(Fact[v]), CALCULATE(SUM(Fact[v]), ALLSELECTED(Fact)))`, read 1 on every row of a visual grouped by `Dim[Name]`, where Desktop reads 0.356 / 0.444 / 0.2.
+- **The fix:** the filters removed and the outer selection restored are now those on every table of the expanded table (`DAXContext.expanded_tables`):
+  - the one side of each active many-to-one relationship, followed transitively (a snowflake);
+  - both ends of a one-to-one;
+  - not a many-to-many relationship, which expands nothing.
+- **A slicer is an outer selection and stays**, as before.
+- **Measured:** Fact -> Dim -> Cat, Dim <-> Twin one-to-one, Fact <-> Tags many-to-many. Every cell matches Desktop: 320 + 210 (two tool paths), where 0.9.117 missed 103 + 67.
+- **Pinned** by `tests/test_issue100_allselected_expanded_table.py`: 23 tests, 16 fail on 0.9.117. The 7 that pass are controls (many-to-many, a fact column, a slicer without a grouping).
+
+### Fixed — ALL / REMOVEFILTERS / ALLEXCEPT on a table act on its expanded table (issue #101)
+
+- **Found while verifying #100.** `ALL(Table)` dropped the table's own column filters, then stopped every filter reaching the table through any relationship.
+- **What DAX does:** it removes the filters on every column of the expanded table and leaves every other filter in force. Desktop 2.152 differed from the engine in three ways:
+  - **The dimension's own filter.** `CALCULATE(COUNTROWS(Dim), ALL(Fact))` grouped by `Dim[Name]` is 3, not 1.
+  - **A kept dimension column.** `CALCULATE(SUM(Fact[v]), ALLEXCEPT(Fact, Dim[Name]))` grouped by `Dim[Name]` is each member's 16 / 20 / 9, not the 45 total. That is the common "category total" pattern.
+  - **Filters from outside the expanded table.** A filter arriving over a many-to-many or a bidirectional relationship stays. `ALL(Fact)` under `Tags[TagName]` is the tag's 27 / 18, and `COUNTROWS(Dim)` under `ALL(Dim)` still sees a `Fact2` filter that crosses a both-ways relationship (2, not 3).
+- **The fix:** all three modifiers remove the expanded table's filters (`DAXContext.without_columns`). Of the filters still live, only two kinds are kept away from the table:
+  - a table-filter argument on a many-side table;
+  - a date-table filter with no relationship.
+
+  `ALLCROSSFILTERED` keeps removing cross filters too. A filter created later, inside a nested CALCULATE, still applies, as before.
+- **Measured:** 345 + 315 cells match Desktop, where 0.9.117 missed 108.
+- **Pinned** by `tests/test_issue101_all_expanded_table.py`: 27 tests, 19 fail on 0.9.117.
+
+### Fixed — a filter on a column matches values as DAX compares them (issue #102, PR #95 by @allanon2)
+
+- **What was wrong:** list filters went through `str()` keys with float and calendar-day aliases. That covers `filter_context`, `T[C] = v`, `T[C] IN {...}`, single-column TREATAS, and the grouped tools' per-group filter.
+  - `'01'` also selected `'1'`.
+  - A date-time selected every time of its day.
+  - `"north"` selected nothing.
+- **The fix:** a filter on the column itself uses a typed index, and `make_value_matcher` (and `IN` / `NOT IN`) follows the same rules:
+  - text stays text, and matches case-insensitively for **ASCII letters only**, as the column store compares values;
+  - numbers compare by value whatever their storage (#39 kept);
+  - date-times are moments, and a date is midnight (the DATESMTD representation case kept).
+
+  Relationship joins keep their own key spellings. A caller may still pass a number for a text code, or a numeric string for a number, but never `'01'` for `1`.
+- **Measured:** every cell matches Desktop, including grouped by `F2[Code]` and by `F2[At]`; 0.9.117 missed 88 + 60 cells. On the ASCII-only rule, Desktop's own import of 14 names keeps 13 distinct values: only `Apple` / `apple` fold. `Äpfel` / `äpfel`, `Øl` / `øl`, `Éa` / `éa`, `Σίγμα` / `σίγμα`, `Дом` / `дом` and `Straße` / `Strasse` stay apart, and a filter on `"ÄPFEL"` selects `Äpfel` alone. Expressions compare differently, with `"Ä" = "ä"` and `"ß" = "ss"`; that is #107.
+- **Pinned** by `tests/test_issue102_filter_value_matching.py`: 32 tests, 20 fail on 0.9.117.
+
+### Fixed — TREATAS onto several columns filters their combinations (issue #103, PR #99 by @allanon2)
+
+- **What was wrong:** a row constructor `("N", "A")` evaluated as BLANK, and TREATAS kept only its first column. So `CALCULATE(m, TREATAS({("N", "A"), ("W", "B")}, Region[Region], Prod[Cat]))`, the filter Desktop writes for a two-column Include filter, answered BLANK silently.
+- **The fix:**
+  - A row constructor is one row with columns `Value1`, `Value2`, …
+  - TREATAS onto several columns is one filter on their combinations. Each table sees the columns of its expanded table, so a dimension sees its own column's projection.
+  - Plain TREATAS replaces the outer filters on its columns, and `KEEPFILTERS` intersects.
+  - An inner CALCULATE filter on one of the columns leaves the outer combinations' projection onto the others, as DAX does.
+  - A row of the wrong width is an evaluation error, not a blank.
+- **Measured:** every cell matches Desktop, except one. A FILTER over a CROSSJOIN fed to TREATAS still differs, because iterating a CROSSJOIN cannot read the second table's columns (#108, filed separately; 0.9.117 has the same gap).
+- **Pinned** by `tests/test_issue103_treatas_tuples.py`: 23 tests, 16 fail on 0.9.117.
+
+### Fixed — PBIXBuilder: one query alias per table, and visual roles, aggregations, objects, filters and interactions (issue #104, PR #98 by @allanon2)
+
+- **The bug:** `_alias_for` computed the aliases already taken after assigning the new one, minus the candidate itself, so it never saw a collision. `Region` and `Range` both got `r`, and a visual over both pointed at one source twice. Each table now gets its own alias (`r`, `r1`).
+- **The feature:** `add_page` visuals may bind any roles with `{"roles": {role: [field, ...]}}`:
+  - a matrix's Rows / Columns / Values;
+  - a chart's Series;
+  - several values;
+  - implicit aggregations: sum, average, distinctCount, min, max, countNonNull, median, stdDev, variance.
+
+  Codes and query-ref names are Desktop's own, from `customVisualsHost.js`. Code 2 is `Count(...)`, the field well's Count (Distinct); the PR's `DistinctCount(...)` name is not one Desktop writes. A bare `count` is refused as ambiguous.
+
+  A visual may also carry formatting `objects` and visual-level `filters`. A page takes `filters` and `interactions` (its section config's `relationships`), and every page now writes `filters`, as every Desktop-authored page does.
+- **Pinned** by `tests/test_issue104_builder_roles.py`: 4 tests, all fail on 0.9.117.
+
+### Fixed — unsupported DAX functions are reported per measure (issue #105, PR #96 by @allanon2)
+
+- **What was wrong:** `pbix_evaluate_dax` listed the unsupported functions once per call.
+  - A caller could not tell which result depended on one. The engine reads an unsupported call as BLANK and carries on, so `NOSUCHFN(1) + SUM(T[v])` returns a plausible total.
+  - Every BLANK in the call was labelled `"unsupported"`, a legitimately empty measure included.
+- **The fix:** each result carries `unsupported_functions`, the functions its own evaluation hit, directly or through the measures it references. That includes a referenced measure served from the measure cache. Only a measure whose own evaluation hit one is `"unsupported"`. The call-wide warning is unchanged.
+- **Pinned** by `tests/test_issue105_unsupported_per_measure.py`: 2 tests; 1 fails on 0.9.117 (the other is a clean-call control).
+
+### Fixed — evaluations on different threads no longer corrupt each other (issue #106, PR #97 by @allanon2)
+
+- **What was wrong:** the module-level `DAXEngine` carries per-evaluation state: the deadline, the ALLSELECTED snapshots, unsupported functions and errors. Under 8 threads, 264 of 336 `pbix_evaluate_dax` answers differed from the same calls made one at a time; an ALLSELECTED share read 1.0001 for 1.0.
+- **The fix:** `_engine` is one `DAXEngine` per thread. The module-level caches lock their insert, evict and id-assign steps. Two relationship sets interned at once could otherwise get the same id, which keys the cross-filter memo.
+- **Not affected before:** the stdio MCP server runs tools on its event-loop thread. The fix is for hosts that call the tools from several threads.
+- **Pinned** by `tests/test_issue106_thread_local_engine.py`: 2 tests, both fail on 0.9.117.
+
+### Filed for the next release
+
+- **#107:** text comparisons in expressions (`=`, `<`, `IN`, `SWITCH`, `LOOKUPVALUE`, `CONTAINS`) are case-sensitive. #102 covers filter values only.
+- **#108:** iterating a CROSSJOIN cannot read the second table's columns.
+- **#109:** `PBIXBuilder` folds non-ASCII case pairs and `ß` / `ss` into one value, where Power BI keeps them distinct.
+
 ## [0.9.117] - 2026-10-08
 
 ### Fixed — a fill colour is written where Desktop reads it (issue #93)

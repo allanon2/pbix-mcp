@@ -14182,6 +14182,7 @@ def pbix_evaluate_dax(
 
         # Reset unsupported + error trackers before evaluation
         dax_engine._engine.unsupported_functions.clear()
+        dax_engine._engine.unsupported_by_measure.clear()
         dax_engine._engine.eval_errors.clear()
         dax_engine._engine.timed_out.clear()
         logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
@@ -14232,6 +14233,16 @@ def pbix_evaluate_dax(
 
         # Build structured response with DAXResult objects
         unsupported = set(dax_engine._engine.unsupported_functions)
+        # Which measure depended on which unsupported function (PR #96). The
+        # call-wide set made every BLANK in the call "unsupported", a measure
+        # that is legitimately empty included, and said nothing about a NUMBER
+        # computed past an unsupported call.
+        by_measure = dax_engine._engine.unsupported_by_measure
+
+        def _unsupported_of(measure: str) -> list[str] | None:
+            hit = by_measure.get(measure)
+            return sorted(hit) if hit else None
+
         timed_out = set(dax_engine._engine.timed_out)
         dax_results = []
         for name, val in results.items():
@@ -14246,7 +14257,8 @@ def pbix_evaluate_dax(
                 if (ctx.get('measure_types', {}).get(name) == 6
                         and isinstance(val, float) and val.is_integer()):
                     val = int(val)
-                dax_results.append(DAXResult(name=name, value=val, status="ok"))
+                dax_results.append(DAXResult(name=name, value=val, status="ok",
+                                             unsupported_functions=_unsupported_of(name)))
             elif name in timed_out:
                 # NOT a blank: the evaluation was abandoned on the wall-clock
                 # budget. Reporting it as blank made "no value" and "we ran out
@@ -14267,11 +14279,15 @@ def pbix_evaluate_dax(
                     name=name, value=None, status="error",
                     error_message=dax_engine._engine.eval_errors[name],
                 ))
-            elif unsupported:
-                # Value is None and unsupported functions were hit — mark as unsupported
+            elif _unsupported_of(name) or (unsupported and not by_measure):
+                # BLANK because this measure's own evaluation hit unsupported
+                # functions, named per measure (the call-wide set only when the
+                # engine attributed none).
+                mine = _unsupported_of(name) or sorted(unsupported)
                 dax_results.append(DAXResult(
                     name=name, value=None, status="unsupported",
-                    error_message=f"Uses unsupported function(s): {', '.join(sorted(unsupported))}",
+                    error_message=f"Uses unsupported function(s): {', '.join(mine)}",
+                    unsupported_functions=mine,
                 ))
             else:
                 dax_results.append(DAXResult(name=name, value=None, status="blank"))

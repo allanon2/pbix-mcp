@@ -130,6 +130,11 @@ class DAXResult(BaseModel):
     status: str = "ok"  # "ok" | "blank" | "unsupported" | "error"
     error_message: str | None = None
     data_type: str | None = None  # "Int64"|"Double"|"String"|"DateTime"|"Boolean"
+    # The unsupported DAX functions THIS measure's evaluation depended on,
+    # directly or through the measures it references. A value may still be
+    # present: the engine reads an unsupported call as BLANK and carries on,
+    # so a number computed past one is not to be trusted.
+    unsupported_functions: list[str] | None = None
 
     @field_validator("value")
     @classmethod
