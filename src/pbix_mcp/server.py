@@ -22,6 +22,7 @@ import difflib
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -766,13 +767,20 @@ _ALIGNMENTS = {"left": "'left'", "center": "'center'", "right": "'right'"}
 
 
 def _pbi_lit(value) -> dict:
-    """Convert a Python value to PBI Literal expression wrapper."""
+    """Convert a Python value to PBI Literal expression wrapper.
+
+    A whole-number double is spelled bare, '13D', never Python's '13.0D'
+    (issue #92): in 37 Desktop-authored reports Desktop writes 6,204
+    whole-number D literals -- font sizes, transparencies, offsets -- and
+    not one carries '.0'. Fractions keep theirs ('10.5D').
+    """
     if isinstance(value, bool):
         raw = "true" if value else "false"
     elif isinstance(value, int):
         raw = f"{value}L"
     elif isinstance(value, float):
-        raw = f"{value}D"
+        raw = (f"{int(value)}D" if math.isfinite(value) and value == int(value)
+               else f"{value}D")
     elif isinstance(value, str):
         raw = f"'{value}'"
     else:
@@ -784,18 +792,12 @@ def _pbi_double_lit(value) -> dict:
     """A `D` literal spelled the way Desktop spells it.
 
     Desktop writes an INTEGRAL double without a fractional part — measured on
-    Desktop-authored files: `"288D"`, `"155D"`, `"168D"`, never `"288.0D"`.
-    `_pbi_lit(float(x))` always emits the Python repr, so every integral
-    width came out as `200.0D` (issue #62). Non-integral values keep their
-    decimal form, so `258.5` stays `258.5D`.
-
-    Used where the literal is compared against Desktop-authored files byte
-    for byte; the generic `_pbi_lit` is unchanged, since altering it would
-    move every font size and offset in the codebase at once.
+    Desktop-authored files: `"288D"`, `"155D"`, `"168D"`, never `"288.0D"`
+    (issues #62, #84). Non-integral values keep their decimal form, so
+    `258.5` stays `258.5D`. Since #92 `_pbi_lit` spells every float this way;
+    this helper remains for callers that hold an int and need a DOUBLE.
     """
-    v = float(value)
-    raw = f"{int(v)}D" if v == int(v) else f"{v}D"
-    return {"expr": {"Literal": {"Value": raw}}}
+    return _pbi_lit(float(value))
 
 
 def _pbi_props(mapping: dict, src: dict) -> dict:

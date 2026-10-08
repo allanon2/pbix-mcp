@@ -40,8 +40,10 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-07 (0.9.115): docs 1-45 and GitHub issues/PRs #1-#91 are
-closed; the queues are empty.** 0.9.114 adds #87 (CALCULATE applies its
+**Updated 2026-10-08 (0.9.116): docs 1-46 and GitHub issues/PRs #1-#92 are
+closed; the queues are empty.** 0.9.116 closes doc 46 = #92 (whole-number
+doubles spelled '13D', as Desktop does, for every property).
+Earlier, as of 0.9.115: 0.9.114 adds #87 (CALCULATE applies its
 modifiers before its filter arguments) and #88 (a deterministic row-context
 simulation); 0.9.115 merges PRs #89 (bare [Column] in the grouped tools) and
 #90 (DataMashup reader) by @allanon2, and fixes #91 (DataMashup writer).
@@ -226,6 +228,11 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 46 (GH #92)** -- CLOSED (0.9.116). Font sizes, background
+  transparency and every other float literal were written '13.0D'; Desktop
+  writes all 6,204 whole-number D literals in 37 Desktop-authored reports bare
+  ('13D'). The literal writer now does too. Regression:
+  tests/test_issue92_whole_number_doubles.py.
 - **GH #91** -- CLOSED (0.9.115). pbix_set_m_code returned success but left
   the DataMashup unparseable when its MS-QDEFF Metadata ends with a content zip
   (Microsoft's 2018 Fuzzy Matching demo, COVID-19 US Tracking template). It now

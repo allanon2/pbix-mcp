@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.116] - 2026-10-08
+
+### Fixed — every whole-number double is spelled as Desktop spells it (issue #92)
+
+- **What was wrong:** #84 fixed the container cards (padding, spacing,
+  border, drop shadow), but every other `D` literal still came out as
+  Python's float repr. That covered font sizes on the title, subtitle, legend,
+  data labels and both axes, the background's transparency, and every other
+  float-valued property: `'13.0D'` where Desktop writes `'13D'`.
+- **The fix is general, not per property:** the literal writer (`_pbi_lit`)
+  spells a whole-number double bare, and fractions keep theirs (`'10.5D'`).
+  `_pbi_double_lit` (#62, #84) now just delegates to it.
+- **Measured on the Desktop-authored reports in the local corpus:** across 37
+  of them, Desktop writes 6,204 whole-number `D` literals, and every one is
+  bare. That includes all 1,421 font sizes and 684 transparencies. Not one
+  `N.0D` occurs, so there is no property for which the old spelling was
+  right. OpenBI's census of 27 files (its doc 46) agrees property by
+  property.
+- **Pinned** by `tests/test_issue92_whole_number_doubles.py`: 7 tests, 4 fail
+  on 0.9.115. The 3 that pass are the fraction controls, which were already
+  right.
+
 ## [0.9.115] - 2026-10-07
 
 ### Fixed — the grouped and per-dimension tools resolve a bare `[Column]` through the measure's home table (PR #89, by @allanon2)
