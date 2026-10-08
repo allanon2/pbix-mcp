@@ -1171,6 +1171,26 @@ def _expanded_tables(table: str, relationships) -> set:
     return out
 
 
+_TUPLE_FILTER_PREFIX = "__tuples__#"
+
+
+def _tuple_filter_key(cols) -> str:
+    """The filter_context key of a filter on column combinations. It holds no
+    'Table.Column' shape, so code reading per-column filters passes it by."""
+    return _TUPLE_FILTER_PREFIX + json.dumps([list(c) for c in cols], separators=(",", ":"))
+
+
+def _tuple_norm(v):
+    """A value as TREATAS compares it: text case-insensitively, numbers by value."""
+    if isinstance(v, str):
+        return ("t", v.casefold())
+    if isinstance(v, bool):
+        return ("b", v)
+    if isinstance(v, (int, float)):
+        return ("n", float(v))
+    return ("v", v)
+
+
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
     date when both parse as dates, else as text. A BLANK side compares as the
@@ -2457,6 +2477,56 @@ class DAXContext:
             acc |= f
         return frozenset(acc)
 
+
+    def _tuple_filter_indices(self, table_name: str, tbl: dict, spec: dict):
+        """Rows of ``tbl`` a filter on column combinations (TREATAS onto several
+        columns) keeps, or None when it doesn't reach this table.
+
+        A table sees the tuple's columns that are its own or in its expanded
+        table (the one-side tables it reaches through active many-to-one
+        relationships, followed by key), and keeps a row when those values
+        match some tuple's values for the same columns."""
+        cols = [tuple(c) for c in spec.get("tuple_columns", [])]
+        getters, positions = [], []
+        for i, (t, c) in enumerate(cols):
+            g = self._column_getter(table_name, t, c)
+            if g is not None:
+                getters.append(g)
+                positions.append(i)
+        if not getters:
+            return None
+        keep = {tuple(_tuple_norm(r[i]) for i in positions) for r in spec.get("rows", [])}
+        return frozenset(i for i, row in enumerate(tbl['rows'])
+                         if tuple(_tuple_norm(g(row)) for g in getters) in keep)
+
+    def _column_getter(self, table_name: str, t: str, c: str, seen: frozenset = frozenset()):
+        """row of table_name -> the value of t[c] for it: its own column, or the
+        related row's along active many-to-one relationships (None when the
+        key matches no row: DAX's blank member). None if t isn't reachable."""
+        tbl = self.tables.get(table_name)
+        if not tbl:
+            return None
+        if table_name == t:
+            idx = self._find_col_idx(tbl['columns'], c)
+            return (lambda row, i=idx: row[i]) if idx >= 0 else None
+        for rel in self.relationships or []:
+            if (not rel.get('IsActive') or rel.get('FromTable') != table_name
+                    or rel.get('ToTable') in seen or rel.get('ToTable') == table_name):
+                continue
+            one = rel['ToTable']
+            inner = self._column_getter(one, t, c, seen | {table_name})
+            if inner is None:
+                continue
+            fk = self._find_col_idx(tbl['columns'], rel.get('FromColumn'))
+            otbl = self.tables.get(one)
+            pk = self._find_col_idx(otbl['columns'], rel.get('ToColumn')) if otbl else -1
+            if fk < 0 or pk < 0:
+                continue
+            by_key = {_tuple_norm(r[pk]): r for r in otbl['rows']}
+            return lambda row, fk=fk, by_key=by_key, inner=inner: (
+                inner(by_key[_tuple_norm(row[fk])]) if _tuple_norm(row[fk]) in by_key else None)
+        return None
+
     def _surviving_indices(self, table_name: str, tbl: dict):
         """Indices of ``tbl['rows']`` that satisfy the filter context, or None
         when nothing filters this table.
@@ -2473,6 +2543,11 @@ class DAXContext:
         cache = self._filter_idx_cache
         sets = []
         for fk, allowed in self.filter_context.items():
+            if fk.startswith(_TUPLE_FILTER_PREFIX):
+                hit = self._tuple_filter_indices(table_name, tbl, allowed)
+                if hit is not None:
+                    sets.append(hit)
+                continue
             parts = fk.split('.', 1)
             if len(parts) != 2 or parts[0] != table_name:
                 continue
@@ -3309,6 +3384,17 @@ class DAXEngine:
                 for elem in (self._split_top_level(data, ',') if data else []):
                     elem = elem.strip()
                     if not elem:
+                        continue
+                    parts = (self._split_top_level(elem[1:-1], ',')
+                             if elem.startswith('(') and elem.endswith(')') else [])
+                    if len(parts) > 1:
+                        # A row constructor ("a", 1): one row whose columns
+                        # DAX names Value1, Value2, ...; __tuple__ keeps the
+                        # order for TREATAS onto several columns.
+                        vals = tuple(self._eval_expr(p.strip(), ctx, var_scope) for p in parts)
+                        row = {'__table__': '', '__tuple__': vals}
+                        row.update({f'Value{i}': v for i, v in enumerate(vals, 1)})
+                        rows.append(row)
                         continue
                     v = self._eval_expr(elem, ctx, var_scope)
                     rows.append({'__table__': '', '__column__': 'Value',
@@ -4883,6 +4969,20 @@ class DAXEngine:
                         value = {"all": [applied_here[key], value]}
                     applied_here[key] = value
                     new_ctx = new_ctx.with_filters({key: value})
+                elif (isinstance(result, tuple) and len(result) == 3
+                        and result[0] == '__TREATAS_TUPLES__'):
+                    cols, rows = result[1], result[2]
+                    key = _tuple_filter_key(cols)
+                    if not _tkf:
+                        # TREATAS replaces the filters on its columns.
+                        new_ctx = new_ctx.without_filters([f"{t}.{c}" for t, c in cols])
+                    spec = {"tuple_columns": [list(c) for c in cols],
+                            "rows": [list(r) for r in dict.fromkeys(rows)]}
+                    prev = new_ctx.filter_context.get(key)
+                    if _tkf and isinstance(prev, dict) and "rows" in prev:
+                        keep = {tuple(map(_tuple_norm, r)) for r in prev["rows"]}
+                        spec["rows"] = [r for r in spec["rows"] if tuple(map(_tuple_norm, r)) in keep]
+                    new_ctx = new_ctx.with_filters({key: spec})
                 elif isinstance(result, list) and not result:
                     return None
                 elif isinstance(result, dict) and '__treatas__' in result:
@@ -7141,6 +7241,24 @@ class DAXEngine:
             ref = self._eval_expr(args[i].strip(), ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 target_cols.append(ref)
+        if isinstance(table_ref, list) and len(target_cols) > 1:
+            # Onto several columns: a filter on their combinations. Each row
+            # must carry one value per target column (a row constructor, or a
+            # table with that many columns).
+            rows = []
+            for item in table_ref:
+                if isinstance(item, dict) and '__tuple__' in item:
+                    vals = item['__tuple__']
+                elif isinstance(item, dict):
+                    vals = tuple(v for k, v in self._row_cols(item).items())
+                else:
+                    vals = ()
+                if len(vals) != len(target_cols):
+                    from pbix_mcp.errors import DAXEvaluationError
+                    raise DAXEvaluationError(
+                        f"TREATAS: a row has {len(vals)} value(s) for {len(target_cols)} column(s)")
+                rows.append(tuple(vals))
+            return ('__TREATAS_TUPLES__', target_cols, rows)
         if isinstance(table_ref, list) and target_cols:
             # Extract values and return as filter marker
             values = []
