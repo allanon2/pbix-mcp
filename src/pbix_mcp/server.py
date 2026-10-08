@@ -18214,6 +18214,7 @@ def pbix_doctor(alias: str) -> str:
         def check_string_dictionaries():
             _init_datamodel()
             from pbix_mcp.formats.vertipaq_decoder import decode_dictionary
+            from pbix_mcp.formats.vertipaq_encoder import column_text_key
             offenders = []
             scanned = 0
             for f in abf_files:
@@ -18235,7 +18236,9 @@ def pbix_doctor(alias: str) -> str:
                 for v in values:
                     if not isinstance(v, str):
                         continue
-                    k = v.casefold()
+                    # what the column store folds: ASCII letters only (#109);
+                    # 'Äpfel' and 'äpfel' are two legitimate values
+                    k = column_text_key(v)
                     if k in folded and folded[k] != v:
                         offenders.append(
                             f"{path}: {folded[k]!r} vs {v!r}")

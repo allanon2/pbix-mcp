@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.119] - 2026-10-08
+
+Three fixes found while verifying 0.9.118. Each is checked against Power BI Desktop 2.152 over ADOMD, through the 0.9.118 battery extended to 44 queries:
+
+- **Engine:** all 2,046 cells match, through `pbix_evaluate_dax` and `pbix_evaluate_dax_grouped`.
+- **Builder:** the built and the Desktop-refreshed model answer all 44 queries identically.
+
+### Fixed — text compares case-insensitively in expressions (issue #107)
+
+- **What was wrong:** the expression evaluator compared text with Python's case-sensitive operators everywhere. Desktop's formula engine compares text linguistically and case-insensitively. Desktop 2.152 answers 1 to all of these, and 0.9.118 answered 0 or BLANK:
+  - `IF("North" = "north", 1, 0)` (`==` too);
+  - `IF("a" < "B", 1, 0)`;
+  - `FILTER(F, F[Region] = "north")`;
+  - `SWITCH("north", "North", 1, 0)`;
+  - `LOOKUPVALUE(.., F[Region], "south")`;
+  - `"NORTH" IN VALUES(F[Region])`;
+  - `CONTAINS(F, F[Region], "north")`;
+  - `CONTAINSROW(VALUES(F[Region]), "north")`.
+
+  In the same way `COUNTROWS(DISTINCT({"a", "A", "b"}))` is 2, `MAXX({"a", "B"}, [Value])` is `"B"`, and a predicate `F[Region] <> "north"` excludes North.
+- **The formula engine folds fully:** `"Ä" = "ä"`, `"Σ" = "σ"` and `"Straße" = "STRASSE"` are TRUE. A column's stored values fold ASCII letters only (#102, #109).
+- **The fix:**
+  - comparison operators, `_compare` (IN, predicates), SWITCH, LOOKUPVALUE (now through the column's typed index), CONTAINS and CONTAINSROW compare text case-insensitively;
+  - `DISTINCT` over a table expression dedupes the same way, keeping the first spelling;
+  - `MAXX` / `MINX` order text case-insensitively.
+- **Unchanged, as in Desktop:** `FIND`, `EXACT` and `SUBSTITUTE` stay case-sensitive, and accents still count (`"é" = "e"` is FALSE).
+- **Pinned** by `tests/test_issue107_text_comparisons.py`: 24 tests, 18 fail on 0.9.118. The 6 that pass are the case-sensitive and accent controls, plus TOPN's ordering, which was already right.
+
+### Fixed — iterating a CROSSJOIN reads every table's columns (issue #108)
+
+- **What was wrong:** CROSSJOIN merged each row's right part under `_2_`-prefixed keys, so an iterator's row context could not read the second table's columns:
+  - `COUNTROWS(FILTER(CROSSJOIN(VALUES(Region[Region]), VALUES(Prod[Cat])), Prod[Cat] = "B"))` was BLANK, where Desktop says 3;
+  - `CONCATENATEX` printed `('Prod', 'Cat')`;
+  - `SUMX(CROSSJOIN(..), [m])`'s context transition left the right table unfiltered;
+  - a FILTER over a CROSSJOIN used as a CALCULATE filter, or fed to `TREATAS` (the one cell #103 left open), lost the right table.
+- **The fix:**
+  - each CROSSJOIN row keeps its parts, one row per source table, and CROSSJOIN takes any number of tables;
+  - the row context reads each part, and the context transition filters all of them;
+  - TREATAS takes the parts' values in order;
+  - a FILTER over a CROSSJOIN used as a CALCULATE filter becomes a filter on column combinations (#103), not on the left table's rows.
+- **Measured:** every cell matches Desktop. Examples: `SUMX(CROSSJOIN(..), [s3])` is 31, `CALCULATE([s3], FILTER(CROSSJOIN(..), Region = "S" || Cat = "B"))` is 14, and the TREATAS form is 14 at the total and 2 / 4 / 8 by region.
+- **Pinned** by `tests/test_issue108_crossjoin_rows.py`: 21 tests, 17 fail on 0.9.118. The 4 that pass are row counts and cells where the first table's column alone decides the answer.
+
+### Fixed — PBIXBuilder folds only what the column store folds (issue #109)
+
+- **What was wrong:** the #43 fold (`vertipaq_encoder._val_key`) used `str.casefold()`. Desktop 2.152's own import of 14 names keeps 13 distinct values; only `Apple` / `apple` fold. These stay apart:
+  - `Äpfel` / `äpfel`, `Øl` / `øl`, `Éa` / `éa`;
+  - `Σίγμα` / `σίγμα`, `Дом` / `дом`;
+  - `Straße` / `Strasse`.
+
+  The builder stored 7 values: it rewrote the caller's data and `DISTINCTCOUNT` dropped. Its warning called `ß` / `ss` a case difference. `pbix_doctor` reported a Desktop-made file holding `Äpfel` and `äpfel` as one Desktop "WILL refuse to load".
+- **The fix:** one key, `vertipaq_encoder.column_text_key`, folds ASCII letters only. The encoder, the pre-build warning and the doctor's dictionary check all use it.
+- **Measured:** the built model and Desktop's refresh of the same rows now answer alike, with 13 distinct values. The extended battery's built and refreshed answers are identical on all 44 queries.
+- **Pinned** by `tests/test_issue109_builder_ascii_fold.py`: 2 tests, both fail on 0.9.118.
+
 ## [0.9.118] - 2026-10-08
 
 Seven fixes. Six come from pull requests by @allanon2 (#94–#99), reviewed read-only, reproduced and solved here; the seventh, #101, was found while verifying them.

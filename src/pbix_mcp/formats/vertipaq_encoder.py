@@ -1426,19 +1426,34 @@ def _encode_column(
     }
 
 
+_ASCII_LOWER = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+
+
+def column_text_key(s: str) -> str:
+    """A string as the VertiPaq column store compares it: ASCII letters
+    case-insensitively, every other character as it is (issue #109).
+
+    Measured on Power BI Desktop 2.152's own import of 14 names: only
+    'Apple' / 'apple' became one value; 'Äpfel' / 'äpfel', 'Øl' / 'øl',
+    'Éa' / 'éa', 'Σίγμα' / 'σίγμα', 'Дом' / 'дом' and 'Straße' / 'Strasse'
+    stayed distinct. str.casefold() merged all of them."""
+    return s.translate(_ASCII_LOWER)
+
+
 def _val_key(v):
     """Hashable IDENTITY key for a dictionary value.
 
     Strings fold case (issue #43): VertiPaq's string store is
-    CASE-INSENSITIVE — 'VAN DER SAR' and 'van der SAR' are one value to
-    Analysis Services, and writing both as separate dictionary entries makes
-    Desktop reject the whole model ('A duplicate value has been detected in
-    the Unique Value store'). Folding here dedups every consumer at once
-    (dictionary build, row->index mapping, H$ hierarchy, distinct counts);
-    the STORED spelling stays the first one seen, matching Desktop's own
-    import behavior. NaN keeps its sentinel (NaN != NaN)."""
+    CASE-INSENSITIVE for ASCII letters — 'VAN DER SAR' and 'van der SAR' are
+    one value to Analysis Services, and writing both as separate dictionary
+    entries makes Desktop reject the whole model ('A duplicate value has been
+    detected in the Unique Value store'). Folding here dedups every consumer
+    at once (dictionary build, row->index mapping, H$ hierarchy, distinct
+    counts); the STORED spelling stays the first one seen, matching Desktop's
+    own import behavior. Only ASCII letters fold (column_text_key, #109).
+    NaN keeps its sentinel (NaN != NaN)."""
     if isinstance(v, str):
-        return v.casefold()
+        return column_text_key(v)
     if isinstance(v, float) and math.isnan(v):
         return ("__nan__",)
     return v

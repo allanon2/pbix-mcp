@@ -40,8 +40,15 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-08 (0.9.118): docs 1-47 and GitHub issues/PRs #1-#106 are
-closed; #107, #108 and #109 are open for the next release.** 0.9.118 solves PRs
+**Updated 2026-10-08 (0.9.119): docs 1-47 and GitHub issues/PRs #1-#109 are
+closed; the queues are empty.** 0.9.119 closes the three gaps found while
+verifying 0.9.118:
+
+- #107: text compares case-insensitively in expressions.
+- #108: iterating a CROSSJOIN reads every table's columns.
+- #109: the builder folds only ASCII letters, as the column store does.
+
+As of 0.9.118, docs 1-47 and #1-#106 were closed. 0.9.118 solves PRs
 #94-#99 by @allanon2 on our side, each with its own issue:
 
 - #100: ALLSELECTED over the expanded table (PR #94).
@@ -53,11 +60,8 @@ closed; #107, #108 and #109 are open for the next release.** 0.9.118 solves PRs
 - #101: ALL / REMOVEFILTERS / ALLEXCEPT over the expanded table, found
   verifying #100.
 
-Three further gaps were found while verifying and filed. #107: text
-comparisons in expressions are case-sensitive. #108: iterating a CROSSJOIN
-cannot read its second table's columns. #109: the builder folds non-ASCII
-case pairs and ß / ss, which Power BI keeps apart (its column store folds only
-ASCII letters, as #102 now matches).
+Three further gaps were found while verifying it and were filed as #107-#109,
+fixed in 0.9.119 (above).
 
 As of 0.9.117: 0.9.116 closes doc 46 = #92 (whole-number doubles spelled
 '13D', as Desktop does, for every property); 0.9.117 closes doc 47 = #93 (the

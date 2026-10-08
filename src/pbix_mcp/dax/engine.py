@@ -1225,10 +1225,24 @@ def _intersect_tuple_filters(a: dict, b: dict) -> dict:
             'rows': [r for r in a.get('rows') or [] if _tuple_key(r) in keep]}
 
 
+def _text_key(s: str) -> str:
+    """Text as DAX compares it: case-insensitively (the model's collation;
+    issue #107). Accents still count."""
+    return s.casefold()
+
+
+def _dax_equal(a, b) -> bool:
+    """Equality as DAX's lookups and SWITCH see it: text case-insensitively,
+    numbers by value whatever their storage, dates as moments (_value_keys)."""
+    ka = _value_keys(a, False)
+    return any(k in ka for k in _filter_value_keys(b))
+
+
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
-    date when both parse as dates, else as text. A BLANK side compares as the
-    other side's zero (see _blank_zero_of): BLANK = 0 and BLANK < 1 are TRUE."""
+    date when both parse as dates, else as text, case-insensitively (#107). A
+    BLANK side compares as the other side's zero (see _blank_zero_of): BLANK = 0
+    and BLANK < 1 are TRUE."""
     if target is None and cell is not None:
         target = _blank_zero_of(cell)
     elif cell is None and target is not None:
@@ -1241,8 +1255,8 @@ def _compare(cell, op: str, target) -> bool:
         if a_dt is not None and b_dt is not None:
             a, b = a_dt, b_dt
         else:
-            a = "" if cell is None else str(cell)
-            b = "" if target is None else str(target)
+            a = _text_key("" if cell is None else str(cell))
+            b = _text_key("" if target is None else str(target))
     if op == ">":
         return bool(a > b)
     if op in (">=", "=>"):
@@ -1461,8 +1475,13 @@ def _extremum(cur, cand, want_max: bool):
         return cur
     if cur is None:
         return cand
+    a, b = cand, cur
+    if isinstance(a, str) and isinstance(b, str):
+        # Text orders case-insensitively (Desktop: MAXX({"a", "B"}, [Value])
+        # is "B"; issue #107).
+        a, b = _text_key(a), _text_key(b)
     try:
-        return cand if ((cand > cur) if want_max else (cand < cur)) else cur
+        return cand if ((a > b) if want_max else (a < b)) else cur
     except TypeError:
         return cur
 
@@ -3581,11 +3600,16 @@ class DAXEngine:
                 continue  # a blank side: the old chain fell through
             if kind == _P_TCOL:
                 table_name, col_name = data
-                if ctx._current_row and ctx._current_row.get('__table__') == table_name:
-                    if col_name in ctx._current_row:
-                        return ctx._current_row[col_name]
-                    if ctx._current_row.get('__column__') == col_name:
-                        return ctx._current_row.get('__value__')
+                _cur = ctx._current_row
+                if _cur and '__parts__' in _cur:
+                    # A CROSSJOIN row: the part from that table (#108).
+                    _cur = next((p for p in _cur['__parts__']
+                                 if p.get('__table__') == table_name), _cur)
+                if _cur and _cur.get('__table__') == table_name:
+                    if col_name in _cur:
+                        return _cur[col_name]
+                    if _cur.get('__column__') == col_name:
+                        return _cur.get('__value__')
                 # A reference to a column that does NOT exist must be BLANK, not
                 # a (table, column) marker. Agents_Performance's TopN/BottomN
                 # measures read 'Top-Bottom-N'[Top-Bottom-N Value] while that
@@ -4035,8 +4059,35 @@ class DAXEngine:
     def _make_row_context(self, row_item: dict, ctx: 'DAXContext') -> 'DAXContext':
         """Create a filter context from a row dict, filtering on ALL columns of the row.
         This implements the row context → filter context transition."""
+        parts = row_item.get('__parts__')
+        if parts:
+            # A CROSSJOIN row: the transition filters every source table's
+            # columns, and the row context reads each of them (issue #108).
+            filters_all: dict = {}
+            for part in parts:
+                filters_all.update(self._row_filters(part))
+            new_ctx = ctx.with_filters(filters_all)
+            new_ctx._current_row = row_item
+            new_ctx._outer_ctx = ctx
+            return new_ctx
+        new_ctx = ctx.with_filters(self._row_filters(row_item))
+        # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
+        # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
+        # columns) so column references resolve against the row even inside
+        # compound scalar expressions (T[C] & "...", FORMAT(T[C], ...)) — not
+        # only when the column ref is the entire expression.
+        new_ctx._current_row = row_item
+        # Keep the pre-transition context reachable for plain column aggregates
+        # (see DAXContext._outer_ctx).
+        new_ctx._outer_ctx = ctx
+        return new_ctx
+
+    @staticmethod
+    def _row_filters(row_item: dict) -> dict:
+        """The filters one row's context transition applies: every column of
+        the row, as an iterated (in-scope) value."""
         meta_keys = {'__table__', '__column__', '__value__', '__row__',
-                     '__blank_row__'}
+                     '__blank_row__', '__parts__', '__tuple__'}
         table_name = row_item.get('__table__', '')
         filters: dict[str, list] = {}
         if row_item.get('__blank_row__'):
@@ -4063,22 +4114,16 @@ class DAXEngine:
             # so it stays in scope like any other (Desktop: ISINSCOPE TRUE on
             # the blank row after a transition, #80 / #82).
             filters[f"{table_name}.{col}"] = RowContextValues([None])
-        new_ctx = ctx.with_filters(filters)
-        # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
-        # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
-        # columns) so column references resolve against the row even inside
-        # compound scalar expressions (T[C] & "...", FORMAT(T[C], ...)) — not
-        # only when the column ref is the entire expression.
-        new_ctx._current_row = row_item
-        # Keep the pre-transition context reachable for plain column aggregates
-        # (see DAXContext._outer_ctx).
-        new_ctx._outer_ctx = ctx
-        return new_ctx
+        return filters
 
     def _resolve_row_result(self, result, row_item, row_ctx):
         """Resolve a column reference result in a row iteration context.
         If result is a (table, column) tuple, resolve it to a concrete value."""
         if isinstance(result, tuple) and len(result) == 2:
+            if isinstance(row_item, dict) and '__parts__' in row_item:
+                # A CROSSJOIN row: the part from that table (#108).
+                row_item = next((p for p in row_item['__parts__']
+                                 if p.get('__table__') == result[0]), row_item)
             if isinstance(row_item, dict) and '__table__' in row_item:
                 # Full-row dict (from bare table iteration): look up column directly
                 if row_item.get('__row__') and result[0] == row_item['__table__']:
@@ -4308,6 +4353,10 @@ class DAXEngine:
                     # takes the zero of the other operand's type. See
                     # _blank_zero_of for the Desktop-verified table.
                     left, right = _coerce_blanks_for_compare(left, right)
+                if isinstance(left, str) and isinstance(right, str):
+                    # Text compares case-insensitively ("North" = "north",
+                    # "a" < "B"; issue #107).
+                    left, right = _text_key(left), _text_key(right)
                 if left is not None and right is not None:
                     try:
                         return op_fn(left, right)
@@ -4904,7 +4953,10 @@ class DAXEngine:
         i = 1
         while i < len(args) - 1:
             case_val = self._eval_expr(args[i].strip(), ctx)
-            if test_val == case_val:
+            # = semantics: text case-insensitively (#107). A BLANK side keeps
+            # the plain identity test.
+            if (test_val == case_val if test_val is None or case_val is None
+                    else _compare(test_val, '=', case_val)):
                 return self._eval_expr(args[i + 1].strip(), ctx)
             i += 2
         # Default (odd number of remaining args)
@@ -5269,6 +5321,35 @@ class DAXEngine:
                 return None
             if isinstance(result, list) and result:
                 first = result[0]
+                if isinstance(first, dict) and first.get('__parts__'):
+                    # A table of COMBINATIONS (a FILTER over a CROSSJOIN): one
+                    # filter on the combinations of its columns, as TREATAS
+                    # onto several columns makes (#103). Taking it as the left
+                    # table's rows dropped the right table (issue #108).
+                    cj_cols: list = []
+                    for part in first['__parts__']:
+                        pt = new_ctx.model_table(part.get('__table__', ''))
+                        plain = self._row_cols(part)
+                        cj_cols += ([(pt, c) for c in plain] if plain
+                                    else [(pt, part.get('__column__', ''))])
+                    cj_rows = [tuple(self._row_values(r)) for r in result
+                               if isinstance(r, dict)]
+                    cj_key = _tuple_filter_key(cj_cols)
+                    cj_spec = {'tuple_columns': [list(c) for c in cj_cols],
+                               'rows': [list(r) for r in dict.fromkeys(cj_rows)]}
+                    if filter_arg.upper().startswith('KEEPFILTERS'):
+                        prev = new_ctx.filter_context.get(cj_key)
+                        if prev is not None:
+                            cj_spec = _intersect_tuple_filters(prev, cj_spec)
+                    else:
+                        cj_set = set(cj_cols)
+                        new_ctx = new_ctx.without_columns(
+                            lambda t, c: (t, c) in cj_set, keep_keys=applied_here)
+                    if cj_key in applied_here:
+                        cj_spec = _intersect_tuple_filters(applied_here[cj_key], cj_spec)
+                    applied_here[cj_key] = cj_spec
+                    new_ctx = new_ctx.with_filters({cj_key: cj_spec})
+                    continue
                 if isinstance(first, dict) and '__table__' in first:
                     groups: dict = {}
                     if '__row__' in first:
@@ -7264,16 +7345,17 @@ class DAXEngine:
                     result.append({'__table__': ref[0], '__column__': ref[1], '__value__': v})
             return result
         if isinstance(ref, list):
-            # Deduplicate table rows
-            seen = set()
+            # Deduplicate table rows as DAX compares their values: text
+            # case-insensitively (Desktop: COUNTROWS(DISTINCT({"a", "A", "b"}))
+            # is 2; issue #107), numbers by value; the first spelling stays.
+            seen_rows: set = set()
             result = []
             for item in ref:
-                if isinstance(item, dict) and '__value__' in item:
-                    key = str(item['__value__'])
-                else:
-                    key = str(item)
-                if key not in seen:
-                    seen.add(key)
+                vals = self._row_values(item) if isinstance(item, dict) else [item]
+                row_key = tuple(('t', _text_key(v)) if isinstance(v, str)
+                                else _value_keys(v, False)[0] for v in vals)
+                if row_key not in seen_rows:
+                    seen_rows.add(row_key)
                     result.append(item)
             return result
         return []
@@ -7345,23 +7427,40 @@ class DAXEngine:
         return result
 
     def _fn_crossjoin(self, args_str: str, ctx: DAXContext) -> Any:
-        """CROSSJOIN(table1, table2) — cartesian product."""
+        """CROSSJOIN(table1, table2, ...) — cartesian product.
+
+        Each row keeps its PARTS, one row per source table (``__parts__``), so
+        an iterator's row context reads every table's columns and a context
+        transition filters all of them. The merged keys (left as is, right
+        prefixed ``_2_``) stay for the callers that read them; on their own
+        they hid the right table: FILTER(CROSSJOIN(VALUES(R[Region]),
+        VALUES(P[Cat])), P[Cat] = "B") counted nothing (issue #108)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
-        t1 = self._eval_expr(args[0].strip(), ctx)
-        t2 = self._eval_expr(args[1].strip(), ctx)
-        if not isinstance(t1, list) or not isinstance(t2, list):
+        tables = [self._eval_expr(a.strip(), ctx) for a in args]
+        if not all(isinstance(t, list) for t in tables):
             return []
-        result = []
-        for item1 in t1:
-            for item2 in t2:
-                merged = {}
-                if isinstance(item1, dict):
-                    merged.update(item1)
-                if isinstance(item2, dict):
-                    merged.update({f"_2_{k}": v for k, v in item2.items()})
-                result.append(merged)
+
+        def _parts(item) -> tuple:
+            if not isinstance(item, dict):
+                return ()
+            return tuple(item.get('__parts__') or (item,))
+
+        result = tables[0]
+        for t2 in tables[1:]:
+            joined = []
+            for item1 in result:
+                for item2 in t2:
+                    merged = {}
+                    if isinstance(item1, dict):
+                        merged.update(item1)
+                    if isinstance(item2, dict):
+                        merged.update({f"_2_{k}": v for k, v in item2.items()
+                                       if k != '__parts__'})
+                    merged['__parts__'] = _parts(item1) + _parts(item2)
+                    joined.append(merged)
+            result = joined
         return result
 
     def _fn_datatable(self, args_str: str, ctx: DAXContext) -> Any:
@@ -8387,6 +8486,11 @@ class DAXEngine:
         row's columns, a CROSSJOIN row's left part then its right ('_2_')."""
         if '__tuple__' in row:
             return list(row['__tuple__'])
+        if row.get('__parts__'):
+            out: list = []
+            for part in row['__parts__']:
+                out += cls._row_values(part)
+            return out
         left = {k: v for k, v in row.items() if not k.startswith('_2_')}
         right = {k[3:]: v for k, v in row.items() if k.startswith('_2_')}
         plain = cls._row_cols(left)
@@ -8443,7 +8547,9 @@ class DAXEngine:
                 hay = tuple(self._row_cols(r).values())
             else:
                 hay = (r,)
-            if len(hay) == len(needle) and all(a == b for a, b in zip(hay, needle)):
+            if len(hay) == len(needle) and all(
+                    a == b if a is None or b is None else _dax_equal(a, b)
+                    for a, b in zip(hay, needle)):
                 return True
         return False
 
@@ -11258,13 +11364,12 @@ class DAXEngine:
             return False
 
         rows = ctx.get_filtered_rows(table_name)
+        # Values match as DAX compares them: text case-insensitively, numbers
+        # by value (str() missed 1 against 1.0 and "north" against "North").
+        wanted = [(col_idx, _filter_value_keys(value)) for col_idx, value in criteria]
         for row in rows:
-            match = True
-            for col_idx, value in criteria:
-                if str(row[col_idx]) != str(value):
-                    match = False
-                    break
-            if match:
+            if all(any(k in keys for k in _value_keys(row[col_idx], False))
+                   for col_idx, keys in wanted):
                 return True
         return False
 
@@ -11342,15 +11447,17 @@ class DAXEngine:
         if not criteria:
             return None
 
-        # Search through all rows (ignoring filter context for lookup)
-        for row in tbl['rows']:
-            match = True
-            for col_idx, search_val in criteria:
-                if str(row[col_idx]) != str(search_val):
-                    match = False
-                    break
-            if match:
-                return row[result_col_idx]
+        # Search through all rows (ignoring filter context for lookup), through
+        # the columns' typed index: text case-insensitively, numbers by value
+        # (#107; str() missed 1 against 1.0 and "north" against "North").
+        hit = None
+        for col_idx, search_val in criteria:
+            idx = ctx._indices_for_column_filter(tbl, col_idx, [search_val])
+            hit = idx if hit is None else hit & idx
+            if not hit:
+                break
+        if hit:
+            return tbl['rows'][min(hit)][result_col_idx]
 
         # Return alternate value if provided
         if len(args) > 1 + len(criteria) * 2:

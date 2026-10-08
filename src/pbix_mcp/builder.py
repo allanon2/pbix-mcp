@@ -1405,6 +1405,7 @@ class PBIXBuilder:
             # Silently altering supplied values is the one thing this project
             # does not do, so say so here rather than let the caller discover it
             # in a readback.
+            from pbix_mcp.formats.vertipaq_encoder import column_text_key
             for c in t["columns"]:
                 if str(c.get("data_type", "String")) != "String":
                     continue
@@ -1415,7 +1416,7 @@ class PBIXBuilder:
                     v = row.get(cname)
                     if not isinstance(v, str):
                         continue
-                    key = v.casefold()
+                    key = column_text_key(v)
                     prev = first_by_key.get(key)
                     if prev is None:
                         first_by_key[key] = v
@@ -1430,8 +1431,8 @@ class PBIXBuilder:
                         "case_fold", [t["name"]],
                         f"WARNING: Table '{t['name']}' column '{cname}' has "
                         f"{len(collisions)} value(s) differing only by case "
-                        f"({examples}). VertiPaq's string store is "
-                        f"case-insensitive, so these are stored as ONE value "
+                        f"({examples}). VertiPaq's string store folds the case "
+                        f"of ASCII letters, so these are stored as ONE value "
                         f"using the first spelling seen (as Power BI does on "
                         f"import) — distinct counts and grouping will reflect "
                         f"the folded value."
