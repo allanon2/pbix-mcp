@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.139] - 2026-10-11
+
+A grouped visual evaluated one row per call keeps one measure memo for the whole query (#186). A saved slicer range filters as a range (#189). The report binder keeps the bare columns Desktop keeps in a List slicer (#187), a multi-row card and an Azure map (#188), and compiles hierarchy levels instead of failing on them (#190).
+
+Run over every Desktop-authored data visual of the 31 corpus files (395), `compile_visual_binding` now leaves each prototype query and its projections as Desktop saved them. 0.9.138 rewrote 19 of them and raised `KeyError` on 23. The corpus census (1,508 measures) changes only the 14 measures that use RAND or RANDBETWEEN. Five of its files, re-timed side by side with 0.9.138, take 715.8 s against 712.7 s. `regress_check.py` answers every probe of its Desktop batteries as 0.9.138 does.
+
+### Fixed — every evaluate_measures_batch call started a fresh memo (issue #186)
+
+**What was wrong:** each call built a new `DAXContext`, and with it an empty measure memo. A caller that evaluates a grouped visual one row per call recomputed, on every row, the per-item values that a RANKX, TOPN or FILTER over `ALL(...)` needs, although they do not depend on the row. Agents Performance's 293-row employee table took 3.2 s a row, about 950 s in all.
+
+**The fix:** `evaluate_measures_batch` and `evaluate_measures_smart` take an optional `cache` dict. A caller passes one dict to every call of one query, and the measure memo lives in it, so each employee's `[MTD Total Sales]` is computed once for the table. `pbix_evaluate_dax_grouped` and `pbix_evaluate_dax_per_dimension` keep one per call. Agents Performance's table now takes **32 s**, and 18 of its rows rechecked without the cache give the same answers.
+
+Sharing never changes an answer:
+
+- **The memo is named by everything else that decides a value:** the model's tables, the measures and calculation groups, the relationships, the marked date tables, the culture, the measure home tables and the model's columns. One dict can serve several queries.
+- **A measure that can reach ALLSELECTED is also keyed by the query's selection and grouping keys.** Two queries with different slicer selections never share its values.
+
+**Pinned** by `tests/test_issue186_shared_memo.py`: answers with and without the cache, `[Total]` computed once per employee rather than once per employee per row, and the cases that must not share. **All 8 fail on 0.9.138**, which has no `cache` argument.
+
+### Fixed — a slicer's saved range was read as one value (issue #189)
+
+**What was wrong:** `_extract_default_filters_dict` read a saved `Comparison` of kind 1-4 (`>`, `>=`, `<`, `<=`) as the one-value list `[bound]`, which every caller applies as an equality, and dropped an `And` of two comparisons. IT Support's Date slicers save `Date >= 2024-01-01`, so the defaults filtered every page to one day: `pbix_evaluate_dax` gave `1- Tickets` = 28 with defaults, where Desktop shows 11,923.
+
+**The fix:** a range comes back as the predicate `make_value_matcher` evaluates: `{"op": ">=", "value": ...}`, and `{"all": [...]}` for both bounds of a Between slicer, each keeping its own kind. The upper bound is `<` the day after the slicer's end date, so it is not mapped to the inclusive `between`. An equality (kind 0, a what-if parameter's slicer) stays the one-value list SELECTEDVALUE reads.
+
+- **IT Support:** `1- Tickets` with the defaults is 11,923, as Desktop shows.
+- **Artificial Intelligence Sample:** the Anomaly Detection page's `Date >= 2020-06-01 AND Date < 2021-06-01` gives Revenue Won 16,745,400 and Opportunity Count 10,178, against 29,621,000 and 20,000 for every date.
+
+`pbix_get_default_filters` returns the same predicates.
+
+**Pinned** by `tests/test_issue189_slicer_ranges.py`. **9 of its 11 tests fail on 0.9.138.**
+
+### Fixed — the report binder aggregated the bare columns Desktop keeps (issues #187, #188)
+
+**What was wrong:** the binder wrapped a column in an implicit aggregation in three wells where Desktop keeps it bare:
+
+- **A List slicer's Values** (`listSlicer`, #187). `_SLICER_TYPES` lacked it, so `T.Grp` became `CountNonNull(T.Grp)`. All 9 List slicers in the community files keep the column, as the classic and Button slicers do.
+- **A multi-row card's Values** (#188). A multi-row card lists one card per row of its columns. Root Cause Analysis' 8 cards each bind a column beside a measure.
+- **An Azure map's Y / X** (#188), the wells its Latitude and Longitude fill. Map with Pie Chart Bubbles binds `Store.Latitude` and `Store.Longitude` there, bare.
+
+**The fix:** `listSlicer` is a slicer to the binder. A multi-row card's `Values` and an Azure map's `X` / `Y` keep a bare column bare. An Azure map's `Size` and a chart's value axis aggregate as before.
+
+### Fixed — a hierarchy level made the binder raise KeyError: 'Column' (issue #190)
+
+**What was wrong:** `compile_visual_binding` knew Column, Measure and Aggregation selects only. A visual that binds a level of a user hierarchy (Cars Sales' `Date.Calendar.Year` slicer) or of an auto date/time hierarchy (Briqlab Pink's `Scheduled_Dep` month axis) raised `KeyError: 'Column'`. That was 23 visuals in 7 community files, and every write through the binder failed for them.
+
+**The fix:** a `HierarchyLevel` select compiles as Desktop saves it, compared field by field with what Desktop saved for those 23 visuals:
+
+- **The expression:** its `SourceRef` is rewritten to the entity. For an auto date/time level, that is the SourceRef inside its `PropertyVariationSource`.
+- **The names:** its `NativeReferenceName` is `<hierarchy> <level>` ("Calendar Year"), or `<column> <level>` for an auto date/time level ("Scheduled_Dep Month"). Its display name and restatement are the level.
+- **No aggregation:** a level is never wrapped in an implicit aggregation.
+
+**Pinned** (#187, #188, #190) by `tests/test_issue187_188_190_visual_binding.py`. Its values are the queries and dataTransforms Desktop saved for Cars Sales' slicer, Briqlab Pink's area chart and Dashboard Help Modal View's column chart, plus the repros from the issues. **10 of its 14 tests fail on 0.9.138.**
+
 ## [0.9.138] - 2026-10-10
 
 DAX's text comparison follows Power BI Desktop's own collation (#185), and SEARCH, FIND, CONTAINSSTRING, CONTAINSSTRINGEXACT and SUBSTITUTE match as that collation compares (#180). Checked against Power BI Desktop 2.152 over ADOMD:

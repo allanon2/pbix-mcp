@@ -4347,6 +4347,8 @@ class DAXEngine:
         self._group_keys: set = set()
         # The caller's true slicer state, when grouped evaluation passes it.
         self._selected_base: dict | None = None
+        # _selection_token's value for the current outermost measure.
+        self._sel_token: tuple | None = None
         # Home tables of the measures currently on the evaluation stack; the
         # innermost one disambiguates a bare [Column] inside that measure.
         self._home_tables: list = []
@@ -4838,7 +4840,8 @@ class DAXEngine:
             # ALLSELECTED restores (#118): the same row under two iterations
             # can have two values, so the iteration is part of the key -- for
             # a measure that can reach ALLSELECTED (_reads_shadow).
-            _shadow_on = bool(ctx.filter_context) and self._reads_shadow(measure_name, ctx)
+            _sel_on = self._reads_shadow(measure_name, ctx)
+            _shadow_on = bool(ctx.filter_context) and _sel_on
 
             def _fc_part(k, v):
                 tag = type(v).__name__ if type(v) not in (list, dict) else ''
@@ -4875,7 +4878,10 @@ class DAXEngine:
             # Under the same filters, a reference whose item applies and one
             # whose item is already applied (inside the item, or nested in the
             # measure) have different values: the items are part of the key.
-            cache_key = (measure_name, fc_key) + ((_cg_sig,) if _cg_sig else ())
+            # A measure that reaches ALLSELECTED also reads the query's
+            # selection, which a memo shared across queries must key (#186).
+            cache_key = ((measure_name, fc_key) + ((_cg_sig,) if _cg_sig else ())
+                         + ((self._selection_token(ctx),) if _sel_on else ()))
         except Exception:
             cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
@@ -4926,6 +4932,7 @@ class DAXEngine:
             self._date_tables = dict(getattr(ctx, 'date_tables', None) or {})
             self._clearing_cache: tuple | None = None
             self._selected_base = getattr(ctx, 'selected_filters', None)
+            self._sel_token = None
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
         # A measure invocation IS the row->filter context transition (implicit
@@ -6714,6 +6721,28 @@ class DAXEngine:
         if not gk:
             return dict(outer)
         return {k: v for k, v in outer.items() if k not in gk}
+
+    def _selection_token(self, ctx: DAXContext) -> tuple:
+        """What ALLSELECTED restores besides the filters in force: the query's
+        selection (_selected_filters) and its grouping keys. One query has one,
+        so a memo kept per query needed no part of it; a memo shared by the
+        rows of a grouped query (evaluate_measures_batch's ``cache``, issue
+        #186) keys a measure that reaches ALLSELECTED on it.
+
+        The outermost measure is looked up before evaluate_measure snapshots
+        the query, so its token comes from its own context."""
+        def _token(sel: dict, keys) -> tuple:
+            return (tuple(sorted((k, type(v).__name__, _canonical(v)) for k, v in sel.items())),
+                    tuple(sorted(keys or ())))
+        if self._eval_depth == 0:
+            keys = set(getattr(ctx, 'group_keys', ()) or ())
+            base = getattr(ctx, 'selected_filters', None)
+            return _token(dict(base) if base is not None else
+                          {k: v for k, v in ctx.filter_context.items() if k not in keys}, keys)
+        tok = self._sel_token
+        if tok is None:
+            tok = self._sel_token = _token(self._selected_filters(), self._group_keys)
+        return tok
 
     # ---- what ALLSELECTED restores (issue #118) -----------------------------
     # Power BI Desktop 2.152 over ADOMD (build_b118.py):
@@ -15713,6 +15742,37 @@ def evaluate_measure(measure_name: str, tables: dict, measures: dict,
     return _engine.evaluate_measure(measure_name, ctx)
 
 
+def _canonical(value) -> str:
+    """A deterministic text for a model part (sets sorted), to key a memo."""
+    def _default(o):
+        if isinstance(o, (set, frozenset)):
+            return sorted(map(repr, o))
+        return repr(o)
+    return json.dumps(value, sort_keys=True, default=_default)
+
+
+def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
+    """Give ``ctx`` the measure memo kept in a caller's ``cache`` (issue #186).
+
+    The memo key is a measure and the filters it sees, so it is only valid
+    for one model, one relationship set, the same marked date tables,
+    culture, measure home tables, model columns and calculation groups: they
+    name the memo inside ``cache``, so one dict can serve several queries
+    and never hands a value across models. The query's ALLSELECTED state is
+    keyed per measure (DAXEngine._selection_token)."""
+    groups, formats = _calc_registry(ctx.measures)
+    name = (id(ctx.tables), _canonical(ctx.measures),
+            _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
+            _canonical(formats), _canonical(ctx.relationships),
+            ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
+            ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+    entry = cache.get(name)
+    if entry is None or entry[0] is not ctx.tables:
+        # the tables are held, so their id cannot name another model
+        entry = cache[name] = (ctx.tables, {}, {}, {})
+    ctx._measure_cache, ctx._measure_cache_unsupported, ctx._shield_cache = entry[1:]
+
+
 def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             filter_context: dict | None = None,
                             date_table: str | None = None, date_column: str | None = None,
@@ -15724,7 +15784,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
                             measure_tables: dict | None = None,
                             model_columns: dict | None = None,
                             calculation_groups: list | None = None,
-                            measure_formats: dict | None = None) -> dict:
+                            measure_formats: dict | None = None,
+                            cache: dict | None = None) -> dict:
     """Evaluate multiple measures, returning { name: value }.
 
     ``calculation_groups`` is ModelReader.calculation_groups and
@@ -15742,6 +15803,14 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     selection, and ``selected_filters`` is that slicer selection itself (the
     base filter_context BEFORE the group key was merged in) — together they
     are what ALLSELECTED restores (see DAXContext.group_keys).
+
+    ``cache`` is a dict the caller keeps for one query -- a grouped visual
+    evaluated one row per call -- and passes to every call of it. The
+    measure memo then lives there, so a value that does not depend on the
+    row, such as each employee's [Total] under a RANKX over
+    ALL(Emp[k]), is computed once for the query instead of once per row
+    (issue #186). Values are keyed by everything else that decides them
+    (_attach_query_memo), so sharing never changes an answer.
     """
     if calculation_groups is not None or measure_formats is not None:
         set_calculation_groups(measures, calculation_groups, measure_formats)
@@ -15761,6 +15830,8 @@ def evaluate_measures_batch(measure_names: list, tables: dict, measures: dict,
     ctx.culture = culture
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
+    if cache is not None:
+        _attach_query_memo(ctx, cache)
     results = {}
     for name in measure_names:
         results[name] = _engine.evaluate_measure(name, ctx)
@@ -16042,11 +16113,13 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
                             selected_filters: dict | None = None,
                             date_tables: dict | None = None,
                             calculation_groups: list | None = None,
-                            measure_formats: dict | None = None) -> dict:
+                            measure_formats: dict | None = None,
+                            cache: dict | None = None) -> dict:
     """Evaluate measures with smart fallback for SELECTEDVALUE-dependent measures.
 
     ``calculation_groups`` / ``measure_formats``: as in evaluate_measures_batch
-    (issue #121).
+    (issue #121). ``cache``: a query's shared measure memo, as in
+    evaluate_measures_batch (issue #186).
 
     ``group_by`` names the filter_context keys that are the query's GROUPING
     (one SUMMARIZECOLUMNS / visual row), as opposed to slicer filters: their
@@ -16090,6 +16163,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     ctx.measure_tables = measure_tables or {}
     ctx.model_columns = model_columns or {}
     ctx.culture = culture
+    if cache is not None:
+        _attach_query_memo(ctx, cache)
     results = {}
 
     for name in measure_names:

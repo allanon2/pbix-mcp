@@ -23,7 +23,20 @@ _TABLE_TYPES = {"tableEx", "table"}
 # matrix / pivotTable cross rows against columns — a fundamentally different
 # binding (Primary rows + Secondary columns) from a flat table.
 _MATRIX_TYPES = {"matrix", "pivotTable"}
-_SLICER_TYPES = {"slicer", "advancedSlicerVisual"}
+# The classic slicer, the Button slicer and Desktop's native List slicer all
+# keep a bare column in Values (issue #187: all 9 List slicers of the community
+# files bind dimDate.Year, Parameter.Parameter, ... unwrapped).
+_SLICER_TYPES = {"slicer", "advancedSlicerVisual", "listSlicer"}
+# Roles where Desktop keeps a bare column bare although the role also takes
+# measures (issue #188): a multi-row card lists one card per row of its
+# columns (Root Cause Analysis' 8 cards bind dim-Product.Sub-Category beside a
+# measure), and an Azure map takes coordinate columns as they are (Map with
+# Pie Chart Bubbles' Store.Latitude / Store.Longitude in Y / X, the roles its
+# Latitude / Longitude wells fill).
+_BARE_COLUMN_ROLES = {
+    "multiRowCard": {"Values"},
+    "azureMap": {"X", "Y"},
+}
 _CARTESIAN_TYPES = {
     "barChart", "columnChart", "clusteredBarChart", "clusteredColumnChart",
     "stackedBarChart", "stackedColumnChart", "hundredPercentStackedBarChart",
@@ -88,6 +101,16 @@ _FIELD_REF_RE = re.compile(
 
 def _type_codes(data_type: str | None) -> tuple[int, int]:
     return _TYPE_CODES.get(data_type or "", _DEFAULT_CODES)
+
+
+def _hierarchy_source(hier: dict) -> dict:
+    """The expression holding a hierarchy's SourceRef: the hierarchy's own,
+    or, for an auto date/time hierarchy, its PropertyVariationSource's."""
+    expr: dict = hier.get("Expression", {})
+    pvs = expr.get("PropertyVariationSource")
+    if pvs is not None:
+        expr = pvs.get("Expression", {})
+    return expr
 
 
 def _data_reduction(visual_type: str) -> dict:
@@ -165,6 +188,8 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
         entity = alias2entity.get(src.get("Source"), src.get("Entity"))
         prop = col.get("Property", "")
         role = ref2role.get(old_ref)
+        if role in _BARE_COLUMN_ROLES.get(visual_type, ()):
+            continue                       # Desktop keeps the column bare here
         geo_role = role in _GEO_ROLES
         geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
         # X is a value role only for the lat/long case handled here; treating
@@ -351,14 +376,33 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
 
     def _node(sel):
         # Unwrap an Aggregation (e.g. Sum(col)) to its inner Column/Measure so the
-        # Property / SourceRef helpers work for aggregate selects too.
+        # Property / SourceRef helpers work for aggregate selects too. A
+        # hierarchy level (Desktop's Date.Calendar.Year) reads as a column
+        # whose property is its level, on its hierarchy's source (issue #190).
         if "Aggregation" in sel:
             inner = sel["Aggregation"].get("Expression", {})
             return inner.get("Column") or inner.get("Measure") or {}
+        if "HierarchyLevel" in sel:
+            lvl = sel["HierarchyLevel"]
+            src = _hierarchy_source(lvl.get("Expression", {}).get("Hierarchy", {}))
+            return {"Expression": src, "Property": lvl.get("Level", "")}
         return sel.get("Measure") or sel.get("Column") or {}
 
     def _native(sel):
         return _node(sel).get("Property", sel.get("Name", ""))
+
+    def _query_native(sel):
+        """The query's NativeReferenceName: a hierarchy level's is its
+        hierarchy and level ("Calendar Year"), an auto date/time
+        hierarchy's its column and level ("Scheduled_Dep Month"), as
+        Desktop writes them."""
+        if "HierarchyLevel" in sel:
+            lvl = sel["HierarchyLevel"]
+            hier = lvl.get("Expression", {}).get("Hierarchy", {})
+            pvs = hier.get("Expression", {}).get("PropertyVariationSource")
+            base = pvs.get("Property", "") if pvs else hier.get("Hierarchy", "")
+            return f"{base} {lvl.get('Level', '')}".strip()
+        return _native(sel)
 
     def _entity_of(sel):
         src = _node(sel).get("Expression", {}).get("SourceRef", {})
@@ -380,6 +424,13 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
                 if key in inner:
                     _rewrite_src(inner[key])
             return {"Aggregation": agg}
+        if "HierarchyLevel" in sel:
+            lvl = copy.deepcopy(sel["HierarchyLevel"])
+            hier = lvl.get("Expression", {}).get("Hierarchy")
+            if hier is not None:
+                pvs = hier.get("Expression", {}).get("PropertyVariationSource")
+                _rewrite_src(pvs if pvs is not None else hier)
+            return {"HierarchyLevel": lvl}
         key = "Measure" if "Measure" in sel else "Column"
         node = copy.deepcopy(sel[key])
         _rewrite_src(node)
@@ -392,7 +443,7 @@ def compile_visual_binding(single_visual: dict, resolve_type=None):
     native_names: list[str] = []
     _seen: dict[str, int] = {}
     for s in selects:
-        base = _native(s)
+        base = _query_native(s)
         cnt = _seen.get(base, -1) + 1
         _seen[base] = cnt
         native_names.append(base if cnt == 0 else f"{base}{cnt}")
