@@ -14505,6 +14505,9 @@ def pbix_evaluate_dax_per_dimension(
             ctx['date_table'], ctx['date_column'], ctx.get('relationships')
         )
         fallback_measures = [m for m in measure_names if m not in fast]
+        # One measure memo for every dimension value (issue #186): what a
+        # value does not depend on is computed once for the sweep.
+        query_cache: dict = {}
 
         for val in capped_vals:
             if fallback_measures:
@@ -14519,6 +14522,7 @@ def pbix_evaluate_dax_per_dimension(
                     date_tables=ctx.get('date_tables'),
                     measure_tables=ctx.get('measure_tables'),
                     model_columns=ctx.get('model_columns'),
+                    cache=query_cache,
                 )
             else:
                 fb = {}
@@ -14675,6 +14679,9 @@ def pbix_evaluate_dax_grouped(
         capped = uniq[:max_groups]
 
         results: list[dict] = []
+        # One measure memo for every group (issue #186): a RANKX over
+        # ALL(...) evaluates its per-item values once for the whole table.
+        query_cache: dict = {}
         if len(keys) == 1:
             ref, dim_table, dim_col = keys[0][0], keys[0][1], keys[0][2]
             fast = dax_engine.evaluate_per_dimension(
@@ -14693,7 +14700,8 @@ def pbix_evaluate_dax_grouped(
                         group_keys={ref}, selected_filters=base_fc,
                         date_tables=ctx.get('date_tables'),
                         measure_tables=ctx.get('measure_tables'),
-                        model_columns=ctx.get('model_columns'))
+                        model_columns=ctx.get('model_columns'),
+                        cache=query_cache)
                 results.append({
                     "key": {dim_col: val},
                     "values": {m: (fast[m].get(val) if m in fast else
@@ -14710,7 +14718,8 @@ def pbix_evaluate_dax_grouped(
                     group_keys={k[0] for k in keys}, selected_filters=base_fc,
                     date_tables=ctx.get('date_tables'),
                     measure_tables=ctx.get('measure_tables'),
-                    model_columns=ctx.get('model_columns'))
+                    model_columns=ctx.get('model_columns'),
+                    cache=query_cache)
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},
                     "values": {m: vals.get(m) for m in measure_names},
@@ -15681,7 +15690,10 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
     """Internal: extract default slicer filters as a dict for programmatic use.
 
     Handles both In-type (value list) and Comparison-type (equality/range) filters.
-    Returns { 'Entity.Property': [values] } suitable for use as filter_context.
+    Returns { 'Entity.Property': [values] | predicate } suitable for use as
+    filter_context: an In list or an equality is a value list; a range is
+    ``{"op": ">=", "value": lo}``, or ``{"all": [...]}`` for both bounds of a
+    Between slicer (issue #189).
 
     ``layout`` may be a pre-parsed layout dict to avoid re-reading/re-parsing the
     (potentially multi-MB) report layout once per page.
@@ -15697,7 +15709,7 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
 
     page = sections[page_index]
     containers = page.get("visualContainers", [])
-    filters = {}
+    filters: dict = {}   # key -> value list | range predicate
 
     import re as _re
 
@@ -15730,6 +15742,33 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
         if entity and prop:
             return f"{entity}.{prop}"
         return None
+
+    # ComparisonKind 1-4 as the filter_context predicates make_value_matcher
+    # evaluates (issue #189).
+    _range_ops = {1: ">", 2: ">=", 3: "<", 4: "<="}
+
+    def _comparisons(cond, from_entries):
+        """[(key, spec)] for a Comparison, or an And of Comparisons: what a
+        Between slicer saves ("Date >= lo AND Date < the day after hi").
+        Kind 0 (=) is the one-value list a what-if parameter's
+        SELECTEDVALUE reads; kinds 1-4 are range predicates, never the
+        bound as a value."""
+        if "And" in cond:
+            left = _comparisons(cond["And"].get("Left", {}), from_entries)
+            right = _comparisons(cond["And"].get("Right", {}), from_entries)
+            return left + right if left is not None and right is not None else None
+        comp = cond.get("Comparison")
+        if comp is None:
+            return None
+        kind = comp.get("ComparisonKind", 0)  # 0=Equal, 1=GT, 2=GTE, 3=LT, 4=LTE
+        key = _resolve_column(comp.get("Left", {}).get("Column", {}), from_entries)
+        parsed = _parse_literal(comp.get("Right", {}).get("Literal", {}).get("Value"))
+        if key is None or parsed is None:
+            return None
+        if kind == 0:
+            return [(key, [parsed])]
+        op = _range_ops.get(kind)
+        return [(key, {"op": op, "value": parsed})] if op else None
 
     for vc in containers:
         config = _parse_visual_config(vc)
@@ -15765,28 +15804,17 @@ def _extract_default_filters_dict(work_dir: str, page_index: int = 0, layout: di
                             filters[key] = vals
 
                 # --- Comparison-type: equality / range filters ---
-                if "Comparison" in cond:
-                    comp = cond["Comparison"]
-                    kind = comp.get("ComparisonKind", 0)  # 0=Equal, 1=GT, 2=GTE, 3=LT, 4=LTE
-                    left = comp.get("Left", {})
-                    right = comp.get("Right", {})
-
-                    # Left side should be a column reference
-                    col_expr = left.get("Column", {})
-                    key = _resolve_column(col_expr, from_entries)
-
-                    # Right side should be a literal value
-                    lit = right.get("Literal", {}).get("Value")
-                    parsed = _parse_literal(lit)
-
-                    if key and parsed is not None:
-                        if kind == 0:
-                            # Equality: single value filter
-                            filters[key] = [parsed]
-                        else:
-                            # Range filter (GT/GTE/LT/LTE) — store as single value
-                            # for SELECTEDVALUE to work on numeric slicers
-                            filters[key] = [parsed]
+                if "Comparison" in cond or "And" in cond:
+                    parts = _comparisons(cond, from_entries)
+                    by_key: dict = {}
+                    for key, spec in parts or ():
+                        by_key.setdefault(key, []).append(spec)
+                    for key, specs in by_key.items():
+                        if len(specs) == 1:
+                            filters[key] = specs[0]
+                        else:   # both bounds of one column: intersect them
+                            filters[key] = {"all": [
+                                {"in": s} if isinstance(s, list) else s for s in specs]}
 
     return filters
 
@@ -15864,9 +15892,13 @@ def _get_default_filters_current(ctx: dict) -> dict:
 def pbix_get_default_filters(alias: str, page_index: int = 0) -> str:
     """Extract default slicer filter selections from a report page.
 
-    Reads the filter config from slicer visuals (advancedSlicerVisual, slicer)
-    to determine what the dashboard's default filtered state is.
-    Supports both In-type (value list) and Comparison-type (equality/range) filters.
+    Reads the filter config from slicer visuals (slicer, advancedSlicerVisual,
+    listSlicer) to determine what the dashboard's default filtered state is.
+    Supports both In-type (value list) and Comparison-type (equality/range)
+    filters: a range comes back as a predicate such as
+    ``{"op": ">=", "value": "2024-01-01T00:00:00"}`` (both bounds of a Between
+    slicer as ``{"all": [...]}``), which pbix_evaluate_dax's filter_context
+    takes as it is.
 
     Args:
         alias: The alias of the open file

@@ -40,8 +40,19 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.138): docs 1-60 and GitHub issues/PRs #1-#185 are
-closed.** 0.9.138 closes #185 (DAX's text comparison: the Kelvin sign <> K, Hebrew
+**Updated 2026-10-11 (0.9.139): docs 1-63 and GitHub issues/PRs #1-#190 are
+closed.** 0.9.139 closes doc 61 = #186: a grouped visual evaluated one row
+per evaluate_measures_batch call keeps one measure memo for the query (the
+`cache` argument), so Agents Performance's 293-row employee table takes 32 s
+instead of ~950 s; doc 62 = #187 / #188: the report binder keeps the bare
+columns Desktop keeps in a List slicer, a multi-row card's Values and an
+Azure map's X / Y; doc 63 = #189: a slicer's saved range filters as a range
+(IT Support's defaults: 28 -> 11,923 tickets, as Desktop shows); and #190: a
+hierarchy level compiles as Desktop saves it instead of raising KeyError
+(23 Desktop-authored visuals in 7 community files).
+
+As of 0.9.138, docs 1-60 and GitHub issues/PRs #1-#185 were closed.
+0.9.138 closes #185 (DAX's text comparison: the Kelvin sign <> K, Hebrew
 final letters and small kana apart, as Desktop answers; build_b181.py,
 build_b185.py - build_b187.py, build_b189.py) and #180 (SEARCH / FIND /
 CONTAINSSTRING(EXACT) / SUBSTITUTE; build_b190.py, 114 probes). [Rewritten in
@@ -490,6 +501,16 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 61 (GH #186), doc 62 (GH #187, #188), doc 63 (GH #189), GH #190** --
+  CLOSED (0.9.139). Every evaluate_measures_batch call started an empty
+  measure memo (Agents Performance's table ~950 s, now 32 s with one `cache`
+  per query); a slicer's saved range was read as one value (IT Support 28 vs
+  Desktop's 11,923 tickets); the binder aggregated the bare columns of a List
+  slicer, a multi-row card and an Azure map, and raised KeyError on a
+  hierarchy level (ground truth: the bindings Desktop saved in the corpus
+  files). Regression: tests/test_issue186_shared_memo.py,
+  tests/test_issue189_slicer_ranges.py,
+  tests/test_issue187_188_190_visual_binding.py.
 - **GH #185, GH #180** -- CLOSED (0.9.138). Text compared by Windows NLS 6.1
   instead of Desktop's collation (Desktop: build_b181.py, build_b185.py -
   build_b187.py, build_b189.py); SEARCH / FIND / CONTAINSSTRING(EXACT) /
