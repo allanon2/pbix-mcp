@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.138] - 2026-10-10
+
+DAX's text comparison follows Power BI Desktop's own collation (#185), and SEARCH, FIND, CONTAINSSTRING, CONTAINSSTRINGEXACT and SUBSTITUTE match as that collation compares (#180). Checked against Power BI Desktop 2.152 over ADOMD:
+
+- `build_b181.py`: `=` over 2,938 pairs of characters the old collation equated. All match, against 2,596 on 0.9.137.
+- `build_b185.py`: `=` and `<` over 1,093 pairs inside the classes Desktop splits. All match.
+- `build_b186.py` and `build_b187.py`: Desktop's ORDER BY of all 63,425 BMP characters UNICHAR accepts, and `=` of every neighbour in that order. Both match in full.
+- `build_b189.py`: `=` over every pair of 55 texts with nonspacing marks. All match.
+- `build_b190.py`: 114 SEARCH / FIND / CONTAINSSTRING(EXACT) / SUBSTITUTE probes. All match, against 62 on 0.9.137.
+
+The corpus census (1,508 measures) changes only measures that use RAND or RANDBETWEEN (all 15 of them this time); it runs in 1,818 s, against 1,809 s on 0.9.137. `regress_check.py` finds no regression across its Desktop batteries, and 49 answers that now match Desktop.
+
+### Fixed — text was compared by Windows NLS 6.1, not by Desktop's collation (issue #185)
+
+**What was wrong:** the collation weighed text by the Windows NLS 6.1 sort keys this package measured. Desktop's engine compares text by the sorting weight table of SQL Server's version-100 collations, which differs in two ways:
+
+- **Its own weights.** The Kelvin sign and K, the Ohm sign and Ω, Ƒ and ƒ, Ṥ and Ş, and the negative circled numbers have weights of their own, and characters added after Unicode 5.0 weigh nothing (U+1E9E, as #156 found).
+- **Its case rule.** With case and width ignored, the third-level differences drop out only in the cased scripts (digits, Latin, Greek, Cyrillic, Armenian, Georgian, Glagolitic, Coptic):
+  - there, "a" = "A", "2" = "²", "ᴀ" = "A", "①" = "1";
+  - elsewhere, the case weight keeps what it marks: a Hebrew final letter (כ <> ך), a small kana (ぁ <> あ), a final jamo, a Tibetan retroflex letter. Kana type and width still drop out (あ = ア = ｱ).
+
+pbix-mcp equated 330 of the characters `build_b181.py` asked about where Desktop does not. `"K" = UNICHAR(8490)` was TRUE.
+
+**What Desktop does, besides:**
+
+- A conjoining jamo sorts among the Hangul syllables.
+- A CJK ideograph sorts after them.
+- A kana iteration or prolonged-sound mark repeats the weight of the letter before it. After an expansion or a jamo, or alone, it sorts after everything.
+- Punctuation that weighs only as word-sort punctuation keeps its case and width ("-" <> "－").
+- A text of nothing but nonspacing marks sorts by their accent.
+
+**The fix:** the collation builds the sort key as [MS-UCODEREF] 3.1.5.2 lays it out, with Desktop's case rule and the context rules above. Its weights:
+
+- **Base.** The sorting weight table Microsoft publishes for Windows Server 2008 ([MSDN-SWT], a normative reference of [MS-UCODEREF]).
+- **Corrections.** 203 code points that Desktop's version-100 table weighs differently take Desktop's weights: Arabic harakat, pointed Hebrew letters, Tibetan vowel signs and squared CJK units. With the published weights alone, b181, b185, b186 and b187 answer 3, 15, 80 and 35 times wrong.
+
+Desktop's own comparison is not a consistent order in one corner: texts that mix decomposed accents with word-sort punctuation compare by where each text ends ("é" < "e-" but "e" + U+0301 > "e-"). There the key keeps a consistent order.
+
+**Pinned** by `tests/test_issue185_text_collation.py`: the b181, b185, b187 and b189 answers and a sample of b186's order. **15 of its 26 tests fail on 0.9.137.**
+
+### Fixed — SEARCH, FIND, CONTAINSSTRING(EXACT) and SUBSTITUTE matched one character to one (issue #180)
+
+**What was wrong:** the engine matched character by character after case folding. Desktop matches as its collation compares, by elements: a character with the nonspacing marks after it. An expansion is one element, and ignorable characters belong to none.
+
+**What Desktop does** (`build_b190.py`):
+
+- **Expansions match whole, never in part.** `SEARCH("ss", "xß")` is 2 and `SEARCH("ß", "xss")` is 2, while `SEARCH("s", "xß")`, `SEARCH("s*", "ßa")` and `SEARCH("a?e", "æe")` fail.
+- **Precomposed equals decomposed.** "é" finds "e" + U+0301, and "e" does not.
+- **Ignorables are skipped.** "ab" is found in "a" + U+00AD + "b". A find text of nothing else is never found.
+- **Wildcards.**
+  - `?` takes one element, never an ignorable: "a?b" finds "aßb", and "a??b" does not.
+  - `*` takes any run.
+  - `%`, `_` and `[` are literal.
+- **What each function ignores.** SEARCH and CONTAINSSTRING ignore case, kana type and width. FIND and CONTAINSSTRINGEXACT ignore none of them. Neither ignores superscripts: `SEARCH("2", "x²")` fails.
+- **Kana iteration marks** are matched as written: `SEARCH(UNICHAR(12293), "佐々木")` is 2, while "佐佐" is not found in "佐々木".
+- **SUBSTITUTE** finds as FIND does, then replaces as many UTF-16 units as the old text has, from each match's start:
+  - `SUBSTITUTE("xssy", "ß", "z")` is "xzsy";
+  - `SUBSTITUTE("ssss", "ß", "z")` is "zzzs";
+  - `SUBSTITUTE("xææy", "ae", "z")` is "xzy";
+  - `SUBSTITUTE("xß", "ss", "y")` fails with "The function SUBSTITUTE encountered a text that exceeds the maximum allowed length". With an instance it cuts the text short instead.
+
+**The fix:** `pbix_mcp.dax.collation.search` matches a find text's literal runs, `?` and `*` element by element, on the collation's weights. SEARCH masks case, kana and width as the comparison does, and FIND masks nothing. ASCII text without NUL takes the old case-folded path, which gives the same answers faster.
+
+**Pinned** by `tests/test_issue180_linguistic_search.py`: the 114 probes. **52 fail on 0.9.137.**
+
 ## [0.9.137] - 2026-10-10
 
 A time-intelligence function takes a table of dates as its `<dates>` (#182, OpenBI's doc 60), and the builder no longer turns a relationship around when both of its columns are unique (#184). Checked against Power BI Desktop 2.152 over ADOMD:

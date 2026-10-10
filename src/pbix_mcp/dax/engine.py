@@ -673,24 +673,6 @@ def _case_table(which: str) -> dict:
     return table
 
 
-def _search_fold() -> dict:
-    """``str.translate`` table for SEARCH / CONTAINSSTRING's case-insensitive
-    match (issue #169): Desktop's LOWER (_case_table), and the final sigma
-    and the Angstrom sign with sigma and a-ring, which Desktop's SEARCH finds
-    equal too (SEARCH(UNICHAR(962), "x" & UNICHAR(931)) is 2, SEARCH(UNICHAR(
-    197), "x" & UNICHAR(8491)) 2; build_b174.py, build_b174c.py) -- while the
-    Kelvin and Ohm signs, the dotless and dotted i stay apart. Desktop
-    compares linguistically (its collation, ß = ss); this is that comparison
-    one character to one."""
-    table = _CASE_TABLES.get('SEARCH')
-    if table is None:
-        table = dict(_case_table('LOWER'))
-        table[0x03C2] = 0x03C3
-        table[0x212B] = 0x00E5
-        _CASE_TABLES['SEARCH'] = table
-    return table
-
-
 def _unichar(cp: int):
     """UNICHAR(cp)'s character, or None where Desktop raises (issues #172,
     #176). Power BI Desktop 2.152 (build_b170.py over the BMP, build_b174.py
@@ -754,9 +736,10 @@ def _u16_len(s: str) -> int:
 _SPACE_RUNS = re.compile(' {2,}')
 
 # SEARCH / CONTAINSSTRING's find text, tokenized (issue #169): a literal
-# character, or one of these two
-_WILD_ANY = object()
-_WILD_RUN = object()
+# character, or one of these two (the collation's: `?` is one element, `*` any
+# run of them -- issue #180)
+_WILD_ANY = _collation.ANY
+_WILD_RUN = _collation.RUN
 
 
 @lru_cache(maxsize=4096)
@@ -791,10 +774,10 @@ def _wild_regex(tokens: tuple):
                               for t in tokens), re.DOTALL)
 
 
-def _wild_search(tokens: tuple, text: str, start0: int) -> int:
+def _wild_search(tokens: tuple, text: str, start0: int, ignore_case: bool = True) -> int:
     """The 0-based position where SEARCH's pattern matches ``text`` (UTF-16
-    units, folded as the caller compares) from ``start0`` on, or -1. Power BI
-    Desktop 2.152 (build_b174.py - build_b174c.py):
+    units) from ``start0`` on, or -1. Power BI Desktop 2.152
+    (build_b174.py - build_b174c.py, build_b190.py):
 
     - a start past the text finds nothing, so neither "" nor "*" is found in
       "" (SEARCH("", "") fails, CONTAINSSTRING("", "") is FALSE);
@@ -803,7 +786,13 @@ def _wild_search(tokens: tuple, text: str, start0: int) -> int:
       start, as long as the rest is found from the start on (SEARCH("*a",
       "aba", 2) is 1, SEARCH("*a", "abc", 2) fails);
     - two or more `*` and nothing else are never found (SEARCH("**", "a*c")
-      fails), while one alone is."""
+      fails), while one alone is;
+    - the rest matches as the collation compares, element by element
+      (_collation.search): "ss" finds "ß", `?` takes one character with its
+      marks (an expansion whole: "a?b" finds "aßb", "a??b" does not), an
+      ignorable character is skipped but never taken by `?`.
+    ASCII text without NUL matches as its case-folded characters, the same
+    answer quicker."""
     if start0 >= len(text):
         return -1
     if not tokens:
@@ -814,9 +803,33 @@ def _wild_search(tokens: tuple, text: str, start0: int) -> int:
             rest = rest[1:]
         if not rest:
             return 0 if len(tokens) == 1 else -1
-        return 0 if _wild_regex(rest).search(text, start0) else -1
-    m = _wild_regex(tokens).search(text, start0)
-    return m.start() if m else -1
+        return 0 if _wild_find(rest, text, start0, ignore_case) >= 0 else -1
+    return _wild_find(tokens, text, start0, ignore_case)
+
+
+def _wild_find(tokens: tuple, text: str, start0: int, ignore_case: bool) -> int:
+    if text.isascii() and '\x00' not in text and all(t is _WILD_ANY or t is _WILD_RUN or (t.isascii() and t != '\x00')
+                                                    for t in tokens):
+        if ignore_case:
+            tokens = tuple(t if t is _WILD_ANY or t is _WILD_RUN else t.lower() for t in tokens)
+            text = text.lower()
+        m = _wild_regex(tokens).search(text, start0)
+        return m.start() if m else -1
+    hit = _collation.search(tokens, text, start0, ignore_case)
+    return -1 if hit is None else hit[0]
+
+
+def _find_text(find: str, text: str, start0: int) -> int:
+    """FIND's match (UTF-16 units, 0-based, from ``start0``), or -1: literal,
+    case-, kana- and width-sensitive, but as the collation compares (issue
+    #180): "ss" finds "ß" and "ß" finds "ss", "é" finds "e" + U+0301 while
+    "e" does not, an ignorable character is skipped and a find text of
+    nothing else is never found."""
+    if not find:
+        return start0 if start0 <= len(text) else -1
+    if text.isascii() and find.isascii() and '\x00' not in text and '\x00' not in find:
+        return text.find(find, start0)
+    return _wild_find(tuple(find), text, start0, False)
 
 
 # ---- VALUE (issue #170) -------------------------------------------------------
@@ -1943,7 +1956,9 @@ def _text_key(s: str) -> tuple:
     two texts apart. Power BI Desktop 2.152 (build_b156.py / build_b157*.py,
     issue #157): "_x" < "1x" < "a10" < "a2" < "Americas" < "APAC" < "apple",
     "Ölund" < "Zeta", "æ" = "ae", "ß" = "ss"; the code-point order put "1x"
-    before "_x" and "éclair" after "Zeta"."""
+    before "_x" and "éclair" after "Zeta". The weights are SQL Server's
+    version-100 collation's, as Desktop's engine compares (issue #185): the
+    Kelvin sign <> "K", a Hebrew final letter apart from its plain form."""
     return _collation.sort_key(s)
 
 
@@ -14228,22 +14243,34 @@ class DAXEngine:
         if not old:
             return text
         u = _u16(text)
+        # occurrences are found as FIND finds them (issue #180): "ß" finds
+        # "ss", "ab" finds "a" + U+00AD + "b"; each replaces as many units as
+        # the old text has, from where it starts (build_b190.py)
         if instance is not None:
-            # Replace only the nth occurrence
             count = 0
-            result = []
-            i = 0
-            while i < len(u):
-                if u[i:i + len(old)] == old:
-                    count += 1
-                    if count == instance:
-                        result.append(new)
-                        i += len(old)
-                        continue
-                result.append(u[i])
-                i += 1
-            return _from_u16(''.join(result))
-        return _from_u16(u.replace(old, new))
+            pos = 0
+            while True:
+                hit = _find_text(old, u, pos)
+                if hit < 0:
+                    return text
+                count += 1
+                if count == instance:
+                    return _from_u16(u[:hit] + new + u[hit + len(old):])
+                pos = hit + 1
+        out = []
+        pos = 0
+        while True:
+            hit = _find_text(old, u, pos)
+            if hit < 0:
+                break
+            if hit + len(old) > len(u):
+                raise _DAXEvaluationError(
+                    "The function SUBSTITUTE encountered a text that exceeds the maximum allowed length.")
+            out.append(u[pos:hit])
+            out.append(new)
+            pos = hit + len(old)
+        out.append(u[pos:])
+        return _from_u16(''.join(out))
 
     def _fn_replace(self, args_str: str, ctx: DAXContext) -> Any:
         """REPLACE(text, start, n, new) — replace n UTF-16 units from the
@@ -14274,14 +14301,16 @@ class DAXEngine:
     def _text_position(self, fn: str, args: list, ctx: DAXContext, wildcards: bool) -> Any:
         """SEARCH / FIND(find, within, start, NotFoundValue) as Power BI
         Desktop 2.152 finds (build_b166.py - build_b174c.py, issue #169):
-        SEARCH ignores case and takes the wildcards ? * and ~ (_wild_tokens,
-        _wild_search); FIND matches literally, case and all. Positions count
-        UTF-16 units (#176). A start below 1 is an error, and a start past
-        the text finds nothing -- not even "" (SEARCH("", "abc", 4) and
-        SEARCH("", "") fail), except that FIND finds "" at 1 in "" (FIND("",
-        "") is 1; build_b175.py). Text that isn't found is an error, unless
-        a NotFoundValue is given: then that is the answer (FIND ignored it).
-        Both returned -1."""
+        SEARCH ignores case, kana type and width and takes the wildcards ? *
+        and ~ (_wild_tokens, _wild_search); FIND matches literally, case and
+        all (_find_text). Both match as the collation compares (issue #180):
+        "ss" finds "ß", "é" finds "e" + U+0301, an ignorable character is
+        skipped. Positions count UTF-16 units (#176). A start below 1 is an
+        error, and a start past the text finds nothing -- not even ""
+        (SEARCH("", "abc", 4) and SEARCH("", "") fail), except that FIND
+        finds "" at 1 in "" (FIND("", "") is 1; build_b175.py). Text that
+        isn't found is an error, unless a NotFoundValue is given: then that
+        is the answer (FIND ignored it). Both returned -1."""
         if len(args) < 2:
             return -1
         find_text = _u16(self._eval_text(args[0], ctx))
@@ -14289,12 +14318,11 @@ class DAXEngine:
         start = (self._text_count(args[2], ctx, least=1)
                  if len(args) > 2 and args[2].strip() else 1)
         if wildcards:
-            fold = _search_fold()
-            pos = _wild_search(_wild_tokens(find_text.translate(fold)), within_text.translate(fold), start - 1)
+            pos = _wild_search(_wild_tokens(find_text), within_text, start - 1)
         elif start - 1 >= max(len(within_text), 1):
             pos = -1
         else:
-            pos = within_text.find(find_text, start - 1)
+            pos = _find_text(find_text, within_text, start - 1)
         if pos >= 0:
             return pos + 1      # DAX positions are 1-based
         if len(args) > 3:
@@ -14320,9 +14348,8 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return False
-        fold = _search_fold()
-        within = _u16(self._eval_text(args[0], ctx)).translate(fold)
-        find = _u16(self._eval_text(args[1], ctx)).translate(fold)
+        within = _u16(self._eval_text(args[0], ctx))
+        find = _u16(self._eval_text(args[1], ctx))
         return _wild_search(_wild_tokens(find), within, 0) >= 0
 
     def _fn_containsstringexact(self, args_str: str, ctx: DAXContext) -> Any:
@@ -14334,7 +14361,7 @@ class DAXEngine:
             return False
         within = _u16(self._eval_text(args[0], ctx))
         find = _u16(self._eval_text(args[1], ctx))
-        return find in within
+        return not find or _find_text(find, within, 0) >= 0
 
     def _fn_exact(self, args_str: str, ctx: DAXContext) -> Any:
         """EXACT(text1, text2) — case-sensitive string comparison."""

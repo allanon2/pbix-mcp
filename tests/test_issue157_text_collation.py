@@ -2,9 +2,10 @@
 
 It compared text by code point after case-folding: "_x" < "1x" was FALSE,
 "Ölund" < "Zeta" FALSE, and MIN / MAX / FIRSTNONBLANK / LASTNONBLANK and
-CONCATENATEX's ordering followed the code points. Desktop compares as
-Windows' NLS sorting does for the model's locale, at the version of its sort
-tables (pbix_mcp.dax.collation): case-insensitively, an accent after its
+CONCATENATEX's ordering followed the code points. Desktop compares by the
+sort weights of SQL Server's version-100 collations (pbix_mcp.dax.collation;
+issue #185 found them, where Windows' NLS 6.1 was first taken for them):
+case-insensitively, an accent after its
 letter, punctuation before the digits, hyphens and apostrophes weighing only
 where nothing else tells two texts apart (at the end of a text, more than an
 accent); "æ" = "ae", "ß" = "ss", "²" = "2".
