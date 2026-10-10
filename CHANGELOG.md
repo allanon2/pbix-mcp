@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.138] - 2026-10-10
+
+[Entry removed in the clean-room history rewrite of 2026-10-20, issue #198.]
+This release made DAX's text comparison (#185) and SEARCH / FIND /
+CONTAINSSTRING(EXACT) / SUBSTITUTE (#180) answer as Power BI Desktop does. Part
+of how it did so was derived from Desktop's engine binary, which the
+clean-room policy excludes; the original entry described that and is not kept.
+Every commit from this one on carries the clean re-derivation released in
+0.9.145 instead (`docs/reverse-engineering/experiments/2026-10-19-clean-room-collation.md`).
+The Desktop answers it was tested against (batteries b181-b190) stand.
+
 ## [0.9.137] - 2026-10-10
 
 A time-intelligence function takes a table of dates as its `<dates>` (#182, OpenBI's doc 60), and the builder no longer turns a relationship around when both of its columns are unique (#184). Checked against Power BI Desktop 2.152 over ADOMD:

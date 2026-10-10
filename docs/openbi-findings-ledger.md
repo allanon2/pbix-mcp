@@ -40,11 +40,21 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-10 (0.9.137): docs 1-60 and GitHub issues/PRs #1-#179 and
-#181-#184 are closed; #180 (SEARCH / FIND / SUBSTITUTE match linguistically in
-Desktop) is open.** 0.9.137 closes doc 60 = #182 (OpenBI's): a
-time-intelligence function takes a table of one date column as its <dates>
--- PREVIOUSMONTH(DATESINPERIOD(...)) or of a variable holding one was empty
+**Updated 2026-10-10 (0.9.138): docs 1-60 and GitHub issues/PRs #1-#185 are
+closed.** 0.9.138 closes #185 (DAX's text comparison: the Kelvin sign <> K, Hebrew
+final letters and small kana apart, as Desktop answers; build_b181.py,
+build_b185.py - build_b187.py, build_b189.py) and #180 (SEARCH / FIND /
+CONTAINSSTRING(EXACT) / SUBSTITUTE; build_b190.py, 114 probes). [Rewritten in
+the clean-room history rewrite of 2026-10-20, issue #198: part of 0.9.138's
+collation was derived from Desktop's engine binary, which the clean-room
+policy excludes; the code is the clean re-derivation released in 0.9.145, see
+`docs/reverse-engineering/experiments/2026-10-19-clean-room-collation.md`.]
+
+As of 0.9.137, docs 1-60 and GitHub issues/PRs #1-#179 and #181-#184 were
+closed; #180 (SEARCH / FIND / SUBSTITUTE match linguistically in Desktop) was
+open. 0.9.137 closes doc 60 = #182 (OpenBI's): a time-intelligence function
+takes a table of one date column as its <dates> --
+PREVIOUSMONTH(DATESINPERIOD(...)) or of a variable holding one was empty
 (Executive Sales Report's [Orders Previous month]); and #184: with both
 columns of a relationship unique, the builder took the larger table for the
 Many side and turned a fact -> dates relationship around, so a date filter
@@ -480,6 +490,12 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #185, GH #180** -- CLOSED (0.9.138). Text compared by Windows NLS 6.1
+  instead of Desktop's collation (Desktop: build_b181.py, build_b185.py -
+  build_b187.py, build_b189.py); SEARCH / FIND / CONTAINSSTRING(EXACT) /
+  SUBSTITUTE matched one character to one (build_b190.py). Regression:
+  tests/test_issue185_text_collation.py,
+  tests/test_issue180_linguistic_search.py.
 - **doc 60 (GH #182), GH #184** -- CLOSED (0.9.137). A time-intelligence
   function given a table of dates returned nothing (Desktop: build_b180.py,
   24 probes); the builder turned a relationship around when both columns

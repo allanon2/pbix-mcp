@@ -2,12 +2,12 @@
 
 It compared text by code point after case-folding: "_x" < "1x" was FALSE,
 "Ölund" < "Zeta" FALSE, and MIN / MAX / FIRSTNONBLANK / LASTNONBLANK and
-CONCATENATEX's ordering followed the code points. Desktop compares as
-Windows' NLS sorting does for the model's locale, at the version of its sort
-tables (pbix_mcp.dax.collation): case-insensitively, an accent after its
-letter, punctuation before the digits, hyphens and apostrophes weighing only
-where nothing else tells two texts apart (at the end of a text, more than an
-accent); "æ" = "ae", "ß" = "ss", "²" = "2".
+CONCATENATEX's ordering followed the code points. Desktop compares
+case-insensitively, an accent after its letter, punctuation before the
+digits, hyphens and apostrophes weighing only where nothing else tells two
+texts apart (at the end of a text, more than an accent); "æ" = "ae",
+"ß" = "ss", "²" = "2" (pbix_mcp.dax.collation; its sources are recorded in
+docs/reverse-engineering/experiments/2026-10-19-clean-room-collation.md).
 
 Expected values: Power BI Desktop 2.152 over ADOMD (build_b156.py,
 build_b157.py, build_b157d.py, build_b157g.py and the pair probes of
