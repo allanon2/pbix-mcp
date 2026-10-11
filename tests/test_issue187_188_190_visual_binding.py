@@ -117,12 +117,23 @@ class TestIssue188BareColumnRoles:
         assert work["prototypeQuery"] == sv["prototypeQuery"]
         assert [s["Name"] for s in _query_selects(q)] == ["T.Cat", "T.M"]
 
-    def test_multi_row_card_keeps_a_numeric_column(self):
+    def test_multi_row_card_numeric_column_by_its_summarization(self):
+        # Values takes a grouping or a measure (issue #191): a number set to
+        # "Don't summarize" stays bare, one with a default summarization is
+        # summarized as Desktop's field well does.
         sv = {"visualType": "multiRowCard",
               "projections": {"Values": [{"queryRef": "T.Amount"}]},
               "prototypeQuery": {"Version": 2, "From": _FROM, "Select": [_col("t", "Amount", "T.Amount")]}}
-        work, _, _ = _compile(sv, _resolve)
+
+        def resolve(sb):
+            def r(e, p, m):
+                return _resolve(e, p, m)
+            r.summarize_by = lambda e, p: sb
+            return r
+        work, _, _ = _compile(sv, resolve(2))
         assert work["projections"] == sv["projections"]
+        work, _, _ = _compile(sv, resolve(1))
+        assert work["projections"] == {"Values": [{"queryRef": "Sum(T.Amount)"}]}
 
     def test_azure_map_keeps_its_coordinates(self):
         sv = {"visualType": "azureMap",

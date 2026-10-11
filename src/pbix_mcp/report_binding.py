@@ -27,16 +27,6 @@ _MATRIX_TYPES = {"matrix", "pivotTable"}
 # keep a bare column in Values (issue #187: all 9 List slicers of the community
 # files bind dimDate.Year, Parameter.Parameter, ... unwrapped).
 _SLICER_TYPES = {"slicer", "advancedSlicerVisual", "listSlicer"}
-# Roles where Desktop keeps a bare column bare although the role also takes
-# measures (issue #188): a multi-row card lists one card per row of its
-# columns (Root Cause Analysis' 8 cards bind dim-Product.Sub-Category beside a
-# measure), and an Azure map takes coordinate columns as they are (Map with
-# Pie Chart Bubbles' Store.Latitude / Store.Longitude in Y / X, the roles its
-# Latitude / Longitude wells fill).
-_BARE_COLUMN_ROLES = {
-    "multiRowCard": {"Values"},
-    "azureMap": {"X", "Y"},
-}
 _CARTESIAN_TYPES = {
     "barChart", "columnChart", "clusteredBarChart", "clusteredColumnChart",
     "stackedBarChart", "stackedColumnChart", "hundredPercentStackedBarChart",
@@ -68,6 +58,80 @@ QUERY_AGGREGATES: dict[int, str] = {
 # (ledger issues-5).
 _GEO_ROLES = {"Latitude", "Longitude"}
 _LATLONG_NAME_RE = re.compile(r"^(lat(itude)?|lo?ng(itude)?)$", re.IGNORECASE)
+
+# The kind of each well of Desktop's built-in visuals, as their capabilities
+# in desktop.min.js declare them (issue #191). A column dropped into a
+# GROUPING well stays bare, into a MEASURE well it is always summarized, into
+# a GROUPING-OR-MEASURE well only a number with a default summarization is
+# (VisualAuthoringService.shouldPreferGroupToAggregate). "num": the well
+# requires a number, so text and dates are counted rather than given their
+# Min; "lat" / "lon": the well's preferred type is a latitude / longitude.
+_G, _M, _GM = "grouping", "measure", "grouping-or-measure"
+_CHART_WELLS = {"Category": (_G,), "Series": (_G,), "Rows": (_G,), "Y": (_M, "num"),
+                "Y2": (_M, "num"), "Gradient": (_M, "num"), "Tooltips": (_M,)}
+_WELL_KINDS: dict[str, dict[str, tuple]] = {
+    **{vt: _CHART_WELLS for vt in (
+        "barChart", "columnChart", "clusteredBarChart", "clusteredColumnChart",
+        "stackedBarChart", "stackedColumnChart", "hundredPercentStackedBarChart",
+        "hundredPercentStackedColumnChart", "ribbonChart", "lineChart", "areaChart",
+        "stackedAreaChart", "lineClusteredColumnComboChart",
+        "lineStackedColumnComboChart", "pieChart", "donutChart", "funnel")},
+    "waterfallChart": {"Category": (_G,), "Breakdown": (_G,), "Y": (_M, "num"), "Tooltips": (_M,)},
+    "treemap": {"Group": (_G,), "Details": (_G,), "Values": (_M, "num"),
+                "Gradient": (_M, "num"), "Tooltips": (_M,)},
+    "gauge": {"Y": (_M, "num"), "MinValue": (_M, "num"), "MaxValue": (_M, "num"),
+              "TargetValue": (_M, "num"), "Tooltips": (_M,)},
+    "kpi": {"Indicator": (_M, "num"), "TrendLine": (_G,), "Goal": (_M, "num")},
+    "scatterChart": {"Category": (_G,), "Series": (_G,), "X": (_GM,), "Y": (_GM, "num"),
+                     "Size": (_M, "num"), "Gradient": (_M, "num"), "Play": (_G,),
+                     "Tooltips": (_M,)},
+    "map": {"Category": (_G,), "Series": (_G,), "Y": (_GM, "lat"), "X": (_GM, "lon"),
+            "Size": (_M, "num"), "Gradient": (_M, "num"), "Tooltips": (_M,)},
+    "azureMap": {"Category": (_G,), "Series": (_G,), "Y": (_GM, "lat"), "X": (_GM, "lon"),
+                 "Size": (_M, "num"), "Tooltips": (_M,), "PathID": (_G,), "PointOrder": (_G,)},
+    "filledMap": {"Category": (_G,), "Series": (_G,), "Y": (_M, "lat"), "X": (_M, "lon"),
+                  "Size": (_M, "num"), "Tooltips": (_M,)},
+    "card": {"Values": (_M,)},
+    "cardVisual": {"Data": (_M,), "Rows": (_G,), "Tooltips": (_M,)},
+    "multiRowCard": {"Values": (_GM,)},
+    "matrix": {"Rows": (_G,), "Columns": (_G,), "Values": (_M,)},
+    "pivotTable": {"Rows": (_G,), "Columns": (_G,), "Values": (_M,)},
+}
+# Model SummarizeBy (AMO AggregateFunction) -> the aggregate a measure well
+# gives a number (defaultAggregateToQueryAggregateFunction; Default is Sum).
+_SUMMARIZE_BY = {1: _AGG_SUM, 3: _AGG_SUM, 4: 3, 5: 4, 6: _AGG_COUNTNONNULL,
+                 7: _AGG_AVERAGE, 8: 2}
+_SUMMARIZE_NONE = 2
+_LATLONG_CATEGORIES = {"Latitude", "Longitude"}
+_AGG_MIN = 3
+
+
+def _desktop_aggregate(kind: tuple, vtype, summarize_by, category,
+                       location_bound: bool):
+    """The QueryAggregateFunction Desktop wraps a dropped column in, or None
+    to leave it bare (shouldPreferGroupToAggregate / createExprWithAggregate /
+    SQAggregationOperationsService.defaultAggregate)."""
+    well = kind[0]
+    if well == _G:
+        return None
+    numeric = vtype in _NUMERIC_TYPES
+    latlong = (category in _LATLONG_CATEGORIES
+               or any(k in ("lat", "lon") for k in kind[1:]))
+    if well == _GM:
+        if latlong:
+            # A coordinate is averaged only beside a location; on its own it
+            # places one point per value.
+            return _AGG_AVERAGE if location_bound else None
+        if not numeric or summarize_by == _SUMMARIZE_NONE:
+            return None
+        return _SUMMARIZE_BY.get(summarize_by, _AGG_SUM)
+    if latlong:
+        return _AGG_AVERAGE
+    if numeric and summarize_by != _SUMMARIZE_NONE:
+        return _SUMMARIZE_BY.get(summarize_by, _AGG_SUM)
+    if vtype in ("String", "DateTime") and "num" not in kind[1:]:
+        return _AGG_MIN                    # "First X" / "Earliest X"
+    return _AGG_COUNTNONNULL
 
 # (underlyingType, queryMetadata.Type) per model data type — taken verbatim from
 # Desktop-authored reports (sales_demo + GeoSales/IT_Support/etc. corpus). Keyed
@@ -134,12 +198,19 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
     empty). When Desktop's own field well receives a numeric column on a value
     axis it stores an ``Aggregation`` select named ``Sum(Entity.Property)`` in
     the prototype and points the projection at that name (ground truth: AI
-    Sample barChart). This mirrors that: every bare ``Column`` select projected
-    into a value role (``Y``/``Values``/``Y2``/``Size``) becomes
-    ``{"Aggregation": {"Expression": {"Column": ...}, "Function": Sum|CountNonNull}}``
-    with the Desktop queryRef naming, and the projections are updated in place.
-    Flat grids (``table``/``tableEx``) and slicers show raw values and are left
-    alone; measures and explicit aggregations are untouched.
+    Sample barChart). This mirrors that, as Desktop decides it for its
+    built-in visuals (_WELL_KINDS, issue #191): a bare ``Column`` select in a
+    well that takes only measures (a chart's Y, Tooltips, Gradient, a card's
+    Values, ...) always becomes ``{"Aggregation": ...}`` -- a number by its
+    default summarization (``resolve_type.summarize_by``; Default is Sum),
+    text or a date by Min where the well accepts them, otherwise
+    CountNonNull, a latitude / longitude by Avg -- and in a
+    grouping-or-measure well only a number whose default summarization is
+    not None does. Projections are re-pointed at Desktop's queryRef names.
+    Other visual types keep the older rule (Y/Values/Y2/Size: Sum for a
+    number, CountNonNull otherwise). Flat grids (``table``/``tableEx``) and
+    slicers show raw values and are left alone; measures and explicit
+    aggregations are untouched.
 
     Returns a mapping of old queryRef -> new queryRef (empty when nothing changed).
     """
@@ -175,6 +246,17 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
             for it in items[start:start + length]:
                 param_covered.add(it.get("queryRef"))
 
+    wells = _WELL_KINDS.get(visual_type)
+
+    def _model_fact(name, entity, prop):
+        fn = getattr(resolve_type, name, None)
+        if fn is None:
+            return None
+        try:
+            return fn(entity, prop)
+        except Exception:
+            return None
+
     renamed: dict[str, str] = {}
     agg_selects: dict = {}   # (source alias/entity, property) -> mutated select
     for sel in selects:
@@ -188,30 +270,47 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
         entity = alias2entity.get(src.get("Source"), src.get("Entity"))
         prop = col.get("Property", "")
         role = ref2role.get(old_ref)
-        if role in _BARE_COLUMN_ROLES.get(visual_type, ()):
-            continue                       # Desktop keeps the column bare here
-        geo_role = role in _GEO_ROLES
-        geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
-        # X is a value role only for the lat/long case handled here; treating
-        # every scatter X as an implicit aggregate is a separate (unchanged)
-        # behavior.
-        if role not in _VALUE_ROLES and not geo_role \
-                and not (role == "X" and geo_named):
-            continue
         vtype = None
         if resolve_type is not None:
             try:
                 vtype = resolve_type(entity, prop, False)
             except Exception:
                 vtype = None
-        if geo_role or (geo_named and vtype in _NUMERIC_TYPES):
-            # Coordinates AVERAGE (Desktop's geo default summarization);
-            # summing them produces a point that exists on no map.
-            func, fn_name = _AGG_AVERAGE, "Avg"
-        elif vtype in _NUMERIC_TYPES:
-            func, fn_name = _AGG_SUM, "Sum"
+        kind = wells.get(role) if wells is not None and role is not None else None
+        if kind is not None:
+            # A well Desktop's capabilities declare: its rule (issue #191).
+            # Without a data category, a column named like a coordinate is
+            # taken for one (ledger issues-5).
+            category = _model_fact("data_category", entity, prop)
+            if category is None and _LATLONG_NAME_RE.match(prop or ""):
+                category = "Latitude"
+            # A coordinate is averaged beside a location -- on a map its
+            # Category, elsewhere any other projected well.
+            if visual_type in ("map", "azureMap"):
+                located = bool(projections.get("Category"))
+            else:
+                located = any(projections.get(r) for r in projections if r != role)
+            func = _desktop_aggregate(
+                kind, vtype, _model_fact("summarize_by", entity, prop),
+                category, located)
+            if func is None:
+                continue
+            fn_name = QUERY_AGGREGATES[func]
         else:
-            func, fn_name = _AGG_COUNTNONNULL, "CountNonNull"
+            geo_role = role in _GEO_ROLES
+            geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
+            # X is a value role only for the lat/long case handled here.
+            if role not in _VALUE_ROLES and not geo_role \
+                    and not (role == "X" and geo_named):
+                continue
+            if geo_role or (geo_named and vtype in _NUMERIC_TYPES):
+                # Coordinates AVERAGE (Desktop's geo default summarization);
+                # summing them produces a point that exists on no map.
+                func, fn_name = _AGG_AVERAGE, "Avg"
+            elif vtype in _NUMERIC_TYPES:
+                func, fn_name = _AGG_SUM, "Sum"
+            else:
+                func, fn_name = _AGG_COUNTNONNULL, "CountNonNull"
         new_ref = (f"{fn_name}({entity}.{prop})" if entity and prop
                    else f"{fn_name}({old_ref})")
         sel.pop("Column")

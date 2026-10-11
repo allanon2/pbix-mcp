@@ -585,7 +585,9 @@ class TestGeoAverageAggregation:
         assert by_prop["Longitude"] == 1  # long-named in X -> Avg
         assert by_prop["Sales"] == 0      # ordinary numeric in Size -> Sum
 
-    def test_ordinary_numeric_x_left_bare(self):
+    def test_ordinary_numeric_x_sums(self):
+        # A scatter's X takes a grouping or a measure: Desktop sums a number
+        # with a default summarization dropped there (issue #191).
         sv = self._sv()
         sv["visualType"] = "scatterChart"
         sv["projections"] = {"X": [{"queryRef": "Geo.Sales"}],
@@ -594,5 +596,4 @@ class TestGeoAverageAggregation:
         sales_sel = next(s for s in sv["prototypeQuery"]["Select"]
                          if s["Name"].endswith("Sales)")
                          or s.get("Column", {}).get("Property") == "Sales")
-        # non-geo X keeps its previous (bare) behavior
-        assert "Column" in sales_sel and "Aggregation" not in sales_sel
+        assert sales_sel["Aggregation"]["Function"] == 0

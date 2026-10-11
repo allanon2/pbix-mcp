@@ -2991,6 +2991,7 @@ def _report_type_resolver(info: dict):
     Plain internal helper — NOT an MCP tool (must stay above pbix_add_visual's
     ``@mcp.tool()`` without displacing it)."""
     col_types: dict = {}
+    col_facts: dict = {}   # (table, column) -> (SummarizeBy, DataCategory)
     try:
         from pbix_mcp.formats.abf_rebuild import read_metadata_sqlite
         from pbix_mcp.formats.datamodel_roundtrip import decompress_datamodel
@@ -3010,12 +3011,19 @@ def _report_type_resolver(info: dict):
                 # COALESCE: Type 4 (calculated-table column) keeps its name
                 # in InferredName with ExplicitName NULL, so the key would be
                 # (table, None) and the type lookup would silently miss.
+                # A calculated (2) or calculated-table (4) column keeps its
+                # type in InferredDataType: ExplicitDataType is 1, automatic,
+                # and read as text it made every such number CountNonNull
+                # (issue #191).
                 "SELECT t.Name tn, COALESCE(c.ExplicitName, c.InferredName) cn, "
-                "       c.ExplicitDataType edt "
+                "       CASE WHEN c.ExplicitDataType IN (1, 19) OR c.ExplicitDataType IS NULL "
+                "            THEN c.InferredDataType ELSE c.ExplicitDataType END edt, "
+                "       c.SummarizeBy sb, c.DataCategory dc "
                 "FROM [Column] c JOIN [Table] t ON t.ID = c.TableID "
                 "WHERE c.Type IN (1, 2, 4)"
             ):
                 col_types[(r["tn"], r["cn"])] = _AMO.get(r["edt"], "String")
+                col_facts[(r["tn"], r["cn"])] = (r["sb"], r["dc"])
             conn.close()
         finally:
             # Close the SQLite handle BEFORE unlinking: Windows refuses to
@@ -3042,6 +3050,15 @@ def _report_type_resolver(info: dict):
             return None
         return col_types.get((entity, prop))
 
+    # What Desktop's field well summarizes a dropped column by (issue #191).
+    def summarize_by(entity, prop):
+        return (col_facts.get((entity, prop)) or (None, None))[0]
+
+    def data_category(entity, prop):
+        return (col_facts.get((entity, prop)) or (None, None))[1]
+
+    resolve.summarize_by = summarize_by  # type: ignore[attr-defined]
+    resolve.data_category = data_category  # type: ignore[attr-defined]
     return resolve
 
 
