@@ -40,8 +40,13 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-11 (0.9.139): docs 1-63 and GitHub issues/PRs #1-#190 are
-closed.** 0.9.139 closes doc 61 = #186: a grouped visual evaluated one row
+**Updated 2026-10-11 (0.9.140): docs 1-63 and GitHub issues/PRs #1-#191 are
+closed.** 0.9.140 closes #191: the report binder summarizes a bare column as
+Desktop's field well does -- by the well's kind (grouping / measure /
+either) and the column's default summarization -- instead of a fixed role
+list (a numeric tooltip split a chart into one bar per value).
+
+As of 0.9.139, docs 1-63 and GitHub issues/PRs #1-#190 were closed. 0.9.139 closes doc 61 = #186: a grouped visual evaluated one row
 per evaluate_measures_batch call keeps one measure memo for the query (the
 `cache` argument), so Agents Performance's 293-row employee table takes 32 s
 instead of ~950 s; doc 62 = #187 / #188: the report binder keeps the bare
@@ -501,6 +506,10 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #191** -- CLOSED (0.9.140). Implicit aggregation by a fixed role list;
+  now Desktop's well kinds + default summarization (desktop.min.js), verified
+  in Desktop (5 bars -> 2, Count of Name -> First Name). Regression:
+  tests/test_issue191_well_summarization.py.
 - **doc 61 (GH #186), doc 62 (GH #187, #188), doc 63 (GH #189), GH #190** --
   CLOSED (0.9.139). Every evaluate_measures_batch call started an empty
   measure memo (Agents Performance's table ~950 s, now 32 s with one `cache`

@@ -1028,14 +1028,26 @@ class PBIXBuilder:
 
         # (entity, property) -> data_type, for the report-binding type codes.
         col_types: dict[tuple[str, str], str] = {}
+        col_categories: dict[tuple[str, str], str | None] = {}
         for tdef in self._tables:
             for c in tdef.get("columns", []):
                 col_types[(tdef["name"], c["name"])] = c.get("data_type", "String")
+                col_categories[(tdef["name"], c["name"])] = c.get("data_category")
 
         def _resolve_type(entity, prop, is_measure):
             if is_measure:
                 return None
             return col_types.get((entity, prop))
+
+        # The SummarizeBy / DataCategory this builder writes for the column
+        # (numbers Default, the rest None), which the report binder
+        # summarizes a dropped column by (issue #191).
+        def _summarize_by(entity, prop):
+            dtype = col_types.get((entity, prop))
+            return None if dtype is None else (1 if dtype in ("Int64", "Double", "Decimal") else 2)
+
+        _resolve_type.summarize_by = _summarize_by  # type: ignore[attr-defined]
+        _resolve_type.data_category = lambda e, p: col_categories.get((e, p))  # type: ignore[attr-defined]
 
         from pbix_mcp.report_binding import compile_visual_binding
 

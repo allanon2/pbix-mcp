@@ -5,6 +5,48 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.140] - 2026-10-11
+
+The report binder summarizes a bare column the way Desktop's field well does (#191).
+
+### Fixed — implicit aggregation followed a fixed role list, not Desktop's well kinds (issue #191)
+
+**What was wrong:** `apply_implicit_aggregations` summarized a bare column only in Y, Values, Y2 and Size: Sum for a number, CountNonNull otherwise. Desktop decides by the kind of the well and the column's default summarization. So the binder:
+
+- **Left columns bare in wells that take only measures:** Tooltips, Gradient, a gauge's min / max / target, a KPI's goal, and also a scatter's X. A bare column is grouped by: a pbix-mcp-built column chart with a numeric tooltip drew 5 bars of 1 in Power BI Desktop instead of 3 and 2.
+- **Counted text where Desktop shows "First":** in a card's or a matrix's Values.
+- **Summed a number whatever its default summarization:** Average, Count, Min, Max or Distinct count.
+- **Read every calculated column as text:** the type lookup read `ExplicitDataType`, which is 1 (automatic) for calculated and calculated-table columns, so such a number was counted.
+
+**What Desktop does** (`desktop.min.js`, Power BI Desktop 2.152: `VisualAuthoringService.shouldPreferGroupToAggregate`, `createExprWithAggregate`, `SQAggregationOperationsService.defaultAggregate`, and the built-in visuals' capabilities):
+
+- **Grouping wells** (Category, Series, Rows, ...) keep the column bare.
+- **Wells that take only measures** always summarize it:
+  - a number by its default summarization (Default is Sum);
+  - text or a date by Min where the well accepts them ("First X" / "Earliest X");
+  - anything else by CountNonNull;
+  - a latitude or longitude by Average.
+- **Grouping-or-measure wells** (a scatter's X / Y, a map's Latitude / Longitude, a multi-row card's Values) summarize only a number whose default summarization is not None. A coordinate there is averaged only beside a location.
+
+**The fix:** the binder holds the well kinds of Desktop's built-in visuals (charts, pie / donut, funnel, waterfall, treemap, gauge, KPI, scatter, maps, card, new card, multi-row card, matrix) and applies that rule. It reads the column's default summarization and data category from the model, and a calculated column's type from `InferredDataType`.
+
+- **Unknown wells and visual types** keep the old rule, and a column named like a coordinate is still taken for one when the model gives it no data category (ledger issues-5).
+- **Deliberately unchanged:** a flat table's columns stay bare. Desktop sums a numeric column dropped into a table, but a bare one is also its "Don't summarize" state, and tables built through pbix-mcp list raw rows.
+
+Run over the 395 Desktop-authored data visuals of the 31 corpus files, the binder still rewrites none: every bare column there sits in a grouping well or is set to "Don't summarize".
+
+**Verified** in Power BI Desktop: the same chart and card built with 0.9.139 and 0.9.140.
+
+| | chart | card |
+|---|---|---|
+| 0.9.139 | 5 bars of 1 | "Count of Name = 5" |
+| 0.9.140 | a = 3, b = 2 | "a, First Name", as Desktop's own field well gives |
+
+**Pinned** by `tests/test_issue191_well_summarization.py`. **20 of its 35 tests fail on 0.9.139.** Two earlier tests now pin Desktop's rule:
+
+- a scatter's numeric X is summed;
+- a multi-row card's number with a default summarization is summed, while one set to "Don't summarize" stays bare.
+
 ## [0.9.139] - 2026-10-11
 
 A grouped visual evaluated one row per call keeps one measure memo for the whole query (#186). A saved slicer range filters as a range (#189). The report binder keeps the bare columns Desktop keeps in a List slicer (#187), a multi-row card and an Azure map (#188), and compiles hierarchy levels instead of failing on them (#190).
