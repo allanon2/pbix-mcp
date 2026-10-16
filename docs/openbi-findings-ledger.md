@@ -40,8 +40,15 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-11 (0.9.140): docs 1-63 and GitHub issues/PRs #1-#191 are
-closed.** 0.9.140 closes #191: the report binder summarizes a bare column as
+**Updated 2026-10-16 (0.9.141): docs 1-66 and GitHub issues/PRs #1-#194 are
+closed.** 0.9.141 closes doc 65 = #192: DATESBETWEEN takes a BLANK start /
+end as the column's first / last date, whatever the filters (build_b192.py);
+#194: time-intelligence functions over a fact date column return each date
+once; and doc 66 = #193: a measure that reaches a table only through
+CALCULATE(..., FILTER(ALLSELECTED(T), ...)) is evaluated once per query
+(Awesome Chocolates' trend line 15-30 s -> 1 s; build_b193.py).
+
+As of 0.9.140, docs 1-63 and GitHub issues/PRs #1-#191 were closed. 0.9.140 closes #191: the report binder summarizes a bare column as
 Desktop's field well does -- by the well's kind (grouping / measure /
 either) and the column's default summarization -- instead of a fixed role
 list (a numeric tooltip split a chart into one bar per value).
@@ -505,6 +512,12 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **doc 65 (GH #192), GH #194, doc 66 (GH #193)** -- CLOSED (0.9.141).
+  DATESBETWEEN with a BLANK bound was empty; time-intelligence functions
+  repeated a fact column's dates; the memo shield did not prove
+  CALCULATE(..., FILTER(ALLSELECTED(T), ...)). Desktop: build_b192.py (36),
+  build_b193.py (26). Regression: tests/test_issue192_datesbetween_blank.py,
+  tests/test_issue194_distinct_dates.py, tests/test_issue193_allselected_shield.py.
 - **GH #191** -- CLOSED (0.9.140). Implicit aggregation by a fixed role list;
   now Desktop's well kinds + default summarization (desktop.min.js), verified
   in Desktop (5 bars -> 2, Count of Name -> First Name). Regression:
