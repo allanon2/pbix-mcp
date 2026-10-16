@@ -53,7 +53,9 @@ MEASURES = {
     "Per Day Plus": "SUMX(VALUES('Date'[Date]), [Plus Rows])",
     "Per Day Agg": "SUMX(VALUES('Date'[Date]), [Agg In Pred])",
 }
-SHIELDED = {"Max Week", "Max Week V", "Max Week All", "Days In Max Week"}
+# "Last Day": CALCULATE over FILTER(ALLSELECTED('Date'), ...) replaces every
+# filter on 'Date' (issue #193).
+SHIELDED = {"Max Week", "Max Week V", "Max Week All", "Days In Max Week", "Last Day"}
 LAST_SALE = max(r[0] for r in TABLES["Sales"]["rows"])
 MAX_WEEK = (LAST_SALE - DAYS[0]).days // 7 + 1
 

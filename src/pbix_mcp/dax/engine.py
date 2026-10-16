@@ -3560,6 +3560,10 @@ class DAXContext:
             frontier_tbl = nxt_tbl
         return None
 
+    # The columns a date-table filter reaches a table WITHOUT a relationship
+    # through (_get_date_cross_filter's fallback).
+    _DATE_FALLBACK_COLUMNS = ('Order Date', 'Date', 'OrderDate', 'Transaction Date')
+
     def _get_date_cross_filter(self, table_name, date_tbl, col_filters):
         """Handle date dimension filters (Year, Month etc.) that need Date column resolution."""
         date_cols = date_tbl['columns']
@@ -3588,7 +3592,7 @@ class DAXContext:
                 return [(allowed_dates, fact_date_idx)]
 
         # Fallback: heuristic date column names
-        for dcn in ['Order Date', 'Date', 'OrderDate', 'Transaction Date']:
+        for dcn in self._DATE_FALLBACK_COLUMNS:
             fact_date_idx = self._find_col_idx(tbl['columns'], dcn)
             if fact_date_idx >= 0:
                 return [(allowed_dates, fact_date_idx)]
@@ -5372,6 +5376,22 @@ class DAXEngine:
                 if fname in self._SHIELD_ITER_FNS and len(args) == 2:
                     return (self._shield_rows(args[0], table, ctx, vars_, visiting)
                             and self._shield_scalar(args[1], table, ctx, vars_, visiting, True))
+                if fname == 'SELECTEDVALUE' and args and not row:
+                    # The selection of a column that no filter on the table can
+                    # reach: a calculation group's (no relationship; only an
+                    # explicit filter selects its item), or a table the
+                    # table's filters never propagate to (issue #193).
+                    m = _WHOLE_TCOL_RE.match(args[0])
+                    if not m:
+                        return False
+                    t2 = ctx.model_table((m.group(1) or m.group(2) or '').strip())
+                    if t2 == table or t2 not in ctx.tables:
+                        return False
+                    groups = _calc_registry(ctx.measures)[0]
+                    unreached = (any(g.table.lower() == t2.lower() for g in groups)
+                                 or self._selection_unreached(table, t2, ctx))
+                    return unreached and all(self._shield_scalar(a, table, ctx, vars_, visiting, row)
+                                             for a in args[1:])
                 if fname == 'COUNTROWS' and len(args) == 1:
                     return self._shield_rows(args[0], table, ctx, vars_, visiting)
                 if fname == 'CALCULATE':
@@ -5381,8 +5401,16 @@ class DAXEngine:
                         return len(args) == 1
                     # A filter on a date column that clears the table (#78):
                     # its body sees only those dates of the table (issue #142).
+                    # Whole rows of the table that no filter on it changes --
+                    # ALL(T), ALLSELECTED(T), FILTER over them reading T only
+                    # through the row -- replace every filter on T, so the body
+                    # sees the same T whatever filters T had (issue #193:
+                    # Awesome Chocolates' [Selection max date], CALCULATE(MAX(
+                    # 'dim-Date'[Start of Week]), FILTER(ALLSELECTED('dim-Date'),
+                    # ...)), is one value for every week of the trend line).
                     return (len(args) == 2
-                            and self._shield_date_filter(args[1], table, ctx, vars_, visiting))
+                            and (self._shield_date_filter(args[1], table, ctx, vars_, visiting)
+                                 or self._shield_rows(args[1], table, ctx, vars_, visiting)))
                 return False
             if kind == _P_VARRET and not row:
                 return self._shield_var_block(data, table, ctx, vars_, visiting)
@@ -5621,6 +5649,18 @@ class DAXEngine:
         if t2 not in ctx.tables or ctx._find_col_idx(ctx.tables[t2]['columns'], m.group(3).strip()) < 0:
             return False
         return self._cannot_reach(table, t2, ctx)
+
+    @staticmethod
+    def _selection_unreached(table: str, target: str, ctx: DAXContext) -> bool:
+        """No filter on ``table`` reaches ``target``: no relationship either
+        way, and -- from the date table -- none of the columns its filters
+        reach an unrelated table through (_get_date_cross_filter)."""
+        if ctx._rel_dir.get((target, table)) is not None or ctx._find_rel_path(table, target) is not None:
+            return False
+        if table == ctx.date_table:
+            cols = ctx.tables[target]['columns']
+            return all(ctx._find_col_idx(cols, n) < 0 for n in DAXContext._DATE_FALLBACK_COLUMNS)
+        return True
 
     @staticmethod
     def _cannot_reach(table: str, target: str, ctx: DAXContext) -> bool:
@@ -15063,7 +15103,16 @@ class DAXEngine:
                     if dv is not None:
                         cells.setdefault(dv, row[idx])
         result = []
+        # Each date once: a time-intelligence function returns the column's
+        # distinct dates. Over a fact column, whose dates repeat, every one of
+        # DATESBETWEEN / DATESINPERIOD / DATESYTD / DATESMTD / DATESQTD /
+        # PARALLELPERIOD / NEXTMONTH returned a row per fact row (issue #194;
+        # Desktop 2.152, build_b192.py: 4 dates, not 8).
+        emitted: set = set()
         for d in dates:
+            if d in emitted:
+                continue
+            emitted.add(d)
             day = d.date() if isinstance(d, datetime) else d
             value = cells.get(day)
             if value is None:
@@ -15540,13 +15589,19 @@ class DAXEngine:
         table_name, col_name, _ = self._get_date_column_dates(args[0].strip(), ctx)
         if not table_name:
             return []
-        start_val = self._eval_expr(args[1].strip(), ctx)
-        end_val = self._eval_expr(args[2].strip(), ctx)
-        start_date = self._parse_date(start_val)
-        end_date = self._parse_date(end_val)
+        start_val = _scalarize(self._eval_expr(args[1].strip(), ctx))
+        end_val = _scalarize(self._eval_expr(args[2].strip(), ctx))
+        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
+        # A BLANK bound is the first / last date of the whole column, whatever
+        # filters are in force (issue #192; Desktop 2.152, build_b192.py: the
+        # life-to-date DATESBETWEEN(D, BLANK(), MAX(D)) under March starts at
+        # the column's first day). It used to return no dates.
+        start_date = (min(all_dates, default=None) if start_val is None
+                      else self._parse_date(start_val))
+        end_date = (max(all_dates, default=None) if end_val is None
+                    else self._parse_date(end_val))
         if not start_date or not end_date:
             return []
-        all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         between = [d for d in all_dates if start_date <= d <= end_date]
         return self._make_date_table_result(table_name, col_name, between, ctx=ctx)
 

@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.141] - 2026-10-16
+
+DATESBETWEEN takes a BLANK start or end as the column's first or last date (#192), and time-intelligence functions return each date once over a fact column (#194). A measure that reaches a table only through `CALCULATE(..., FILTER(ALLSELECTED(T), ...))` is evaluated once per query instead of once per row or group (#193): Awesome Chocolates' trend line takes 1 s instead of 15-26 s. Checked against Power BI Desktop 2.152 over ADOMD with `build_b192.py` (36 probes; 0.9.140 matched 8) and `build_b193.py` (26 probes, all matching before and after). The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN. Five of its slowest files, re-timed side by side with 0.9.140, take 835.6 s against 836.2 s. `regress_check.py` answers every probe of its 34 Desktop batteries as 0.9.140 does.
+
+### Fixed — DATESBETWEEN with a BLANK start or end returned no dates (issue #192)
+
+**What was wrong:** a BLANK bound became no date, and `_fn_datesbetween` returned an empty table. The documented life-to-date measure, `CALCULATE([Sales], DATESBETWEEN('Date'[Date], BLANK(), MAX('Date'[Date])))`, was BLANK.
+
+**What Desktop does** (`build_b192.py`):
+
+- **A BLANK start or end** is the first or last date of the whole column, whatever filters are in force. Under March 2024 the life-to-date dates start on the column's first day (1 December 2023, 122 dates).
+- **Over a fact column**, the bound is that column's own first or last date.
+- **A bound outside the column, or a start after the end,** gives no dates.
+
+**The fix:** a BLANK bound, whether written, from an empty MAX or from a variable, takes the column's first or last date.
+
+**Pinned** by `tests/test_issue192_datesbetween_blank.py`. **19 of its 23 tests fail on 0.9.140.**
+
+### Fixed — time-intelligence functions over a fact date column returned each date once per row (issue #194)
+
+**What was wrong:** found while pinning #192. Over a column whose dates repeat (two sales a day), DATESBETWEEN, DATESINPERIOD, DATESYTD, DATESMTD, DATESQTD, PARALLELPERIOD and NEXTMONTH returned a row per fact row. `COUNTROWS(DATESBETWEEN(Sales[SDate], ...))` was 8 where Desktop gives 4. As a CALCULATE filter the duplicates changed nothing; they showed wherever the table was counted or iterated.
+
+**The fix:** `_make_date_table_result` emits each date once.
+
+**Pinned** by `tests/test_issue194_distinct_dates.py`. **9 of its 12 tests fail on 0.9.140.**
+
+### Fixed — a measure over ALLSELECTED evaluated per row of ALLSELECTED was quadratic (issue #193)
+
+**What was wrong:** Awesome Chocolates' trend line, `[Selection Sales Calculation]` grouped by week, took 15-26 s. `[Selection min date]` and `[Selection max date]` filter `ALLSELECTED('dim-Date')` by `[Max Week Not Blank]`, which scans `ALLSELECTED('dim-Date')` again. Their value is the same for every week, but the memo keyed them on the week, so they ran 106 times: about 155,000 measure lookups.
+
+**The fix:** the memo shield, which proves a measure cannot see a table's filters (#142, #166), knows two more cases:
+
+- **`CALCULATE(body, f)` where `f` is whole rows of T** that no filter on T can change (`ALL(T)`, `ALLSELECTED(T)`, or FILTER over them reading T only through the row). `f` replaces every filter on T.
+- **`SELECTEDVALUE` of a column no filter on T reaches:** a calculation group's, or an unrelated table's, as the engine propagates date-table filters.
+
+Such a measure's memo key holds the query's selection and the iteration's rows instead of the row's or group's own filter. An explicit filter on T, which ALLSELECTED keeps, stays in the key.
+
+| Awesome Chocolates, grouped by week (106) | 0.9.140 | 0.9.141 |
+|---|---|---|
+| `[Selection Sales Calculation]` | 16.6 s | 1.1 s |
+| the same under the WOW item | 26.1 s | 0.9 s |
+| `[Selection Sales Calculation Preiod]` under WOW | 25.8 s | 0.7 s |
+| either measure under MOM / QOQ | 27-30 s | 0.8-1.0 s |
+
+Every week's value is unchanged under every item. `build_b193.py` checks the shape against Desktop per week (iteration and SUMMARIZECOLUMNS), under explicit Date filters and with a disconnected selector.
+
+**Pinned** by `tests/test_issue193_allselected_shield.py`: the Desktop answers, the shield, and the selection's dates computed once over 13 grouped weeks. **3 of its 25 tests fail on 0.9.140**; the values already matched. #131's pin now counts `[Last Day]`, the same shape, as shielded.
+
 ## [0.9.140] - 2026-10-11
 
 The report binder summarizes a bare column the way Desktop's field well does (#191).
