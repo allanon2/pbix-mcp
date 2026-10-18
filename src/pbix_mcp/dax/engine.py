@@ -2497,6 +2497,10 @@ def _row_value(vals: list, shadow: Optional[list]) -> RowContextValues:
     return tagged
 
 
+# _row_cell's answer when the expression is not the row's own cell.
+_NO_CELL = object()
+
+
 class _ColumnsRow(dict):
     """A row of a table of COLUMNS -- SUMMARIZE, SELECTCOLUMNS, GROUPBY, ALL /
     ALLSELECTED of several columns -- as opposed to a row of its base table
@@ -9324,6 +9328,32 @@ class DAXEngine:
             return None
         return _from_u16(''.join(_concat_str(v) for v in vals))
 
+    _ROW_CELL_CACHE: dict = {}
+
+    def _row_cell(self, row_expr: str, row_item):
+        """An iterator's expression that is just a column of the iterated
+        table, ``Table[Column]``, is the row's cell: no row context is needed
+        to read it (issue #195: COUNTAX(FILTER(...), Opportunities[
+        OpportunitySeq]) built a context with its transition per row).
+        Anything else, or another kind of row, returns _NO_CELL."""
+        if not (type(row_item) is dict and row_item.get('__row__')) or '__parts__' in row_item:
+            return _NO_CELL
+        parsed = self._ROW_CELL_CACHE.get(row_expr)
+        if parsed is None:
+            m = _WHOLE_TCOL_RE.match(row_expr)
+            parsed = ((m.group(1) or m.group(2) or '').strip().replace("''", "'").lower(),
+                      m.group(3).strip().lower()) if m else ('', '')
+            if len(self._ROW_CELL_CACHE) > 4096:
+                self._ROW_CELL_CACHE.clear()
+            self._ROW_CELL_CACHE[row_expr] = parsed
+        table, col = parsed
+        if not table or str(row_item['__table__']).lower() != table:
+            return _NO_CELL
+        for key in row_item:
+            if key.lower() == col and not key.startswith('__'):
+                return row_item[key]
+        return _NO_CELL
+
     def _fn_sumx(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
         args = self._split_args(args_str)
@@ -9336,7 +9366,10 @@ class DAXEngine:
             seen = False
             dates = True          # every value a date: the sum is a date (#146)
             for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
+                cell = self._row_cell(row_expr, row_item)
+                if cell is not _NO_CELL:
+                    result = cell
+                elif isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
@@ -9369,7 +9402,10 @@ class DAXEngine:
         if isinstance(table_ref, list):
             max_val = None
             for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
+                cell = self._row_cell(row_expr, row_item)
+                if cell is not _NO_CELL:
+                    max_val = _extremum(max_val, cell, True)
+                elif isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
@@ -9421,7 +9457,10 @@ class DAXEngine:
         values = []
         if isinstance(table_ref, list):
             for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
+                cell = self._row_cell(row_expr, row_item)
+                if cell is not _NO_CELL:
+                    result = cell
+                elif isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
@@ -9446,7 +9485,10 @@ class DAXEngine:
         count = 0
         if isinstance(table_ref, list):
             for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
+                cell = self._row_cell(row_expr, row_item)
+                if cell is not _NO_CELL:
+                    result = cell
+                elif isinstance(row_item, dict) and '__table__' in row_item:
                     row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
                     result = self._eval_expr(row_expr, row_ctx)
                     result = self._resolve_row_result(result, row_item, row_ctx)
@@ -9688,65 +9730,129 @@ class DAXEngine:
         if len(args) < 2:
             return []
         table_ref = self._eval_expr(args[0].strip(), ctx)
-        if isinstance(table_ref, list):
-            filtered = []
-            cond_expr = args[1].strip()
-            for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
-                    if '__row__' in row_item:
-                        # Multi-column row dict from ALL(Table)
-                        table_name = row_item['__table__']
-                        extra_filters = {}
-                        for col_name, val in row_item.items():
-                            if col_name.startswith('__'):
-                                continue
-                            # A row transition like any iterator's: in scope
-                            # after CALCULATE (Desktop: COUNTROWS(FILTER(T,
-                            # CALCULATE(IF(ISINSCOPE(T[Cat]), 1, 0)) = 1)) is
-                            # 4), and ALLSELECTED puts back FILTER's rows
-                            # (issue #118). Plain lists read as explicit
-                            # CALCULATE filters.
-                            extra_filters[f"{table_name}.{col_name}"] = _row_value([val], table_ref)
-                        row_ctx = self._transitioned_ctx(ctx, extra_filters)
-                        # Bind the row: a column reference, qualified or not,
-                        # reads its value (MS_Perf_Analyzer's FILTER('Events',
-                        # [component] = "Change Detection") counted 0 rows
-                        # against Desktop's 3), and the row is a row context,
-                        # not a filter: an aggregate in the condition reads the
-                        # context outside FILTER (issue #116; Desktop 2.152,
-                        # COUNTROWS(FILTER(Orders, COUNTROWS(Orders) = 3)) is
-                        # 3). The row's values used to be substituted into the
-                        # condition's TEXT instead, which also rewrote the
-                        # column a function takes: EARLIER(Orders[Revenue])
-                        # compared the row with itself, and FIRSTDATE(Dt[Date])
-                        # got a date literal (#145). The row was bound only
-                        # without an aggregate, before aggregates took their
-                        # column as a column (_column_arg).
-                        row_ctx._current_row = row_item
-                        row_ctx._outer_ctx = ctx
-                        cond = self._eval_expr(cond_expr, row_ctx)
-                        if cond:
-                            filtered.append(row_item)
-                    else:
-                        # Single-column row dict from ALL(Table[Column]) or VALUES
-                        table_name = row_item['__table__']
-                        col_name = row_item['__column__']
-                        # _make_row_context, not a bare with_filters: it also
-                        # BINDS the row, which is what lets a column reference in
-                        # the condition resolve to this row's value. Without the
-                        # binding, `DimEmployee[EmployeeKey]` fell through to an
-                        # unresolved ('Table','Column') marker, so ISBLANK said
-                        # False and the BLANK (unknown) member survived
-                        # `NOT ISBLANK(DimEmployee[EmployeeKey])` -- FILTER
-                        # returned 262 rows where Desktop has 261, which pushed
-                        # Rank MTD Asc to 128 against Desktop's 127. Every other
-                        # iterator (MAXX/MINX/RANKX) already used this helper.
-                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                        cond = self._eval_expr(args[1].strip(), row_ctx)
-                        if cond:
-                            filtered.append(row_item)
-            return filtered
-        return []
+        if not isinstance(table_ref, list):
+            return []
+        filtered = []
+        cond_expr = args[1].strip()
+        # A condition that reads only columns of the row and constants has one
+        # value per combination of those columns: it is evaluated once per
+        # combination, the usual way, and reused for the other rows (issue
+        # #195: the Artificial Intelligence Sample's FILTER(KEEPFILTERS(
+        # Opportunities), Opportunities[Status] = "Won") built a context per
+        # row of 20,000 for three statuses).
+        pure_cols: dict = {}       # table -> the row columns the condition reads, or None
+        pure_memo: dict = {}
+        for row_item in table_ref:
+            if not (isinstance(row_item, dict) and '__table__' in row_item):
+                continue
+            if '__row__' in row_item:
+                tname = row_item['__table__']
+                if tname not in pure_cols:
+                    pure_cols[tname] = self._row_only_condition(cond_expr, tname, row_item)
+                cols = pure_cols[tname]
+                if cols is not None and all(c in row_item for c in cols):
+                    pkey = (tname, tuple(row_item[c] for c in cols))
+                    keep = pure_memo.get(pkey)
+                    if keep is None:
+                        keep = pure_memo[pkey] = bool(
+                            self._filter_whole_row(cond_expr, row_item, table_ref, ctx))
+                else:
+                    keep = bool(self._filter_whole_row(cond_expr, row_item, table_ref, ctx))
+            else:
+                # Single-column row dict from ALL(Table[Column]) or VALUES
+                # _make_row_context, not a bare with_filters: it also
+                # BINDS the row, which is what lets a column reference in
+                # the condition resolve to this row's value. Without the
+                # binding, `DimEmployee[EmployeeKey]` fell through to an
+                # unresolved ('Table','Column') marker, so ISBLANK said
+                # False and the BLANK (unknown) member survived
+                # `NOT ISBLANK(DimEmployee[EmployeeKey])` -- FILTER
+                # returned 262 rows where Desktop has 261, which pushed
+                # Rank MTD Asc to 128 against Desktop's 127. Every other
+                # iterator (MAXX/MINX/RANKX) already used this helper.
+                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                keep = bool(self._eval_expr(cond_expr, row_ctx))
+            if keep:
+                filtered.append(row_item)
+        return filtered
+
+    def _filter_whole_row(self, cond_expr: str, row_item: dict, table_ref: list,
+                          ctx: DAXContext) -> Any:
+        """FILTER's condition for one row of a whole table (a multi-column row
+        dict from the table or ALL(Table))."""
+        table_name = row_item['__table__']
+        extra_filters = {}
+        for col_name, val in row_item.items():
+            if col_name.startswith('__'):
+                continue
+            # A row transition like any iterator's: in scope
+            # after CALCULATE (Desktop: COUNTROWS(FILTER(T,
+            # CALCULATE(IF(ISINSCOPE(T[Cat]), 1, 0)) = 1)) is
+            # 4), and ALLSELECTED puts back FILTER's rows
+            # (issue #118). Plain lists read as explicit
+            # CALCULATE filters.
+            extra_filters[f"{table_name}.{col_name}"] = _row_value([val], table_ref)
+        row_ctx = self._transitioned_ctx(ctx, extra_filters)
+        # Bind the row: a column reference, qualified or not,
+        # reads its value (MS_Perf_Analyzer's FILTER('Events',
+        # [component] = "Change Detection") counted 0 rows
+        # against Desktop's 3), and the row is a row context,
+        # not a filter: an aggregate in the condition reads the
+        # context outside FILTER (issue #116; Desktop 2.152,
+        # COUNTROWS(FILTER(Orders, COUNTROWS(Orders) = 3)) is
+        # 3). The row's values used to be substituted into the
+        # condition's TEXT instead, which also rewrote the
+        # column a function takes: EARLIER(Orders[Revenue])
+        # compared the row with itself, and FIRSTDATE(Dt[Date])
+        # got a date literal (#145). The row was bound only
+        # without an aggregate, before aggregates took their
+        # column as a column (_column_arg).
+        row_ctx._current_row = row_item
+        row_ctx._outer_ctx = ctx
+        return self._eval_expr(cond_expr, row_ctx)
+
+    # The parts a condition that reads only the row may hold: strings,
+    # numbers, Table[Column] references, operators, and these words.
+    _ROW_ONLY_TOKEN_RE = re.compile(
+        r"""\s+|"(?:[^"]|"")*"|\d+(?:\.\d+)?|'(?:[^']|'')+'\s*\[[^\]]+\]|[A-Za-z_]\w*\s*\[[^\]]+\]"""
+        r"""|&&|\|\||<>|<=|>=|[=<>+\-*/&(),{}]|[A-Za-z_]\w*""")
+    _ROW_ONLY_WORDS = frozenset({'AND', 'OR', 'NOT', 'IN', 'TRUE', 'FALSE', 'BLANK', 'ISBLANK'})
+
+    def _row_only_condition(self, cond_expr: str, table: str, row_item: dict):
+        """The columns of ``row_item`` a FILTER condition reads, when that is
+        all it reads -- Table[Column] of the iterated table, constants,
+        comparisons, IN { }, AND / OR / NOT, ISBLANK, arithmetic -- else None.
+        Such a condition has one value per combination of those columns."""
+        cols: list = []
+        lower = {k.lower(): k for k in row_item if not k.startswith('__')}
+        pos = 0
+        text = cond_expr
+        while pos < len(text):
+            m = self._ROW_ONLY_TOKEN_RE.match(text, pos)
+            if not m or m.end() == pos:
+                return None
+            tok = m.group(0)
+            pos = m.end()
+            if tok.isspace() or tok[0] == '"' or tok[0].isdigit():
+                continue
+            if tok.endswith(']'):
+                tpart, _, cpart = tok.partition('[')
+                tpart = tpart.strip()
+                if tpart.startswith("'"):
+                    tpart = tpart[1:-1].replace("''", "'")
+                if tpart.lower() != table.lower():
+                    return None
+                key = lower.get(cpart[:-1].strip().lower())
+                if key is None:
+                    return None
+                if key not in cols:
+                    cols.append(key)
+                continue
+            if tok[0].isalpha() or tok[0] == '_':
+                if tok.upper() not in self._ROW_ONLY_WORDS:
+                    return None
+            # operators and punctuation
+        return cols
 
     # =========================================================================
     # Table functions
