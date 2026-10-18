@@ -4,12 +4,14 @@ row -- pure white, pure black, then the first eight data colours.
 _resolve_theme_color read dataColors[ColorId], so pbix_extract_colors reported
 every "White" as the theme's first data colour, and pbix_recolor rewrote white
 and grey fills to the new primary when it remapped that colour (Desktop then
-painted a recoloured Matrix Bubble Chart's cells magenta). Ground truth is
-Power BI Desktop's own code (desktop.min.js, DataColorPalette):
-basePickerColors = [#FFFFFF, #000000] + the first 8 data colours, and
-getThemeDataColor returns basePickerColors[ColorId]. The Percent shade is
-Desktop's function too: the vectors below are its output, run verbatim under
-Node (7,560 colour/percent pairs, every one equal to the port).
+painted a recoloured Matrix Bubble Chart's cells magenta).
+
+Re-derived clean-room on 2026-10-19 (docs/reverse-engineering/experiments/
+2026-10-19-clean-room-remediation.md): the community Desktop-saved files use
+ColorId 0..9 only (1,365 references), 0 only darkened and 1 only lightened;
+and OpenBI's Desktop probe 33 measured the colours below under a theme whose
+background and foreground were other colours. Earlier versions of this test
+held vectors computed from Desktop's application script; they are gone.
 """
 from __future__ import annotations
 
@@ -38,18 +40,27 @@ def test_a_short_palette_has_fewer_picker_colours():
     assert S._resolve_theme_color([], 0, -0.1) == "#E6E6E6"     # white needs no theme
 
 
-# (ColorId over PAL, Percent, Desktop's shade)
-DESKTOP_SHADES = [
-    (0, -0.1, "#E6E6E6"), (0, -0.2, "#CCCCCC"), (0, -0.3, "#B3B3B3"), (0, -0.5, "#808080"),
-    (0, -0.6, "#666666"), (1, 0.1, "#1A1A1A"), (1, 0.2, "#333333"), (1, 0.4, "#666666"),
-    (1, 0.6, "#999999"), (2, 0.6, "#A0D1FF"), (2, -0.25, "#0D6ABF"), (2, -0.5, "#094780"),
-    (3, 0.4, "#717BC5"),
+# OpenBI's Desktop probe 33 (its ledger F123): shapes under a theme whose
+# data colours start #E81123, #00B294, as Desktop drew them --
+# (palette, ColorId, Percent, colour on screen)
+PROBE_33 = ["#E81123", "#00B294"]
+PROBE_SHADES = [
+    (0, 0, "#FFFFFF"), (0, -0.1, "#E6E6E6"), (1, 0, "#000000"), (1, 0.1, "#1A1A1A"),
+    (2, 0, "#E81123"), (2, -0.1, "#D10F20"), (3, 0, "#00B294"),
 ]
 
 
-@pytest.mark.parametrize("cid,pct,want", DESKTOP_SHADES)
-def test_shades_are_desktops(cid, pct, want):
-    assert S._resolve_theme_color(PAL, cid, pct) == want
+@pytest.mark.parametrize("cid,pct,want", PROBE_SHADES)
+def test_shades_as_desktop_drew_them(cid, pct, want):
+    assert S._resolve_theme_color(PROBE_33, cid, pct) == want
+
+
+def test_a_shade_rounds_a_half_up():
+    """229.5 -> 230 (white at -10%), 25.5 -> 26 (black at +10%), 31.5 -> 32
+    (#E81123's blue at -10%): probe 33's three halves."""
+    assert S._shade_color("#FFFFFF", -0.1) == "#E6E6E6"
+    assert S._shade_color("#000000", 0.1) == "#1A1A1A"
+    assert S._shade_color("#E81123", -0.1) == "#D10F20"
 
 
 def _report(tmp_path, refs):

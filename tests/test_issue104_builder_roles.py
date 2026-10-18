@@ -4,10 +4,11 @@
    the taken set AFTER assigning and minus the candidate, so it never saw a
    collision ('Region' and 'Range' were both "r").
 2. A visual config may bind any roles ({"roles": {role: [field, ...]}}) with
-   implicit aggregations named and coded as Desktop's own customVisualsHost.js
-   has them (Sum=0 .. Variance=8; "Count" is code 2, the field well's Count
-   (Distinct)), and carry formatting objects and visual filters; a page takes
-   filters and interactions (its section config's relationships).
+   implicit aggregations coded as Microsoft's published semantic query schema
+   numbers them (Sum=0 .. Variance=8) and named as report_binding.
+   QUERY_AGGREGATES has them (clean-room remediation 2026-10-19), and carry
+   formatting objects and visual filters; a page takes filters and
+   interactions (its section config's relationships).
 """
 from __future__ import annotations
 
@@ -80,7 +81,7 @@ def test_roles_bind_a_matrix_and_aggregations_use_desktops_names():
     (vc, sv), _card = _visuals(lay)
     assert {r: [i["queryRef"] for i in items] for r, items in sv["projections"].items()} == {
         "Rows": ["Region.Region"], "Columns": ["Range.Band"],
-        "Values": ["Sales.Total", "Sum(Sales.Amount)", "Avg(Sales.Amount)", "Count(Sales.Amount)",
+        "Values": ["Sales.Total", "Sum(Sales.Amount)", "Avg(Sales.Amount)", "DistinctCount(Sales.Amount)",
                    "Min(Sales.Amount)", "Max(Sales.Amount)", "CountNonNull(Sales.Amount)",
                    "Median(Sales.Amount)", "StandardDeviation(Sales.Amount)", "Variance(Sales.Amount)"]}
     codes = [(s["Name"], s["Aggregation"]["Function"]) for s in sv["prototypeQuery"]["Select"]

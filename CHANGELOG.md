@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.143] - 2026-10-19
+
+Clean-room remediation: code that named Power BI Desktop's application scripts (`desktop.min.js`, `customVisualsHost.js`) as its source is replaced by behaviour derived from the community Desktop-saved files, Microsoft's published schemas and documentation, and OpenBI's own Desktop probes. The record, with every count and what is still open: `docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md`.
+
+### Changed
+
+- **ThemeDataColor** (`_theme_picker_colors`, `_shade_color`): same results, new derivation -- ColorId 0..9 in the files, probe 33's colours, a half rounded up. The test's script-computed shade vectors are replaced by probe 33's measurements.
+- **A visual group's layout mode**: ScaleMode is 0 (all 103 groups in the files); ScrollMode's 1 is inferred from the published schema's order, awaiting a Desktop save.
+- **Aggregate names** (`QUERY_AGGREGATES`): codes from the public semantic query schema; Sum / Avg / Min / Max as the files name them. **Distinct count (code 2) is now named `DistinctCount(...)`**, was `Count(...)`; the code is unchanged.
+- **Field-well summarization** (`apply_implicit_aggregations`): rewritten from 0.9.139's own version and the evidence -- grouping wells, tables and slicers keep columns bare; value wells summarize a number by its default summarization ("Don't summarize" stays bare); text in a card, tooltip or matrix values is First (Min), in a chart's value well counted; the new card's Data and a scatter's X summarize. **Not summarized until a Desktop save shows them**: a gauge's Min / Max / Target, a KPI's Goal, colour saturation (0.9.140 summarized them). `tests/test_clean_room_well_summarization.py` replaces `tests/test_issue191_well_summarization.py`.
+
 ## [0.9.142] - 2026-10-18
 
 FILTER over a table with a condition on the row's own columns, and an iterator over a plain column, no longer build a row context per row (#195). The Artificial Intelligence Sample's [Count of Won] by product takes 0.19 s instead of 2.65 s, and [Close %] 0.32 s instead of 4.45 s, with the same values. The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN. Five of its slowest files, re-timed side by side with 0.9.141, take 900.4 s against 912.5 s; the Artificial Intelligence Sample's 22 measures 41.0 s against 62.2 s. `regress_check.py` answers every probe of its 34 Desktop batteries as 0.9.141 does.

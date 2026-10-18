@@ -43,12 +43,18 @@ _NUMERIC_TYPES = {"Int64", "Double", "Decimal"}
 _AGG_SUM = 0
 _AGG_AVERAGE = 1
 _AGG_COUNTNONNULL = 5
-# Every QueryAggregateFunction and the queryRef name Desktop gives it, as its
-# own customVisualsHost.js defines them (enum Sum=0 .. Variance=8; visitAggr
-# writes "<Name>(Entity.Property)"). Code 2, "Count", is the field well's
-# "Count (Distinct)"; the well's plain "Count" is CountNonNull (5).
+# Every QueryAggregateFunction code, as Microsoft's published semantic query
+# schema numbers them (microsoft/json-schemas, MIT, report/definition/
+# semanticQuery: 0 Sum, 1 Average, 2 Distinct count, 3 Min, 4 Max, 5 Count of
+# non-null values, 6 Median, 7 StandardDeviation, 8 Variance), and the name a
+# queryRef gives the aggregated column, "<Name>(Entity.Property)". Sum, Avg,
+# Min and Max are the names the community Desktop-saved files use (13 / 1 /
+# 48 / 4 such selects across 3 / 1 / 7 / 2 files); the others are named after
+# the schema's descriptions -- a queryRef is how the projections name the
+# select (clean-room remediation 2026-10-19, docs/reverse-engineering/
+# experiments/2026-10-19-clean-room-remediation.md).
 QUERY_AGGREGATES: dict[int, str] = {
-    0: "Sum", 1: "Avg", 2: "Count", 3: "Min", 4: "Max", 5: "CountNonNull",
+    0: "Sum", 1: "Avg", 2: "DistinctCount", 3: "Min", 4: "Max", 5: "CountNonNull",
     6: "Median", 7: "StandardDeviation", 8: "Variance",
 }
 # Coordinates must never be summed: Desktop's default summarization for
@@ -59,78 +65,77 @@ QUERY_AGGREGATES: dict[int, str] = {
 _GEO_ROLES = {"Latitude", "Longitude"}
 _LATLONG_NAME_RE = re.compile(r"^(lat(itude)?|lo?ng(itude)?)$", re.IGNORECASE)
 
-# The kind of each well of Desktop's built-in visuals, as their capabilities
-# in desktop.min.js declare them (issue #191). A column dropped into a
-# GROUPING well stays bare, into a MEASURE well it is always summarized, into
-# a GROUPING-OR-MEASURE well only a number with a default summarization is
-# (VisualAuthoringService.shouldPreferGroupToAggregate). "num": the well
-# requires a number, so text and dates are counted rather than given their
-# Min; "lat" / "lon": the well's preferred type is a latitude / longitude.
-_G, _M, _GM = "grouping", "measure", "grouping-or-measure"
-_CHART_WELLS = {"Category": (_G,), "Series": (_G,), "Rows": (_G,), "Y": (_M, "num"),
-                "Y2": (_M, "num"), "Gradient": (_M, "num"), "Tooltips": (_M,)}
-_WELL_KINDS: dict[str, dict[str, tuple]] = {
-    **{vt: _CHART_WELLS for vt in (
-        "barChart", "columnChart", "clusteredBarChart", "clusteredColumnChart",
-        "stackedBarChart", "stackedColumnChart", "hundredPercentStackedBarChart",
-        "hundredPercentStackedColumnChart", "ribbonChart", "lineChart", "areaChart",
-        "stackedAreaChart", "lineClusteredColumnComboChart",
-        "lineStackedColumnComboChart", "pieChart", "donutChart", "funnel")},
-    "waterfallChart": {"Category": (_G,), "Breakdown": (_G,), "Y": (_M, "num"), "Tooltips": (_M,)},
-    "treemap": {"Group": (_G,), "Details": (_G,), "Values": (_M, "num"),
-                "Gradient": (_M, "num"), "Tooltips": (_M,)},
-    "gauge": {"Y": (_M, "num"), "MinValue": (_M, "num"), "MaxValue": (_M, "num"),
-              "TargetValue": (_M, "num"), "Tooltips": (_M,)},
-    "kpi": {"Indicator": (_M, "num"), "TrendLine": (_G,), "Goal": (_M, "num")},
-    "scatterChart": {"Category": (_G,), "Series": (_G,), "X": (_GM,), "Y": (_GM, "num"),
-                     "Size": (_M, "num"), "Gradient": (_M, "num"), "Play": (_G,),
-                     "Tooltips": (_M,)},
-    "map": {"Category": (_G,), "Series": (_G,), "Y": (_GM, "lat"), "X": (_GM, "lon"),
-            "Size": (_M, "num"), "Gradient": (_M, "num"), "Tooltips": (_M,)},
-    "azureMap": {"Category": (_G,), "Series": (_G,), "Y": (_GM, "lat"), "X": (_GM, "lon"),
-                 "Size": (_M, "num"), "Tooltips": (_M,), "PathID": (_G,), "PointOrder": (_G,)},
-    "filledMap": {"Category": (_G,), "Series": (_G,), "Y": (_M, "lat"), "X": (_M, "lon"),
-                  "Size": (_M, "num"), "Tooltips": (_M,)},
-    "card": {"Values": (_M,)},
-    "cardVisual": {"Data": (_M,), "Rows": (_G,), "Tooltips": (_M,)},
-    "multiRowCard": {"Values": (_GM,)},
-    "matrix": {"Rows": (_G,), "Columns": (_G,), "Values": (_M,)},
-    "pivotTable": {"Rows": (_G,), "Columns": (_G,), "Values": (_M,)},
+# Columns Desktop keeps bare in a well that otherwise summarizes (0.9.139):
+# an Azure Map places points by them (4 of 4 bindings in the community
+# Desktop files); a multi-row card lists a text's values (8 of 8) -- a number
+# there is summarized as anywhere (no file has one; Microsoft Learn's
+# default).
+_BARE_COLUMN_ROLES = {
+    "azureMap": {"X", "Y"},
 }
-# Model SummarizeBy (AMO AggregateFunction) -> the aggregate a measure well
-# gives a number (defaultAggregateToQueryAggregateFunction; Default is Sum).
-_SUMMARIZE_BY = {1: _AGG_SUM, 3: _AGG_SUM, 4: 3, 5: 4, 6: _AGG_COUNTNONNULL,
-                 7: _AGG_AVERAGE, 8: 2}
-_SUMMARIZE_NONE = 2
-_LATLONG_CATEGORIES = {"Latitude", "Longitude"}
-_AGG_MIN = 3
+_BARE_TEXT_ROLES = {
+    "multiRowCard": {"Values"},
+}
+# The wells a column dropped into is summarized in: the value wells 0.9.139
+# summarized, plus tooltips, a decomposition tree's Analyze and a key
+# influencers' Explain by. In the community Desktop files Y, Analyze and a
+# number in Explain by are aggregated (6 of 6), a text in Explain by stays
+# bare (17 of 17), and every grouping well -- Category, Rows, Columns,
+# Series, Target -- keeps even a summing number bare (over 200 bindings).
+_SUMMARIZING_ROLES = {"Y", "Values", "Y2", "Size", "Tooltips", "Analyze", "ExplainBy",
+                      "Data"}
+# The new card's Data well holds measures (74 in 14 files); a scatter chart's
+# X does (7 of 7), and Microsoft Learn: scatter charts require aggregated
+# values on X and Y. Wells of visuals no community file uses -- a gauge's
+# targets, a KPI's goal, colour saturation -- are not summarized until a
+# Desktop save shows them (docs/reverse-engineering/experiments/
+# 2026-10-19-clean-room-remediation.md, "Open").
+_SUMMARIZING_VISUAL_ROLES = {"scatterChart": {"X"}}
+# The model's own default summarization (the Tabular model's AggregateFunction,
+# Microsoft's public documentation: Default 1, None 2, Sum 3, Min 4, Max 5,
+# Count 6, Average 7, DistinctCount 8) -> the query aggregate a number gets,
+# matched by name to the public QueryAggregateFunction codes; Default is Sum
+# for a number, as the model documents it. The files: Sum -> Sum (6 bindings),
+# Average -> Avg (1).
+_NUMBER_AGGREGATES = {1: _AGG_SUM, 3: _AGG_SUM, 4: 3, 5: 4, 6: _AGG_COUNTNONNULL, 7: _AGG_AVERAGE, 8: 2}
+# "Don't summarize": each value on its own (Microsoft Learn, "Work with
+# aggregates"), the column stays bare -- as the files keep it in a table and
+# on an Azure Map.
+_DONT_SUMMARIZE = 2
+# A text or date in a card, a tooltip or a matrix's values is given its first
+# value, Min (7 of 7 such bindings across 4 community Desktop files); in a
+# chart's value wells it is counted (Microsoft Learn: a categorical field in a
+# numbers-only bucket is counted -- no file has one).
+_FIRST = 3
+_FIRST_VISUAL_ROLES = {"card": {"Values"}, "matrix": {"Values"}, "pivotTable": {"Values"}}
 
 
-def _desktop_aggregate(kind: tuple, vtype, summarize_by, category,
-                       location_bound: bool):
-    """The QueryAggregateFunction Desktop wraps a dropped column in, or None
-    to leave it bare (shouldPreferGroupToAggregate / createExprWithAggregate /
-    SQAggregationOperationsService.defaultAggregate)."""
-    well = kind[0]
-    if well == _G:
+def _implicit_aggregate(visual_type: str, role: str, data_type, summarize_by, data_category,
+                        prop: str):
+    """The (code, name) a bare column in ``role`` of ``visual_type`` is summarized
+    by, or None to keep it bare. ``data_type`` is the model type ("Int64",
+    "String", ...), ``summarize_by`` the column's default summarization code,
+    ``data_category`` its data category (clean-room remediation 2026-10-19)."""
+    if role in _BARE_COLUMN_ROLES.get(visual_type, ()):
         return None
-    numeric = vtype in _NUMERIC_TYPES
-    latlong = (category in _LATLONG_CATEGORIES
-               or any(k in ("lat", "lon") for k in kind[1:]))
-    if well == _GM:
-        if latlong:
-            # A coordinate is averaged only beside a location; on its own it
-            # places one point per value.
-            return _AGG_AVERAGE if location_bound else None
-        if not numeric or summarize_by == _SUMMARIZE_NONE:
-            return None
-        return _SUMMARIZE_BY.get(summarize_by, _AGG_SUM)
-    if latlong:
+    geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
+    if role not in _SUMMARIZING_ROLES and role not in _GEO_ROLES and not (role == "X" and geo_named) \
+            and role not in _SUMMARIZING_VISUAL_ROLES.get(visual_type, ()):
+        return None
+    numeric = data_type in _NUMERIC_TYPES
+    if numeric and summarize_by == _DONT_SUMMARIZE:
+        return None                        # a number set not to summarize stays bare
+    if not numeric and role in _BARE_TEXT_ROLES.get(visual_type, ()):
+        return None
+    if role in _GEO_ROLES or (numeric and (geo_named or data_category in _GEO_ROLES)):
+        # coordinates average, never sum (0.9.139: two cities summed land in the sea)
         return _AGG_AVERAGE
-    if numeric and summarize_by != _SUMMARIZE_NONE:
-        return _SUMMARIZE_BY.get(summarize_by, _AGG_SUM)
-    if vtype in ("String", "DateTime") and "num" not in kind[1:]:
-        return _AGG_MIN                    # "First X" / "Earliest X"
+    if numeric:
+        return _NUMBER_AGGREGATES.get(summarize_by, _AGG_SUM)
+    if role == "ExplainBy":
+        return None
+    if role == "Tooltips" or role in _FIRST_VISUAL_ROLES.get(visual_type, ()):
+        return _FIRST
     return _AGG_COUNTNONNULL
 
 # (underlyingType, queryMetadata.Type) per model data type — taken verbatim from
@@ -193,24 +198,16 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
     """Rewrite plain value-role columns in the PROTOTYPE query to Aggregations.
 
     Power BI Desktop re-derives the live data query from
-    ``config.singleVisual.prototypeQuery`` + ``projections`` — aggregating only
+    ``config.singleVisual.prototypeQuery`` + ``projections`` -- aggregating only
     the compiled ``query`` is not enough (Desktop-verified: the chart stays
-    empty). When Desktop's own field well receives a numeric column on a value
-    axis it stores an ``Aggregation`` select named ``Sum(Entity.Property)`` in
-    the prototype and points the projection at that name (ground truth: AI
-    Sample barChart). This mirrors that, as Desktop decides it for its
-    built-in visuals (_WELL_KINDS, issue #191): a bare ``Column`` select in a
-    well that takes only measures (a chart's Y, Tooltips, Gradient, a card's
-    Values, ...) always becomes ``{"Aggregation": ...}`` -- a number by its
-    default summarization (``resolve_type.summarize_by``; Default is Sum),
-    text or a date by Min where the well accepts them, otherwise
-    CountNonNull, a latitude / longitude by Avg -- and in a
-    grouping-or-measure well only a number whose default summarization is
-    not None does. Projections are re-pointed at Desktop's queryRef names.
-    Other visual types keep the older rule (Y/Values/Y2/Size: Sum for a
-    number, CountNonNull otherwise). Flat grids (``table``/``tableEx``) and
-    slicers show raw values and are left alone; measures and explicit
-    aggregations are untouched.
+    empty). A column Desktop's field well summarizes is stored as an
+    ``Aggregation`` select named ``<Name>(Entity.Property)`` (QUERY_AGGREGATES)
+    and the projection points at that name (ground truth: AI Sample barChart).
+    Which columns are summarized, and by what, is _implicit_aggregate: the
+    well, the column's type, its default summarization and data category.
+    Flat grids (``table``/``tableEx``) and slicers show raw values and are left
+    alone; measures and explicit aggregations are untouched. ``resolve_type``
+    may carry ``summarize_by(entity, prop)`` and ``data_category(entity, prop)``.
 
     Returns a mapping of old queryRef -> new queryRef (empty when nothing changed).
     """
@@ -226,13 +223,13 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
                 for role, items in projections.items() for it in items}
 
     # A projection COVERED BY A FIELD PARAMETER must keep the exact queryRef
-    # the parameter's NAMEOF ref resolves to — a bare Column or Measure,
+    # the parameter's NAMEOF ref resolves to -- a bare Column or Measure,
     # never an implicit Aggregation. Every Desktop-authored binding in the
     # corpus (Furniture Sales, Root Cause, Chandoo Performance) projects the
     # covered field un-wrapped; wrapping a covered numeric column into
     # Sum(T.Col) breaks the queryRef <-> parameter-field correspondence
     # Desktop's re-derivation needs, so it drops the well and the visual
-    # renders EMPTY — no bars, no value axis (issue #36).
+    # renders EMPTY -- no bars, no value axis (issue #36).
     param_covered: set = set()
     for role, entries in (single_visual.get("queryFieldParametersByRole")
                           or {}).items():
@@ -246,14 +243,12 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
             for it in items[start:start + length]:
                 param_covered.add(it.get("queryRef"))
 
-    wells = _WELL_KINDS.get(visual_type)
-
-    def _model_fact(name, entity, prop):
-        fn = getattr(resolve_type, name, None)
-        if fn is None:
+    def _fact(name, entity, prop):
+        reader = getattr(resolve_type, name, None) if resolve_type is not None else None
+        if reader is None:
             return None
         try:
-            return fn(entity, prop)
+            return reader(entity, prop)
         except Exception:
             return None
 
@@ -276,41 +271,11 @@ def apply_implicit_aggregations(single_visual: dict, resolve_type=None) -> dict[
                 vtype = resolve_type(entity, prop, False)
             except Exception:
                 vtype = None
-        kind = wells.get(role) if wells is not None and role is not None else None
-        if kind is not None:
-            # A well Desktop's capabilities declare: its rule (issue #191).
-            # Without a data category, a column named like a coordinate is
-            # taken for one (ledger issues-5).
-            category = _model_fact("data_category", entity, prop)
-            if category is None and _LATLONG_NAME_RE.match(prop or ""):
-                category = "Latitude"
-            # A coordinate is averaged beside a location -- on a map its
-            # Category, elsewhere any other projected well.
-            if visual_type in ("map", "azureMap"):
-                located = bool(projections.get("Category"))
-            else:
-                located = any(projections.get(r) for r in projections if r != role)
-            func = _desktop_aggregate(
-                kind, vtype, _model_fact("summarize_by", entity, prop),
-                category, located)
-            if func is None:
-                continue
-            fn_name = QUERY_AGGREGATES[func]
-        else:
-            geo_role = role in _GEO_ROLES
-            geo_named = bool(_LATLONG_NAME_RE.match(prop or ""))
-            # X is a value role only for the lat/long case handled here.
-            if role not in _VALUE_ROLES and not geo_role \
-                    and not (role == "X" and geo_named):
-                continue
-            if geo_role or (geo_named and vtype in _NUMERIC_TYPES):
-                # Coordinates AVERAGE (Desktop's geo default summarization);
-                # summing them produces a point that exists on no map.
-                func, fn_name = _AGG_AVERAGE, "Avg"
-            elif vtype in _NUMERIC_TYPES:
-                func, fn_name = _AGG_SUM, "Sum"
-            else:
-                func, fn_name = _AGG_COUNTNONNULL, "CountNonNull"
+        func = _implicit_aggregate(visual_type, role, vtype, _fact("summarize_by", entity, prop),
+                                   _fact("data_category", entity, prop), prop)
+        if func is None:
+            continue
+        fn_name = QUERY_AGGREGATES[func]
         new_ref = (f"{fn_name}({entity}.{prop})" if entity and prop
                    else f"{fn_name}({old_ref})")
         sel.pop("Column")

@@ -277,7 +277,9 @@ As of 0.9.121, docs 1-51 and #1-#113, #119-#120 and #131 were closed.
 
 - doc 50 = #119: a ThemeDataColor's ColorId indexes Desktop's picker row --
   white, black, then the first 8 data colours (from desktop.min.js), so 0 and 1
-  are fixed white and black, not the theme's background / foreground (O47);
+  are fixed white and black, not the theme's background / foreground (O47).
+  Re-derived clean-room 2026-10-19 from the community files and OpenBI's
+  probe 33 (reverse-engineering/experiments/2026-10-19-clean-room-remediation.md);
 - doc 51 = #120: ALLSELECTED(<table>) as a table is the table's rows under the
   selection. Desktop keeps only the selection on its own columns for the
   column form, so doc 51's expected 1 for COUNTROWS(ALLSELECTED(T[Region]))
@@ -530,8 +532,10 @@ Kept so the same items are not re-litigated:
   tests/test_issue194_distinct_dates.py, tests/test_issue193_allselected_shield.py.
 - **GH #191** -- CLOSED (0.9.140). Implicit aggregation by a fixed role list;
   now Desktop's well kinds + default summarization (desktop.min.js), verified
-  in Desktop (5 bars -> 2, Count of Name -> First Name). Regression:
-  tests/test_issue191_well_summarization.py.
+  in Desktop (5 bars -> 2, Count of Name -> First Name). Replaced 2026-10-19
+  by a clean-room derivation from the community files, the public schemas and
+  Microsoft Learn (reverse-engineering/experiments/2026-10-19-clean-room-remediation.md);
+  regression: tests/test_clean_room_well_summarization.py.
 - **doc 61 (GH #186), doc 62 (GH #187, #188), doc 63 (GH #189), GH #190** --
   CLOSED (0.9.139). Every evaluate_measures_batch call started an empty
   measure memo (Agents Performance's table ~950 s, now 32 s with one `cache`
