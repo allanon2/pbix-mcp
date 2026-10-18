@@ -40,8 +40,13 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-16 (0.9.141): docs 1-66 and GitHub issues/PRs #1-#194 are
-closed.** 0.9.141 closes doc 65 = #192: DATESBETWEEN takes a BLANK start /
+**Updated 2026-10-19 (0.9.142): docs 1-66 and GitHub issues/PRs #1-#195 are
+closed.** 0.9.142 closes #195 (ComposeBI's): FILTER with a condition on the
+row's own columns evaluates it once per combination, and SUMX / COUNTX /
+COUNTAX / AVERAGEX / MAXX read a plain column's cell -- the Artificial
+Intelligence Sample's [Count of Won] by product 2.65 s -> 0.19 s.
+
+As of 0.9.141, docs 1-66 and GitHub issues/PRs #1-#194 were closed. 0.9.141 closes doc 65 = #192: DATESBETWEEN takes a BLANK start /
 end as the column's first / last date, whatever the filters (build_b192.py);
 #194: time-intelligence functions over a fact date column return each date
 once; and doc 66 = #193: a measure that reaches a table only through
@@ -513,6 +518,10 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #195** -- CLOSED (0.9.142). FILTER(table, column = constant) built a row
+  context per row; it now evaluates a row-only condition once per column
+  combination, and iterators read a plain column's cell. Same values (forced
+  row-by-row comparison). Regression: tests/test_issue195_filter_row_conditions.py.
 - **doc 65 (GH #192), GH #194, doc 66 (GH #193)** -- CLOSED (0.9.141).
   DATESBETWEEN with a BLANK bound was empty; time-intelligence functions
   repeated a fact column's dates; the memo shield did not prove

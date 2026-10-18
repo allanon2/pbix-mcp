@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.142] - 2026-10-18
+
+FILTER over a table with a condition on the row's own columns, and an iterator over a plain column, no longer build a row context per row (#195). The Artificial Intelligence Sample's [Count of Won] by product takes 0.19 s instead of 2.65 s, and [Close %] 0.32 s instead of 4.45 s, with the same values. The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN. Five of its slowest files, re-timed side by side with 0.9.141, take 900.4 s against 912.5 s; the Artificial Intelligence Sample's 22 measures 41.0 s against 62.2 s. `regress_check.py` answers every probe of its 34 Desktop batteries as 0.9.141 does.
+
+### Fixed — FILTER(table, column = constant) walked every row in a row context (issue #195)
+
+**What was wrong:** `COUNTAX(FILTER(KEEPFILTERS(Opportunities), Opportunities[Status] = "Won"), Opportunities[OpportunitySeq])` built a context, with its transition, for each of the table's 20,000 rows to compare one column with a constant. COUNTAX then did the same again to read one column per row. The equivalent `CALCULATE(COUNTROWS(Opportunities), KEEPFILTERS(Opportunities[Status] = "Won"))` took 0.08 s.
+
+**The fix:**
+
+- **FILTER**, when its condition reads only columns of the iterated row and constants (comparisons, `IN { }`, AND / OR / NOT, ISBLANK, arithmetic), evaluates the condition once per combination of those columns, the usual way, and reuses the answer. `Status = "Won"` is evaluated 5 times, not 20,000.
+- **SUMX, COUNTX, COUNTAX, AVERAGEX and MAXX** over an expression that is just a column of the iterated table read the row's cell.
+- **Everything else** (a measure, an aggregate, RELATED, an unqualified `[Name]`, another table) keeps the row-by-row path.
+
+| Artificial Intelligence Sample, by product (10) | 0.9.141 | 0.9.142 |
+|---|---|---|
+| Count of Won | 2.65 s | 0.19 s |
+| Close % | 4.45 s | 0.32 s |
+| Count of Lost | 2.18 s | 0.19 s |
+| Revenue Won (`CALCULATE(SUMX(...), FILTER(Opportunities, ...))`) | 6.9 s | 2.05 s |
+
+All values are unchanged.
+
+**Not changed:** most of Revenue Won's remaining 2 s is applying a table of 12,000 whole rows as a CALCULATE filter. That is the general table-filter path, not FILTER's condition.
+
+**Pinned** by `tests/test_issue195_filter_row_conditions.py`:
+
+- 27 FILTER measures, plus the iterator measures, compared with the row-by-row path forced on, under three filter contexts;
+- the condition evaluated once per status;
+- a plain column read without a row context;
+- what the condition test accepts.
+
+**12 of its 13 tests fail on 0.9.141.**
+
 ## [0.9.141] - 2026-10-16
 
 DATESBETWEEN takes a BLANK start or end as the column's first or last date (#192), and time-intelligence functions return each date once over a fact column (#194). A measure that reaches a table only through `CALCULATE(..., FILTER(ALLSELECTED(T), ...))` is evaluated once per query instead of once per row or group (#193): Awesome Chocolates' trend line takes 1 s instead of 15-26 s. Checked against Power BI Desktop 2.152 over ADOMD with `build_b192.py` (36 probes; 0.9.140 matched 8) and `build_b193.py` (26 probes, all matching before and after). The corpus census (1,508 measures) changes only the 15 measures that use RAND or RANDBETWEEN. Five of its slowest files, re-timed side by side with 0.9.140, take 835.6 s against 836.2 s. `regress_check.py` answers every probe of its 34 Desktop batteries as 0.9.140 does.
