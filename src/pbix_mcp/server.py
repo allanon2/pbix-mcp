@@ -6914,31 +6914,35 @@ def _load_theme_data_colors(work_dir: str) -> list[str]:
 
 
 def _theme_picker_colors(data_colors: list[str]) -> list[str]:
-    """The colour picker's theme row, which a ThemeDataColor's ColorId indexes.
+    """The colour picker's theme row, which a ThemeDataColor's ColorId indexes:
+    white, black, then the theme's first eight data colours (ten swatches, the
+    row Desktop's picker shows).
 
-    Power BI Desktop's own code (desktop.min.js, DataColorPalette):
-    ``basePickerColors = [{value: "#FFFFFF"}, {value: "#000000"}]`` followed by
-    ``_.take(this.colors, 8)``, and getThemeDataColor returns
-    ``basePickerColors[colorIdx]?.value``. So ColorId 0 is pure white and 1
-    pure black -- not the theme's background / foreground -- 2..9 are the
-    first eight data colours, and 10 and up resolve to nothing (issue #119).
+    Derived without Desktop's code (clean-room remediation 2026-10-19,
+    docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md):
+    across the 28 community Desktop-saved files ColorId runs 0..9 and never
+    higher (1,365 references, 9 used 210 times in 9 files); 0 is only ever
+    darkened (350) and 1 only ever lightened (106) -- the shades a picker
+    offers for white and for black; and OpenBI's Desktop probe 33 (its ledger
+    F119 / F123) drew 0 as #FFFFFF and 1 as #000000 under a theme whose
+    background and foreground were other colours, 2 as the first data colour.
     """
     return ["#FFFFFF", "#000000"] + [c.upper() for c in data_colors[:8]]
 
 
-def _js_round(x: float) -> int:
-    """JavaScript's Math.round: the nearest integer, halves toward +infinity."""
-    r = math.floor(x)
-    return r + 1 if x - r >= 0.5 else r
+def _round_half_up(x: float) -> int:
+    """The nearest integer, a half rounded up (+0.5 -> +1, -0.5 -> 0)."""
+    return math.floor(x + 0.5)
 
 
 def _shade_color(hex_color: str, percent: float) -> str:
-    """A ThemeDataColor's Percent, as Desktop shades (desktop.min.js): every
-    channel moves |Percent| of the way toward white (Percent > 0) or black
-    (Percent < 0), rounded as Math.round does -- white 10% darker is #E6E6E6."""
+    """A ThemeDataColor's Percent: each channel moved |Percent| of the way to
+    white (Percent > 0) or black (Percent < 0), a half rounded up. OpenBI's
+    Desktop probe 33 measured it: white at -10% #E6E6E6 (229.5 -> 230), black
+    at +10% #1A1A1A (25.5 -> 26), #E81123 at -10% #D10F20 (31.5 -> 32)."""
     v = int(hex_color[1:7], 16)
     target, amount = (0, -percent) if percent < 0 else (255, percent)
-    chans = [max(0, min(255, ch + _js_round((target - ch) * amount)))
+    chans = [max(0, min(255, _round_half_up(ch + (target - ch) * amount)))
              for ch in ((v >> 16) & 255, (v >> 8) & 255, v & 255)]
     return "#{:02X}{:02X}{:02X}".format(*chans)
 
@@ -14820,8 +14824,15 @@ def _pbir_rewrite_sourcerefs(node, alias_for):
     return node
 
 
-# A visual group's layout mode: PBIR writes the name, classic the number
-# (Power BI Desktop's own enum, desktop.min.js: ScaleMode = 0, ScrollMode = 1).
+# A visual group's layout mode: PBIR writes a name, the classic layout a
+# number. The names and their meaning are Microsoft's published PBIR schema
+# (microsoft/json-schemas, MIT: visualContainer GroupLayoutMode -- ScaleMode,
+# "visuals are scaled as group resizes", then ScrollMode, "a scrollbar is
+# added"). The numbers: every one of the 103 groups in the 28 community
+# Desktop-saved files stores 0, and a group scales by default, so 0 is
+# ScaleMode. No file stores ScrollMode; 1 is inferred from the schema's order
+# and waits on a Desktop save of a group set to scroll (clean-room remediation
+# 2026-10-19, docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md).
 _PBIR_GROUP_MODES = {"ScaleMode": 0, "ScrollMode": 1}
 _PBIR_GROUP_MODE_NAMES = {v: k for k, v in _PBIR_GROUP_MODES.items()}
 
@@ -14891,8 +14902,8 @@ def _pbir_visual_to_container(vdata: dict) -> dict:
     if isinstance(group, dict):
         # A visual GROUP: the classic container carries singleVisualGroup and
         # no singleVisual (138 of 138 Desktop-authored groups in the corpus).
-        # PBIR names the mode ("ScaleMode"); classic stores Desktop's enum
-        # number (desktop.min.js: ScaleMode = 0, ScrollMode = 1).
+        # PBIR names the mode ("ScaleMode"); classic stores a number
+        # (_PBIR_GROUP_MODES).
         svg = {k: v for k, v in group.items() if k != "groupMode"}
         mode = group.get("groupMode")
         svg["groupMode"] = (_PBIR_GROUP_MODES.get(mode, 0) if isinstance(mode, str)
