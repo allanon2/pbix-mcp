@@ -36,13 +36,17 @@ PUSHED = {
     "dim_blank_row": "CALCULATE(COUNTROWS(D), FILTER(D, ISBLANK(D[Name])))",
     "dim_name": 'CALCULATE(COUNTROWS(D), FILTER(D, D[Name] = "a"))',
     "minx": 'CALCULATE(MINX(F, F[Value]), FILTER(F, F[Region] = "S"))',
+    "two_columns_and": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won" && F[Region] = "N"))',
+    "two_columns_or": 'CALCULATE(COUNTROWS(F), FILTER(F, F[Status] = "Lost" || F[Region] = "N"))',
+    "two_columns_not": 'CALCULATE(SUM(F[Value]), FILTER(F, NOT (F[Status] = "Won" && F[Region] = "S")))',
+    "three_columns": 'CALCULATE(SUMX(F, F[Value]), FILTER(F, F[Key] IN {1, 2} && (ISBLANK(F[Status]) || F[Region] = "N")))',
+    "column_vs_column": "CALCULATE(COUNTROWS(F), FILTER(F, F[Key] * 10 < F[Value]))",
 }
 NOT_PUSHED = {
     "row_context": 'SUMX(D, CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won")))',
     "row_context_same_table": 'SUMX(F, CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won")))',
     "second_argument": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won"), D[Name] = "a")',
     "modifier": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won"), ALL(F[Region]))',
-    "two_columns": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won" && F[Region] = "N"))',
     "other_table_aggregate": 'CALCULATE(COUNTROWS(D), FILTER(F, F[Status] = "Won"))',
     "measure_expression": 'CALCULATE([Total], FILTER(F, F[Status] = "Won"))',
     "filter_over_all": 'CALCULATE(SUM(F[Value]), FILTER(ALL(F), F[Status] = "Won"))',
@@ -107,9 +111,10 @@ def test_no_rewrite_where_the_two_could_differ(name, monkeypatch):
 def test_a_condition_that_fails_on_a_hidden_value(monkeypatch):
     # "abc" * 1 fails; the whole-table FILTER never sees it when Code is filtered to the numbers, so neither may the
     # pushed-down filter (over ALL(F[Code]) it did, and the measure went BLANK)
-    tables = {"F": {"columns": ["Code", "V"], "rows": [["12", 1], ["abc", 2], ["30", 4]]}}
-    expr = "CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5))"
-    for filters in ({"F.Code": ["12", "30"]}, {"F.Code": ["30"]}, {}):
+    tables = {"F": {"columns": ["Code", "V", "R"], "rows": [["12", 1, "N"], ["abc", 2, "S"], ["30", 4, "N"]]}}
+    for expr, filters in [(e, f) for e in ("CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5))",
+                                           'CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5 && F[R] = "N"))')
+                          for f in ({"F.Code": ["12", "30"]}, {"F.R": ["N"]}, {"F.Code": ["30"]}, {})]:
         got = []
         for pushdown in (False, True):
             with monkeypatch.context() as m:
@@ -117,9 +122,10 @@ def test_a_condition_that_fails_on_a_hidden_value(monkeypatch):
                     m.setattr(de.DAXEngine, "_pushdown_table_filter", lambda self, args, ctx: None)
                 ctx = de.DAXContext({k: dict(v) for k, v in tables.items()}, {"M": expr}, None, None, dict(filters), [])
                 got.append(de.DAXEngine().evaluate_measure("M", ctx))
-        assert got[0] == got[1], (filters, got)
-    ctx = de.DAXContext(tables, {"M": expr}, None, None, {"F.Code": ["12", "30"]}, [])
-    assert de.DAXEngine().evaluate_measure("M", ctx) == 5
+        assert got[0] == got[1], (expr, filters, got)
+    for expr in ("CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5))", 'CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5 && F[R] = "N"))'):
+        ctx = de.DAXContext(tables, {"M": expr}, None, None, {"F.R": ["N"]}, [])
+        assert de.DAXEngine().evaluate_measure("M", ctx) == 5
 
 
 def test_known_values():

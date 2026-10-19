@@ -8367,18 +8367,20 @@ class DAXEngine:
         return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
 
     def _pushdown_table_filter(self, args: list, ctx: DAXContext):
-        """``CALCULATE(<aggregate of T>, FILTER(T, <condition on one column of
-        T>))`` as ``CALCULATE(<aggregate of T>, KEEPFILTERS(FILTER(VALUES(T[c]),
-        <condition>)))``, or None when the rewrite would not give the same
+        """``CALCULATE(<aggregate of T>, FILTER(T, <condition on T's columns>))``
+        as ``CALCULATE(<aggregate of T>, KEEPFILTERS(FILTER(VALUES(T[c]),
+        <condition>)))`` -- ``SUMMARIZE(T, T[a], T[b])`` for a condition on
+        several columns -- or None when the rewrite would not give the same
         value.
 
         A whole-table FILTER applied as a filter builds and applies its rows
         one by one; the column filter takes them from the column's index. The
         two keep the same rows of T: FILTER's rows are T's rows visible in the
         outer context that satisfy the condition, and KEEPFILTERS keeps the
-        outer context and adds the condition. VALUES, not ALL: the condition
-        sees only the values FILTER's rows have, so one that fails on a hidden
-        value (text arithmetic on "abc") fails in both or in neither. They differ only in what ELSE is
+        outer context and adds the condition. VALUES and SUMMARIZE, not ALL:
+        the condition sees only the values (combinations) FILTER's rows have,
+        so one that fails on a hidden value (text arithmetic on "abc") fails
+        in both or in neither. They differ only in what ELSE is
         filtered (every column of T's expanded table, against one column), so
         the rewrite is made only where nothing else can be seen:
 
@@ -8390,7 +8392,7 @@ class DAXEngine:
         - there is no row context: under one, the table filter replaces the
           transitioned row's filters on T and the two differ
           (SUMX(T, CALCULATE(SUM(T[v]), FILTER(T, ...))));
-        - T is a model table, and the condition reads one column of T and
+        - T is a model table, and the condition reads T's columns and
           constants (_row_only_condition).
 
         The Artificial Intelligence Sample's [Revenue Won],
@@ -8430,10 +8432,14 @@ class DAXEngine:
         cond = parts[1].strip()
         row = {c: None for c in ctx.tables[table]['columns']}
         cols = self._row_only_condition(cond, table, row)
-        if not cols or len(cols) != 1:
+        if not cols:
             return None
         quoted = "'" + table.replace("'", "''") + "'"
-        return [args[0], f"KEEPFILTERS(FILTER(VALUES({quoted}[{cols[0]}]), {cond}))"]
+        if len(cols) == 1:
+            rows = f"VALUES({quoted}[{cols[0]}])"
+        else:
+            rows = f"SUMMARIZE({quoted}, {', '.join(f'{quoted}[{c}]' for c in cols)})"
+        return [args[0], f"KEEPFILTERS(FILTER({rows}, {cond}))"]
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
