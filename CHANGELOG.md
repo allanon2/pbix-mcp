@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.144] - 2026-10-19
+
+Three speed-ups raised by @allanon2's pull requests #199, #200 and #201, solved on our side as issues #202, #203 and #204. The answers do not change. On the Artificial Intelligence Sample, [Revenue Won] by product takes 0.08 s instead of 2.0 s. A year-to-date measure over a 276-cell matrix of countries by month (160,000 fact rows) takes 2.4 s instead of 5.6 s. The corpus census (1,508 measures in 31 files, run side by side with 0.9.143) changes only the 15 measures that use RAND or RANDBETWEEN. The Artificial Intelligence Sample takes 16.2 s instead of 29.8 s, Agents Performance 125.9 s instead of 144.0 s, and Sales Teams Quarterly Performance 18.6 s instead of 23.2 s.
+
+Verified before release:
+
+- **Tests:** full suite 6,764 passed, 5 xfailed; ruff clean; mypy at its limit.
+- **regress_check:** all 3,710 Desktop probes of the earlier batteries answer as on 0.9.143.
+- **Desktop:** `build_b200.py` has 756 probes (aggregates of a fact table and of its dimension, filtered by FILTER over text that differs in case only, blank text and numbers, and an orphan and a blank key that give the dimension its blank row, with no outer filter and under six). All 756 match Power BI Desktop 2.152 with the rewrite and without it. Six row-context probes match too; there the rewrite is not made.
+
+### Changed — CALCULATE(<aggregate of T>, FILTER(T, <condition>)) as a column filter (issue #203; PR #200, by @allanon2)
+
+**What was slow:** a whole-table FILTER as CALCULATE's filter was applied to T's expanded table one row at a time. The Artificial Intelligence Sample's `CALCULATE(SUMX(Opportunities, Opportunities[Value]), FILTER(Opportunities, Opportunities[Status] = "Won"))` walked 20,000 rows per cell.
+
+**The change:** where the result is provably the same, CALCULATE evaluates it as `KEEPFILTERS(FILTER(VALUES(T[c]), <condition>))`, or `SUMMARIZE(T, T[a], T[b])` when the condition reads several columns. Both keep exactly T's visible rows that satisfy the condition. The column filter takes those rows from the column's index. VALUES, not ALL: the condition sees only the values FILTER's rows have. The rewrite is made only when all of these hold:
+
+- the expression is a plain aggregate of T's own columns (SUM / AVERAGE / MIN / MAX / COUNT / COUNTA / DISTINCTCOUNT of `T[c]`, SUMX / AVERAGEX / MINX / MAXX / COUNTX of `(T, T[c])`, COUNTROWS(T));
+- FILTER is the only filter argument;
+- T is named in the model's spelling;
+- the condition reads only T's columns, constants and pure functions of them.
+
+**Deliberately not rewritten:**
+
+- **Under a row context.** There the table filter replaces the row's transition on T's expanded table; the column filter would keep it. Desktop: `SUMX(D, CALCULATE(SUM(F[Amt]), FILTER(F, F[Status] = "Won")))` is 792; the column filter would give 187.
+- **Case-sensitive functions in the condition** (EXACT, FIND, SUBSTITUTE, CONTAINSSTRINGEXACT): the kept values filter ignoring case.
+- **Measures, RELATED, CALCULATE inside the condition; ALL(T) or KEEPFILTERS(FILTER(...)) as the filter; a second filter argument; anything over the aggregate** (`SUM(T[c]) + 0`).
+
+`_row_only_condition` (#195's FILTER memo) and the new `_pushdown_table_filter` share one classifier, `_condition_columns`, each with its own list of functions.
+
+### Changed — In-set filters memoize the union of their values' row sets (issue #202; PR #199, by @allanon2)
+
+A filter that keeps several values of a column takes the union of their row sets from the column's index. The union depends only on the values. It is now kept per model, keyed by table, column and value set. The memo starts again once it holds more than 2,000,000 row indices. A year-to-date matrix asks for the same dates' rows for every country of a month: 5.6 s becomes 2.4 s.
+
+### Changed — In-set filters memoize each value's index spellings (issue #204; PR #201, by @allanon2)
+
+A filter value is looked up under each spelling it can be stored as: the text, a midnight date's ISO form, and the int / float forms of a number (#39, #42, #126). These are now derived once per value instead of on every call. The memo is keyed by type as well as value (`True == 1 == 1.0` in Python, each spelled its own way) and a float by its repr (`-0.0` and `0.0` are spelled apart). It holds at most 200,000 entries. 800 keys looked up 500 times: 0.74 s becomes 0.13 s.
+
+### Tests
+
+- `tests/test_calculate_filter_pushdown.py` (54): Desktop's answers with the rewrite and without it, and the rewrite's exact text. Also the 14 shapes it refuses, row contexts with Desktop's answers, and agreement in six filter contexts. On 0.9.143 all 54 fail because there is no rewrite; its 29 Desktop answers were already right there.
+- `tests/test_index_union_memo.py` (5): 3 fail on 0.9.143.
+- `tests/test_index_spellings_memo.py` (28): 27 fail on 0.9.143.
+
 ## [0.9.143] - 2026-10-19
 
 Clean-room remediation (#196; the work of PR #197, written by ComposeBI's session without opening the scripts, released as it was written): code that named Power BI Desktop's application scripts (`desktop.min.js`, `customVisualsHost.js`) as its source is replaced by behaviour derived from the community Desktop-saved files, Microsoft's published schemas and documentation, and OpenBI's own Desktop probes. The record, with every count and what is still open: `docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md`.

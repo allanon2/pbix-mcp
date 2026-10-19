@@ -1145,6 +1145,17 @@ _CALC_MODIFIER_RE = re.compile(
 _CALC_REMOVE_RE = re.compile(
     r"(?is)^\s*(?:ALL|ALLSELECTED|ALLEXCEPT|ALLNOBLANKROW|ALLCROSSFILTERED|"
     r"REMOVEFILTERS)\s*\(")
+# CALCULATE's expression when it is a plain aggregate of one table's own
+# columns (the filter pushdown, _pushdown_table_filter): SUM(T[c]) and its kin,
+# SUMX(T, T[c]) and its kin, COUNTROWS(T). The caller compares the tables.
+_PD_TABLE = r"(?:'(?:[^']|'')+'|[^\W\d][\w .]*?)"
+_PUSHDOWN_AGG_RE = re.compile(
+    r"(?is)^\s*(?:"
+    r"(?:SUM|AVERAGE|MIN|MAX|COUNT|COUNTA|DISTINCTCOUNT)\s*\(\s*(?P<t1>" + _PD_TABLE + r")\s*\[(?P<c1>[^\]]+)\]\s*\)"
+    r"|(?:SUMX|AVERAGEX|MINX|MAXX|COUNTX)\s*\(\s*(?P<t2>" + _PD_TABLE + r")\s*,\s*(?P<t3>" + _PD_TABLE
+    + r")\s*\[(?P<c3>[^\]]+)\]\s*\)"
+    r"|COUNTROWS\s*\(\s*(?P<t4>" + _PD_TABLE + r")\s*\)"
+    r")\s*$")
 _CALC_PRED_RE = re.compile(
     r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
 # Literal-first CALCULATE predicate: ``2024 = T[Year]`` (issue #39). The left
@@ -1603,6 +1614,60 @@ def _midnight_date(v):
             return None
         return m.date()
     return None
+
+
+def _index_spellings_uncached(v) -> tuple:
+    """The value-index-map keys an In-set filter value can match
+    (DAXContext._indices_for_values)."""
+    # the values are join spellings already (_jstr): 'None' is the
+    # blank key's sentinel and must not fold
+    keys = [str(v)]
+    # strict: no date-prefix aliasing (#42); midnight only (#126)
+    dv = _midnight_date(v)
+    if dv is not None:
+        keys.append(dv.isoformat())
+    # Numeric alternates (issue #39): the map is keyed str(cell), and
+    # str(2024) != str(2024.0), so an int literal missed every Double
+    # cell (and vice versa) -- CALCULATE(expr, T[Year]=2024) selected
+    # zero rows and went BLANK. Add both spellings; bools excluded so
+    # True never aliases 1.
+    if not isinstance(v, bool):
+        fv = None
+        if isinstance(v, (int, float)):
+            fv = float(v)
+        elif isinstance(v, str):
+            try:
+                fv = float(v)
+            except ValueError:
+                pass
+        if fv is not None:
+            keys.append(str(fv))
+            if fv.is_integer():
+                keys.append(str(int(fv)))
+    return tuple(keys)
+
+
+# A value's spellings depend on the value alone, and a query asks for the same
+# ones again and again: a relationship carries a dimension's filter to its
+# fact table as hundreds of text keys, each trying a date parse and a float()
+# (issue #204; PR #201, by @allanon2). Keyed by type too (True == 1 == 1.0
+# keep their own), a float by its repr (-0.0 == 0.0 are spelled apart), and
+# started again past its bound.
+_INDEX_SPELLINGS: dict = {}
+_INDEX_SPELLINGS_MAX = 200_000
+
+
+def _index_spellings(v) -> tuple:
+    key = (float, repr(v)) if type(v) is float else (type(v), v)
+    try:
+        hit = _INDEX_SPELLINGS.get(key)
+    except TypeError:            # an unhashable value
+        return _index_spellings_uncached(v)
+    if hit is None:
+        if len(_INDEX_SPELLINGS) >= _INDEX_SPELLINGS_MAX:
+            _INDEX_SPELLINGS.clear()
+        hit = _INDEX_SPELLINGS[key] = _index_spellings_uncached(v)
+    return hit
 
 
 _DP_PREFIX = 'dp:'
@@ -3873,52 +3938,52 @@ class DAXContext:
         if isinstance(allowed, _DatePartKeys):
             # Across a DatePartOnly join the keys ARE date parts (issue #126).
             dmap = self._date_part_index_map(tbl, col_idx)
-            found = [dmap[k] for k in allowed if k in dmap]
-            if not found:
-                return frozenset()
-            return found[0] if len(found) == 1 else frozenset().union(*found)
+            return self._index_union(dmap, [k for k in allowed if k in dmap], (id(tbl), 'dp', col_idx))
         values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
             else [allowed]
         vmap = self._value_index_map(tbl, col_idx)
-        keys = set()
+        keys: set = set()
         for v in values:
-            # the values are join spellings already (_jstr): 'None' is the
-            # blank key's sentinel and must not fold
-            keys.add(str(v))
-            # strict: no date-prefix aliasing (#42); midnight only (#126)
-            dv = _midnight_date(v)
-            if dv is not None:
-                keys.add(dv.isoformat())
-            # Numeric alternates (issue #39): the map is keyed str(cell), and
-            # str(2024) != str(2024.0), so an int literal missed every Double
-            # cell (and vice versa) — CALCULATE(expr, T[Year]=2024) selected
-            # zero rows and went BLANK. Add both spellings; bools excluded so
-            # True never aliases 1.
-            if not isinstance(v, bool):
-                fv = None
-                if isinstance(v, (int, float)):
-                    fv = float(v)
-                elif isinstance(v, str):
-                    try:
-                        fv = float(v)
-                    except ValueError:
-                        pass
-                if fv is not None:
-                    keys.add(str(fv))
-                    if fv.is_integer():
-                        keys.add(str(int(fv)))
-        found = [vmap[k] for k in keys if k in vmap]
-        if not found:
+            keys.update(_index_spellings(v))
+        return self._index_union(vmap, [k for k in keys if k in vmap], (id(tbl), 'v', col_idx))
+
+    # The row indices the union memo may hold per model in all; past it the
+    # memo starts again.
+    _UNION_MEMO_MAX_ROWS = 2_000_000
+
+    def _index_union(self, index_map: dict, keys: list, where: tuple) -> frozenset:
+        """The rows of ``index_map``'s ``keys`` together. A union of several
+        keys is memoized on the model-wide cache by the keys it unites, which
+        is all it depends on: a query asks for the same one again and again --
+        a year-to-date measure over a matrix of countries by month filters the
+        fact table to the same dates for every country of a month (issue #202;
+        PR #199, by @allanon2)."""
+        if not keys:
             return frozenset()
-        if len(found) == 1:
-            return found[0]
+        if len(keys) == 1:
+            hit1: frozenset = index_map[keys[0]]
+            return hit1
+        memo = self._filter_idx_cache.get('__index_unions__')
+        if memo is None:
+            memo = self._filter_idx_cache['__index_unions__'] = {}
+        mkey = (where, frozenset(keys))
+        held_set: frozenset | None = memo.get(mkey)
+        if held_set is not None:
+            return held_set
         # Accumulate into ONE mutable set. frozenset().union(*found) allocates a
         # new frozenset per operand, which is the dominant cost when a date
         # filter carries ~1000 single-value index sets.
         acc: set = set()
-        for f in found:
-            acc |= f
-        return frozenset(acc)
+        for k in keys:
+            acc |= index_map[k]
+        hit = frozenset(acc)
+        held = memo.get('__rows__', 0) + len(hit)
+        if held > self._UNION_MEMO_MAX_ROWS:
+            memo.clear()
+            held = len(hit)
+        memo[mkey] = hit
+        memo['__rows__'] = held
+        return hit
 
     def _typed_index_map(self, tbl: dict, col_idx: int) -> dict:
         """``{value key: frozenset(row indices)}`` for one column, keyed as DAX
@@ -7540,6 +7605,9 @@ class DAXEngine:
         args = self._split_args(args_str)
         if not args:
             return None
+        pushed = self._pushdown_table_filter(args, ctx)
+        if pushed is not None:
+            args = pushed
 
         base_expr = args[0].strip()
         new_ctx = ctx
@@ -8325,6 +8393,75 @@ class DAXEngine:
                 continue
             drop |= {k for k in after if k.split('.', 1)[0] == table and k not in written}
         return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
+
+    def _pushdown_table_filter(self, args: list, ctx: DAXContext):
+        """``CALCULATE(<aggregate of T>, FILTER(T, <condition on T's columns>))``
+        as ``CALCULATE(<aggregate of T>, KEEPFILTERS(FILTER(VALUES(T[c]),
+        <condition>)))`` (``SUMMARIZE(T, T[a], T[b])`` for a condition on
+        several columns), or None where the two could differ (issue #203; PR
+        #200, by @allanon2).
+
+        A whole-table FILTER applied as a filter builds and applies its rows
+        one by one (the Artificial Intelligence Sample's [Revenue Won], over
+        20,000 rows, issue #195); the column filter takes them from the
+        column's index. Both keep the same rows of T: FILTER's are T's visible
+        rows that satisfy the condition, and KEEPFILTERS keeps the outer
+        context and adds the condition. VALUES / SUMMARIZE, not ALL: the
+        condition sees only the values FILTER's rows have, so one that fails
+        on a hidden value fails in both or neither. They differ only in what
+        else is filtered (T's expanded table against its columns), so the
+        rewrite is made only where nothing else is seen:
+
+        - the expression is a plain aggregate of T's own columns, which reads
+          T's rows and no filter state;
+        - FILTER is the only filter argument;
+        - there is no row context (a transitioned row's filters on T would be
+          replaced by the table filter, not by the column filter);
+        - T is a model table named in the model's spelling, and the condition
+          reads T's columns and constants, or pure functions of them, never
+          case-sensitive ones (the kept values filter ignoring case)."""
+        if len(args) != 2 or ctx._outer_ctx is not None or getattr(ctx, '_current_row', None) is not None:
+            return None
+        wrapper, inner = self._peel_call(re.sub(r"(?is)^\s*FILTER\s+\(", "FILTER(", args[1]), ('FILTER',))
+        if wrapper != 'FILTER':
+            return None
+        parts = self._split_args(inner)
+        if len(parts) != 2:
+            return None
+        tref = parts[0].strip()
+        if tref.startswith("'"):
+            if not (len(tref) > 1 and tref.endswith("'")):
+                return None
+            table = tref[1:-1].replace("''", "'")
+        elif re.fullmatch(r"[^\W\d][\w .]*", tref):
+            table = tref
+        else:
+            return None
+        if table not in ctx.tables:      # the model's own spelling only
+            return None
+        m = _PUSHDOWN_AGG_RE.match(args[0])
+        if not m:
+            return None
+        for ref in (m.group(g) for g in ('t1', 't2', 't3', 't4')):
+            if ref is None:
+                continue
+            ref = ref.strip()
+            name = ref[1:-1].replace("''", "'") if ref.startswith("'") else ref
+            if ctx.model_table(name) != table:
+                return None
+        for col in (m.group(g) for g in ('c1', 'c3')):
+            if col is not None and (col.strip() in ctx.measures
+                                    or ctx._find_col_idx(ctx.tables[table]['columns'], col.strip()) < 0):
+                return None
+        cond = parts[1].strip()
+        cols = self._condition_columns(cond, table, {c: None for c in ctx.tables[table]['columns']},
+                                       self._PUSHDOWN_WORDS)
+        if not cols:
+            return None
+        quoted = "'" + table.replace("'", "''") + "'"
+        rows = (f"VALUES({quoted}[{cols[0]}])" if len(cols) == 1 else
+                f"SUMMARIZE({quoted}, {', '.join(f'{quoted}[{c}]' for c in cols)})")
+        return [args[0], f"KEEPFILTERS(FILTER({rows}, {cond}))"]
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
@@ -9792,11 +9929,23 @@ class DAXEngine:
         r"""|&&|\|\||<>|<=|>=|[=<>+\-*/&(),{}]|[A-Za-z_]\w*""")
     _ROW_ONLY_WORDS = frozenset({'AND', 'OR', 'NOT', 'IN', 'TRUE', 'FALSE', 'BLANK', 'ISBLANK'})
 
+    # The pushdown's condition may also call functions whose value is a fixed
+    # function of their arguments (no context, time or randomness) -- but not
+    # the case-sensitive ones (EXACT, FIND, SUBSTITUTE, CONTAINSSTRINGEXACT):
+    # the values kept are applied as a filter, which matches text ignoring case.
+    _PUSHDOWN_WORDS = _ROW_ONLY_WORDS | frozenset({
+        'VALUE', 'LEFT', 'RIGHT', 'MID', 'LEN', 'UPPER', 'LOWER', 'TRIM', 'CONCATENATE', 'SEARCH',
+        'CONTAINSSTRING', 'ABS', 'INT', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'TRUNC', 'MOD', 'SIGN', 'DIVIDE',
+        'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND', 'IF', 'ISERROR'})
+
     def _row_only_condition(self, cond_expr: str, table: str, row_item: dict):
         """The columns of ``row_item`` a FILTER condition reads, when that is
         all it reads -- Table[Column] of the iterated table, constants,
         comparisons, IN { }, AND / OR / NOT, ISBLANK, arithmetic -- else None.
         Such a condition has one value per combination of those columns."""
+        return self._condition_columns(cond_expr, table, row_item, self._ROW_ONLY_WORDS)
+
+    def _condition_columns(self, cond_expr: str, table: str, row_item: dict, words: frozenset):
         cols: list = []
         lower = {k.lower(): k for k in row_item if not k.startswith('__')}
         pos = 0
@@ -9823,7 +9972,7 @@ class DAXEngine:
                     cols.append(key)
                 continue
             if tok[0].isalpha() or tok[0] == '_':
-                if tok.upper() not in self._ROW_ONLY_WORDS:
+                if tok.upper() not in words:
                     return None
             # operators and punctuation
         return cols

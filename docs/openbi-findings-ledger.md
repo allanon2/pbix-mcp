@@ -40,12 +40,17 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-19 (0.9.143): docs 1-66 and GitHub issues/PRs #1-#197 are
-closed; #198 is open.** 0.9.143 closes #196 with PR #197's clean-room
-re-derivation (ThemeDataColor, group layout mode, aggregate names, field-well
-summarization) of the pieces that cited Desktop's application scripts. #198:
-the 0.9.138 collation used Desktop's engine binary; to be re-derived
-clean-room.
+**Updated 2026-10-19 (0.9.144): docs 1-66 and GitHub issues/PRs #1-#204 are
+closed except #198.** 0.9.144 closes #202, #203 and #204: @allanon2's PRs
+#199 (In-set union memo), #200 (CALCULATE filter pushdown) and #201 (index
+spellings memo), solved on our side; same answers, verified against Desktop
+(build_b200.py, 756 probes). #198: the 0.9.138 collation used Desktop's
+engine binary; to be re-derived clean-room.
+
+As of 0.9.143, docs 1-66 and GitHub issues/PRs #1-#197 were closed; #198 was
+open. 0.9.143 closes #196 with PR #197's clean-room re-derivation
+(ThemeDataColor, group layout mode, aggregate names, field-well summarization)
+of the pieces that cited Desktop's application scripts.
 
 As of 0.9.142, docs 1-66 and GitHub issues/PRs #1-#195 were closed. 0.9.142 closes #195 (ComposeBI's): FILTER with a condition on the
 row's own columns evaluates it once per combination, and SUMX / COUNTX /
@@ -526,6 +531,13 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #202, #203, #204** (PRs #199, #200, #201 by @allanon2) -- CLOSED
+  (0.9.144). In-set filters memoize their unions and each value's spellings;
+  CALCULATE(<aggregate of T>, FILTER(T, <condition>)) runs as a column filter
+  where provably the same (no row context, one filter argument, T's own
+  columns, no case-sensitive functions). Revenue Won 2.0 s -> 0.08 s.
+  Desktop: build_b200.py (756). Regression: tests/test_calculate_filter_pushdown.py,
+  tests/test_index_union_memo.py, tests/test_index_spellings_memo.py.
 - **GH #195** -- CLOSED (0.9.142). FILTER(table, column = constant) built a row
   context per row; it now evaluates a row-only condition once per column
   combination, and iterators read a plain column's cell. Same values (forced
