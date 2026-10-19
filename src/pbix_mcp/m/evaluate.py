@@ -22,10 +22,12 @@ from .values import ANY, CellError, Function, MError, MType, Record, Table, Thun
 Resolver = Callable[[str], Any]
 
 
-def evaluate(source: str | ast.Node, *, resolve: Optional[Resolver] = None, culture: str = "en-US") -> Any:
-    """The value of an M expression. A section document evaluates to a record of its members."""
+def evaluate(source: str | ast.Node, *, resolve: Optional[Resolver] = None, culture: str = "en-US",
+             files: Optional[Callable[[str], bytes]] = None) -> Any:
+    """The value of an M expression. A section document evaluates to a record of its members. ``files`` reads a
+    file File.Contents names (the caller's mapping; it raises sources.UnmappedSource for one it doesn't map)."""
     tree = parse_document(source) if isinstance(source, str) else source
-    ev = _Evaluator(resolve, culture)
+    ev = _Evaluator(resolve, culture, files)
     if isinstance(tree, ast.Section):
         scope = _Scope({}, None)
         for m in tree.members:
@@ -69,9 +71,10 @@ class _Scope:
 
 
 class _Evaluator:
-    def __init__(self, resolve: Optional[Resolver], culture: str):
+    def __init__(self, resolve: Optional[Resolver], culture: str, files: Optional[Callable[[str], bytes]] = None):
         self.resolve = resolve
         self.culture = culture
+        self.files = files
 
     def thunk(self, node: ast.Node, scope: _Scope) -> Thunk:
         return Thunk(lambda: self.eval(node, scope))

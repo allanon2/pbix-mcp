@@ -71,7 +71,7 @@ class TestLanguage:
 
     def test_unknown_names_are_errors_and_resolve_finds_queries(self):
         with pytest.raises(MError, match="wasn't recognized"):
-            evaluate("Excel.Workbook")
+            evaluate("Web.Contents")
         assert evaluate("Other + 1", resolve=lambda name: {"Other": 41}[name]) == 42
 
     def test_section_documents(self):
@@ -159,11 +159,17 @@ class TestTables:
         t = evaluate('Table.Combine({#table({"a", "b"}, {{1, 2}}), #table({"b", "c"}, {{3, 4}})})')
         assert t.columns == ["a", "b", "c"] and t.rows == [[1, 2, None], [None, 3, 4]]
 
-    def test_library_is_exactly_tier_one(self):
-        assert LIBRARY_NAMES == {
+    def test_library_by_tier(self):
+        from pbix_mcp.m import TIERS
+        tier = lambda n: {k for k, v in TIERS.items() if v == n}  # noqa: E731
+        assert tier(1) == {
             "Binary.FromText", "BinaryEncoding.Base64", "BinaryEncoding.Hex", "Binary.Decompress", "Compression.GZip",
             "Compression.Deflate", "Json.Document", "Table.FromRows", "#table", "Table.TransformColumnTypes",
             "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type", "#infinity", "#nan"}
+        assert {"Table.RenameColumns", "Table.RemoveColumns", "Table.SelectColumns", "Table.AddColumn",
+                "Table.PromoteHeaders", "Text.BeforeDelimiter"} <= tier(2)
+        assert {"File.Contents", "Csv.Document", "Excel.Workbook", "Parquet.Document"} <= tier(3)
+        assert LIBRARY_NAMES == set(TIERS)
         # The enumerations' values, from Microsoft's reference pages.
         assert [evaluate(x) for x in ("BinaryEncoding.Base64", "BinaryEncoding.Hex", "Compression.GZip",
                                       "Compression.Deflate")] == [0, 1, 0, 1]

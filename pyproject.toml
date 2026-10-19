@@ -40,6 +40,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Power Query sources a refresh reads (pbix_mcp.m): Excel.Workbook (.xlsx) and Parquet.Document.
+# openpyxl 3.1.5 (MIT; with et-xmlfile 2.0.0, MIT), pyarrow 25.0.1 (Apache-2.0).
+sources = [
+    "openpyxl==3.1.5",
+    "pyarrow==25.0.1",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
