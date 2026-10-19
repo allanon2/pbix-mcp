@@ -110,7 +110,7 @@ _FIRST = 3
 _FIRST_VISUAL_ROLES = {"card": {"Values"}, "matrix": {"Values"}, "pivotTable": {"Values"}}
 
 
-def _implicit_aggregate(visual_type: str, role: str, data_type, summarize_by, data_category,
+def _implicit_aggregate(visual_type: str, role: str | None, data_type, summarize_by, data_category,
                         prop: str):
     """The (code, name) a bare column in ``role`` of ``visual_type`` is summarized
     by, or None to keep it bare. ``data_type`` is the model type ("Int64",

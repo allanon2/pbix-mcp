@@ -40,8 +40,14 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-19 (0.9.142): docs 1-66 and GitHub issues/PRs #1-#195 are
-closed.** 0.9.142 closes #195 (ComposeBI's): FILTER with a condition on the
+**Updated 2026-10-19 (0.9.143): docs 1-66 and GitHub issues/PRs #1-#197 are
+closed; #198 is open.** 0.9.143 closes #196 with PR #197's clean-room
+re-derivation (ThemeDataColor, group layout mode, aggregate names, field-well
+summarization) of the pieces that cited Desktop's application scripts. #198:
+the 0.9.138 collation used Desktop's engine binary; to be re-derived
+clean-room.
+
+As of 0.9.142, docs 1-66 and GitHub issues/PRs #1-#195 were closed. 0.9.142 closes #195 (ComposeBI's): FILTER with a condition on the
 row's own columns evaluates it once per combination, and SUMX / COUNTX /
 COUNTAX / AVERAGEX / MAXX read a plain column's cell -- the Artificial
 Intelligence Sample's [Count of Won] by product 2.65 s -> 0.19 s.
