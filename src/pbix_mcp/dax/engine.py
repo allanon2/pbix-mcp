@@ -8454,7 +8454,8 @@ class DAXEngine:
         rows: 6 to 15 times faster per call, the same values."""
         if len(args) != 2 or ctx._outer_ctx is not None or getattr(ctx, '_current_row', None) is not None:
             return None
-        wrapper, inner = self._peel_call(args[1], ('FILTER',))
+        # FILTER ( T, ... ), as a formatter writes it, too
+        wrapper, inner = self._peel_call(re.sub(r"(?is)^\s*FILTER\s+\(", "FILTER(", args[1]), ('FILTER',))
         if wrapper != 'FILTER':
             return None
         parts = self._split_args(inner)
