@@ -150,40 +150,50 @@ def _add_column(table: Any, name: Any, generator: Any, column_type: Any = None) 
 
 
 def _promote_headers(table: Any, options: Any = None) -> Table:
-    """The first row's text and number values become the column names (Microsoft's reference: "By default, only
-    text or number values are promoted"); the rest keep their ColumnN name. Options aren't supported yet, nor are
-    names the reference doesn't settle: an empty or repeated one is an error."""
+    """The first row's values become the column names: text and numbers by default (Microsoft's reference), any
+    scalar with PromoteAllScalars, written as Text.From writes it; a null, or a value not promoted, keeps its
+    ColumnN name. As a Desktop refresh shows (#104's probes): an empty name stays empty, and a name already taken
+    gets "_<n>" with one counter across the table ("a", "a", "a_1" become a, a_1, a_1_2; "a", "a", "b", "a"
+    become a, a_1, b, a_2)."""
     t = _need_table(table, "Table.PromoteHeaders")
+    all_scalars = False
     if options is not None:
         if not isinstance(options, Record) or any(k not in ("PromoteAllScalars", "Culture") for k in options.fields):
             raise _error("Table.PromoteHeaders: only the PromoteAllScalars and Culture options are known.")
-        if options["PromoteAllScalars"] if "PromoteAllScalars" in options else False:
-            raise _error("Table.PromoteHeaders: PromoteAllScalars isn't supported yet.")
+        all_scalars = bool(options["PromoteAllScalars"]) if "PromoteAllScalars" in options else False
+        culture = options["Culture"] if "Culture" in options else None
+        if culture not in (None, "en-US"):
+            raise _error(f"Table.PromoteHeaders: the culture {culture!r} isn't supported yet.")
     if not t.rows:
         return Table(list(t.columns), [], list(t.types))
     from .library import to_text
-    names = []
+    first = []
     for i, cell in enumerate(t.rows[0]):
         v = force(cell)
         if isinstance(v, str):
-            name = v
-        elif isinstance(v, (int, float)) and not isinstance(v, bool):
-            name = to_text(v, "en-US")
+            first.append(v)
+        elif v is not None and (all_scalars and kind_of(v) in _SCALARS or
+                                isinstance(v, (int, float)) and not isinstance(v, bool)):
+            first.append(to_text(v, "en-US"))
         else:
-            name = t.columns[i]
-        if name == "":
-            raise _error("Table.PromoteHeaders: an empty header isn't supported yet.")
+            first.append(t.columns[i])
+    names: list[str] = []
+    counter = 0
+    for name in first:
+        while name in names:
+            counter += 1
+            name = f"{name}_{counter}"
         names.append(name)
-    if len(set(names)) != len(names):
-        dup = next(n for n in names if names.count(n) > 1)
-        raise _error(f"Table.PromoteHeaders: the header {dup!r} repeats; how it is renamed isn't known yet.")
     return Table(names, [list(r) for r in t.rows[1:]], [ANY] * len(names))
+
+
+_SCALARS = ("number", "text", "logical", "date", "datetime", "datetimezone", "time", "duration")
 
 
 def _before_delimiter(text: Any, delimiter: Any, index: Any = None) -> Any:
     """The text before the delimiter's index-th occurrence (0: the first), counted from the start or, with
-    {index, RelativePosition.FromEnd}, from the end (Microsoft's reference). Not found isn't settled by the
-    reference: an error until Desktop shows it."""
+    {index, RelativePosition.FromEnd}, from the end (Microsoft's reference). When there aren't that many
+    occurrences, the whole text, as a Desktop refresh shows (#104)."""
     if text is None:
         return None
     if not isinstance(text, str) or not isinstance(delimiter, str) or delimiter == "":
@@ -205,7 +215,7 @@ def _before_delimiter(text: Any, delimiter: Any, index: Any = None) -> Any:
         positions.append(i)
         start = i + len(delimiter)
     if len(positions) <= n:
-        raise _error("Text.BeforeDelimiter: the delimiter wasn't found; what Desktop returns then isn't known yet.")
+        return text
     pos = positions[n] if where == FROM_START else positions[len(positions) - 1 - n]
     return text[:pos]
 

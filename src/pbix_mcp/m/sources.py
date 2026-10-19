@@ -16,19 +16,20 @@ the ``pbix-mcp[sources]`` extra.
 """
 from __future__ import annotations
 
-import csv
 import datetime as dt
 import hashlib
 import io
 import posixpath
+import re
 import threading
 import xml.etree.ElementTree as ET
 import zipfile
 from collections import OrderedDict
+from decimal import Decimal
 from functools import partial
 from typing import Any, Callable, Optional
 
-from .values import ANY, Function, LazyTable, MError, MType, Record, Table, force, kind_of
+from .values import ANY, CellError, Function, LazyTable, MError, MType, Record, Table, force, kind_of
 
 # Enumerations, from Microsoft's reference pages.
 QUOTE_NONE, QUOTE_CSV = 0, 1
@@ -82,9 +83,7 @@ def _csv_document(source: Any, columns: Any = None, delimiter: Any = None, extra
         columns, delimiter, encoding, extra = get("Columns"), get("Delimiter"), get("Encoding"), get("ExtraValues")
         quote = QUOTE_CSV if get("QuoteStyle") is None else get("QuoteStyle")
         style = CSV_QUOTE_AFTER_DELIMITER if get("CsvStyle") is None else get("CsvStyle")
-    if quote == QUOTE_NONE:
-        raise _error("Csv.Document: QuoteStyle.None isn't supported until Desktop shows how quotes inside a row read.")
-    if quote != QUOTE_CSV or style not in (CSV_QUOTE_AFTER_DELIMITER, CSV_QUOTE_ALWAYS):
+    if quote not in (QUOTE_NONE, QUOTE_CSV) or style not in (CSV_QUOTE_AFTER_DELIMITER, CSV_QUOTE_ALWAYS):
         raise _error("Csv.Document: unknown QuoteStyle or CsvStyle.")
     if style == CSV_QUOTE_ALWAYS:
         raise _error("Csv.Document: CsvStyle.QuoteAlways isn't supported yet.")
@@ -92,43 +91,75 @@ def _csv_document(source: Any, columns: Any = None, delimiter: Any = None, extra
         delimiter = ","
     if not (isinstance(delimiter, str) and len(delimiter) == 1):
         raise _error("Csv.Document: only a single-character delimiter is supported yet.")
-    if extra is not None and not (type(extra) is int and extra in (EXTRA_ERROR, EXTRA_IGNORE)):
-        raise _error("Csv.Document: ExtraValues.List isn't supported yet.")
+    if extra is not None and not (type(extra) is int and extra in (EXTRA_LIST, EXTRA_ERROR, EXTRA_IGNORE)):
+        raise _error("Csv.Document: unknown ExtraValues.")
     text = _decode(source, 65001 if encoding is None else encoding)
-    # strict: an unterminated quote, or text after a closing quote, is an error -- the reference doesn't say what
-    # either reads as.
-    reader = csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, quotechar='"', doublequote=True,
-                        strict=True)
-    rows: list[list[str]] = []
-    try:
-        for r in reader:
-            if not r:
-                raise _error(f"Csv.Document: line {reader.line_num} is blank; how Desktop reads a blank line isn't "
-                             "known yet.", "DataFormat.Error")
-            rows.append(list(r))
-    except csv.Error as e:
-        raise _error(f"Csv.Document: {e} (line {reader.line_num})", "DataFormat.Error") from None
+    rows = _csv_records(text, delimiter, quote == QUOTE_CSV)
     names = _csv_columns(columns, rows)
     width = len(names)
-    out = []
-    for r in rows:
-        if len(r) > width and extra == EXTRA_ERROR:
-            raise _error("Csv.Document: a row has more values than columns (ExtraValues.Error).", "DataFormat.Error")
-        # A short row: the reference's text says null, its example shows "" -- refused until measured.
-        if len(r) < width:
-            raise _error("Csv.Document: a row has fewer values than columns; what Desktop fills them with isn't "
-                         "known yet.", "DataFormat.Error")
-        out.append(r[:width])
+    # A Desktop refresh pads a short row with "" and drops a long row's extra values, whatever ExtraValues says
+    # (#104's D3 probes: Error and List read like Ignore, with Columns given or not).
+    out = [(r + [""] * (width - len(r)))[:width] for r in rows]
     return Table(names, out, [ANY] * width)
 
 
+def _csv_records(text: str, delimiter: str, quoted_breaks: bool) -> list[list[str]]:
+    """Records as a Desktop refresh reads them (#104's D3 probes). A quote opens a quoted value only at the start
+    of a value (' "x" ' is read as written); inside it "" is a quote; text after the closing quote joins the value
+    ('"x"y' is xy). With QuoteStyle.Csv a line break inside quotes is part of the value, and a quote never closed
+    runs to the end of the text, line breaks and all; with QuoteStyle.None every line break ends the record,
+    closing the quote. CR LF, CR and LF each end a record; a blank line is a record of one empty value; a line
+    break at the very end doesn't start another."""
+    records: list[list[str]] = []
+    fields: list[str] = []
+    value: list[str] = []
+    i, n = 0, len(text)
+    started = False                          # anything read since the last record ended
+    while i < n:
+        c = text[i]
+        if c == '"' and not value:
+            # A quoted value.
+            i += 1
+            started = True
+            while i < n:
+                c = text[i]
+                if c == '"':
+                    if i + 1 < n and text[i + 1] == '"':
+                        value.append('"')
+                        i += 2
+                        continue
+                    i += 1
+                    break
+                if c in "\r\n" and not quoted_breaks:
+                    break
+                value.append(c)
+                i += 1
+            continue
+        if c == delimiter:
+            fields.append("".join(value))
+            value = []
+            started = True
+            i += 1
+            continue
+        if c in "\r\n":
+            fields.append("".join(value))
+            records.append(fields)
+            fields, value, started = [], [], False
+            i += 2 if c == "\r" and i + 1 < n and text[i + 1] == "\n" else 1
+            continue
+        value.append(c)
+        started = True
+        i += 1
+    if started or value or fields:
+        fields.append("".join(value))
+        records.append(fields)
+    return records
+
+
 def _csv_columns(columns: Any, rows: list[list[str]]) -> list[str]:
+    """Columns: a count, names, or (none given) the first record's width, as a Desktop refresh counts them."""
     if columns is None:
-        widths = {len(r) for r in rows}
-        if len(widths) > 1:
-            raise _error("Csv.Document: rows have different lengths and no Columns is given; how Desktop counts "
-                         "them isn't known yet.", "DataFormat.Error")
-        return [f"Column{i + 1}" for i in range(widths.pop() if widths else 0)]
+        return [f"Column{i + 1}" for i in range(len(rows[0]) if rows else 0)]
     if type(columns) is int and columns >= 0:
         return [f"Column{i + 1}" for i in range(columns)]
     if isinstance(columns, list) and all(isinstance(force(c), str) for c in columns):
@@ -147,9 +178,12 @@ def _decode(source: Any, encoding: Any) -> str:
     if type(encoding) is not int or encoding not in ENCODINGS:
         raise _error(f"The text encoding {encoding!r} isn't supported yet.")
     name = ENCODINGS[encoding]
-    bom = {"utf-8": b"\xef\xbb\xbf", "utf-16-le": b"\xff\xfe", "utf-16-be": b"\xfe\xff"}.get(name)
-    if bom and source.startswith(bom):
-        source = source[len(bom):]
+    # A byte order mark wins over the encoding given: a Desktop refresh reads a UTF-16 file given 65001, and a
+    # UTF-8 one given 1252, by their marks (#104's D3 probes).
+    for bom, by in ((b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
+        if source.startswith(bom):
+            source, name = source[len(bom):], by
+            break
     try:
         return str(source.decode(name))
     except UnicodeDecodeError:
@@ -168,38 +202,40 @@ _SHEETS_LOCK = threading.Lock()
 
 
 def _excel_workbook(workbook: Any, use_headers: Any = None, delay_types: Any = None) -> Table:
-    """The workbook's sheets and tables as a navigation table (Name, Data, Item, Kind, Hidden): each sheet's cells
-    over its stored dimension (the reference: "the dimensions metadata from the file" unless InferSheetDimensions),
-    each table's body under its header names; cached values. A Data table is read when first used, and kept by the
-    workbook's content (M values never change)."""
+    """The workbook's sheets, then its tables, as a navigation table (Name, Data, Item, Kind, Hidden), in the
+    order a Desktop refresh lists them (#104's D3 probes). A sheet's cells span its stored dimension's columns
+    (the reference: "the dimensions metadata from the file") and its rows down to the last row storing a cell,
+    or, with InferSheetDimensions, the cells holding values; a table's rows are its body, a totals row included.
+    Each cell is the value stored in the file, a formula's cached one: a date-formatted cell is its number, as a
+    Desktop refresh reads it; an error value (#DIV/0!) is a failed cell. With useHeaders the first row becomes the
+    column names, its values unconverted. A Data table is read when first used, and kept by the workbook's
+    content (M values never change)."""
+    infer = False
     if isinstance(use_headers, Record):
         options = use_headers
         if any(k not in ("UseHeaders", "DelayTypes", "InferSheetDimensions") for k in options.fields):
             raise _error("Excel.Workbook: unknown options.")
-        if "InferSheetDimensions" in options and options["InferSheetDimensions"]:
-            raise _error("Excel.Workbook: InferSheetDimensions isn't supported yet.")
+        infer = bool(options["InferSheetDimensions"]) if "InferSheetDimensions" in options else False
         use_headers = options["UseHeaders"] if "UseHeaders" in options else None
         delay_types = options["DelayTypes"] if "DelayTypes" in options else None
-    if use_headers not in (None, False):
-        raise _error("Excel.Workbook: useHeaders converts numbers and dates by culture (Microsoft's reference); it "
-                     "isn't supported yet. Use Table.PromoteHeaders.")
+    if use_headers not in (None, False, True):
+        raise _error("Excel.Workbook: useHeaders must be a logical.")
     if not delay_types:
         raise _error("Excel.Workbook: column types without delayTypes aren't supported yet (Desktop writes true).")
     if not isinstance(workbook, bytes):
         raise _error(f"Excel.Workbook needs binary, not {kind_of(workbook)}.")
-    try:
-        import openpyxl  # noqa: F401
-    except ImportError:
-        raise _error("Excel.Workbook needs pbix-mcp's sources extra (openpyxl).") from None
     digest = hashlib.sha256(workbook).hexdigest()
     sheets, tables = _workbook_parts(workbook)
+    headers = bool(use_headers)
     rows: list[list[Any]] = []
-    for name, state in sheets:
-        rows.append([name, LazyTable(_cached(digest, "sheet", name, partial(_sheet, workbook, name))), name,
-                     "Sheet", state != "visible"])
+    for name, state, part in sheets:
+        load = partial(_sheet, workbook, part, infer, headers)
+        rows.append([name, LazyTable(_cached(digest, f"sheet:{infer}:{headers}", name, load)), name, "Sheet",
+                     state != "visible"])
+    for name, _, part in sheets:
         for t in tables.get(name, []):
-            rows.append([t["name"], LazyTable(_cached(digest, "table", t["name"], partial(_table, workbook, name, t))),
-                         t["name"], "Table", False])
+            load = partial(_table, workbook, part, t)
+            rows.append([t["name"], LazyTable(_cached(digest, "table", t["name"], load)), t["name"], "Table", False])
     return Table(list(_NAV), rows, [ANY] * len(_NAV))
 
 
@@ -220,9 +256,9 @@ def _cached(digest: str, kind: str, name: str, load: Callable[[], Table]) -> Cal
     return get
 
 
-def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str]], dict[str, list[dict]]]:
-    """The sheets (name, state) in workbook order, and each sheet's tables (name, ref, header and totals rows,
-    column names), read from the package's own parts."""
+def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str, str]], dict[str, list[dict]]]:
+    """The sheets (name, state, part) in workbook order, and each sheet's tables (name, ref, header and totals
+    rows, column names) in the sheet's relationship order, read from the package's own parts."""
     try:
         z = zipfile.ZipFile(io.BytesIO(workbook))
         wb = ET.fromstring(z.read("xl/workbook.xml"))
@@ -232,10 +268,10 @@ def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str]], dict[str, l
     sheets, tables = [], {}
     for s in wb.iterfind("m:sheets/m:sheet", _NS):
         name, state = s.get("name") or "", s.get("state") or "visible"
-        sheets.append((name, state))
         target = rels.get(s.get(f"{{{_NS['r']}}}id") or "")
         if not target:
             continue
+        sheets.append((name, state, target))
         found = []
         for rid, part in _rels(z, target).items():
             if not part.startswith("xl/tables/"):
@@ -262,97 +298,160 @@ def _rels(z: zipfile.ZipFile, part: str) -> dict[str, str]:
     return out
 
 
-def _cells(workbook: bytes, sheet: str, bounds: Optional[tuple[int, int, int, int]]) -> list[list[Any]]:
-    """A sheet's values over ``bounds`` (min_col, min_row, max_col, max_row; None: its stored dimension), every
-    position present (missing cells and rows are null). A formula is read as its cached value; one without a
-    cached value isn't settled by the reference and is refused."""
-    import openpyxl
-    from openpyxl.utils.cell import range_boundaries
-    wb = openpyxl.load_workbook(io.BytesIO(workbook), read_only=True, data_only=False, keep_links=False)
-    try:
-        ws = wb[sheet]
-        if bounds is None:
-            try:
-                bounds = range_boundaries(ws.calculate_dimension(force=False))
-            except ValueError:
-                raise _error(f"Excel.Workbook: sheet {sheet!r} stores no dimension; reading it is "
-                             "InferSheetDimensions' job, not supported yet.") from None
-        min_col, min_row, max_col, max_row = bounds
-        width = max_col - min_col + 1
-        grid: dict[int, list[Any]] = {}
-        formulas: list[tuple[int, int]] = []
-        for r in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
-            for c in r:
-                row = getattr(c, "row", None)
-                if row is None:
-                    continue
-                line = grid.setdefault(row, [None] * width)
-                if getattr(c, "data_type", None) == "f":
-                    formulas.append((row, c.column))
-                else:
-                    line[c.column - min_col] = _cell(c)
-    finally:
-        wb.close()
-    if formulas:
-        wb = openpyxl.load_workbook(io.BytesIO(workbook), read_only=True, data_only=True, keep_links=False)
+_REF = re.compile(r"^\$?([A-Z]{1,3})\$?(\d+)$")
+
+
+def _cell_ref(ref: str) -> tuple[int, int]:
+    """(column, row), 1-based, of an A1 reference."""
+    m = _REF.match(ref.upper())
+    if not m:
+        raise _error(f"Excel.Workbook: the cell reference {ref!r} isn't valid.", "DataFormat.Error")
+    col = 0
+    for ch in m.group(1):
+        col = col * 26 + ord(ch) - 64
+    return col, int(m.group(2))
+
+
+def _range(ref: str) -> tuple[int, int, int, int]:
+    """(min col, min row, max col, max row) of an A1 range or single cell."""
+    first, _, last = ref.partition(":")
+    c1, r1 = _cell_ref(first)
+    c2, r2 = _cell_ref(last or first)
+    return min(c1, c2), min(r1, r2), max(c1, c2), max(r1, r2)
+
+
+def _text_of(node: Optional[ET.Element]) -> Optional[str]:
+    """A string item's text: its own text or its runs' text (phonetic runs left out); None when it holds none."""
+    if node is None:
+        return None
+    parts = []
+    for child in node:
+        tag = child.tag.rsplit("}", 1)[-1]
+        if tag == "t":
+            parts.append(child.text or "")
+        elif tag == "r":
+            t = child.find("m:t", _NS)
+            parts.append(t.text or "" if t is not None else "")
+    return "".join(parts) if parts else None
+
+
+def _shared_strings(z: zipfile.ZipFile) -> list[Optional[str]]:
+    rels = _rels(z, "xl/workbook.xml")
+    path = next((p for p in rels.values() if p.endswith("sharedStrings.xml")), "xl/sharedStrings.xml")
+    if path not in z.namelist():
+        return []
+    return [_text_of(si) or "" for si in ET.fromstring(z.read(path)).iterfind("m:si", _NS)]
+
+
+def _number(text: str) -> int | float:
+    if any(ch in text for ch in ".eE"):
+        return float(text)
+    return int(text)
+
+
+def _cell_value(c: ET.Element, shared: list[Optional[str]]) -> Any:
+    """A cell's stored value, as a Desktop refresh reads it (#104's D3 probes): its number (date-formatted ones
+    too), text, logical, a formula's cached value (none: null), or, for an error value, a failed cell."""
+    t = c.get("t") or "n"
+    v = c.find("m:v", _NS)
+    raw = v.text if v is not None else None
+    where = c.get("r") or "?"
+    if t == "inlineStr":
+        return _text_of(c.find("m:is", _NS))
+    if raw is None:
+        if v is not None and c.find("m:f", _NS) is not None:
+            return ""          # a formula whose cached value is empty: Desktop reads "" (#104)
+        if v is not None:
+            raise _error(f"Excel.Workbook: the cell {where} stores an empty value; not supported yet.")
+        return None
+    if t == "n":
         try:
-            ws = wb[sheet]
-            wanted = set(formulas)
-            for r in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
-                for c in r:
-                    if (getattr(c, "row", None), getattr(c, "column", None)) in wanted:
-                        if c.value is None:
-                            raise _error(f"Excel.Workbook: the formula in {c.coordinate} has no cached value; what "
-                                         "Desktop reads then isn't known yet.", "DataFormat.Error")
-                        grid[c.row][c.column - min_col] = _cell(c)
-        finally:
-            wb.close()
-    return [grid.get(r, [None] * width) for r in range(min_row, max_row + 1)]
+            return _number(raw)
+        except ValueError:
+            raise _error(f"Excel.Workbook: the cell {where} holds {raw!r}, not a number.", "DataFormat.Error") from None
+    if t == "s":
+        try:
+            return shared[int(raw)]
+        except (ValueError, IndexError):
+            raise _error(f"Excel.Workbook: the cell {where} names a shared string that isn't there.",
+                         "DataFormat.Error") from None
+    if t == "str":
+        return raw
+    if t == "b":
+        return raw.strip() not in ("0", "false")
+    if t == "e":
+        return CellError(MError("DataFormat.Error", f"Invalid cell value '{raw}'."))
+    raise _error(f"Excel.Workbook: the cell {where} has type {t!r}, not supported yet.")
 
 
-def _sheet(workbook: bytes, sheet: str) -> Table:
-    rows = _cells(workbook, sheet, None)
+def _grid(workbook: bytes, part: str, bounds: Optional[tuple[int, int, int, int]], infer: bool) -> list[list[Any]]:
+    """The sheet's values: over ``bounds`` (a table's range) as stored; otherwise over the stored dimension's
+    columns, down to the last row that stores a cell (a formatted empty one too), or (``infer``) over the cells
+    holding values."""
+    z = zipfile.ZipFile(io.BytesIO(workbook))
+    try:
+        root = ET.fromstring(z.read(part))
+    except (KeyError, ET.ParseError) as e:
+        raise _error(f"Excel.Workbook: the sheet part {part!r} can't be read: {e}", "DataFormat.Error") from None
+    shared = _shared_strings(z)
+    cells: dict[tuple[int, int], Any] = {}
+    stored: list[tuple[int, int]] = []      # every cell the file stores, a formatted empty one too
+    for c in root.iterfind("m:sheetData/m:row/m:c", _NS):
+        ref = c.get("r")
+        if ref is None:
+            raise _error("Excel.Workbook: a cell without a reference isn't supported yet.")
+        at = _cell_ref(ref)
+        stored.append(at)
+        value = _cell_value(c, shared)
+        if value is not None:
+            cells[at] = value
+    if bounds is None:
+        dim = root.find("m:dimension", _NS)
+        if infer or dim is None or not dim.get("ref"):
+            if not infer:
+                raise _error("Excel.Workbook: the sheet stores no dimension; reading it is InferSheetDimensions' "
+                             "job.")
+            if not cells:
+                return []
+            cols = [k[0] for k in cells]
+            rows = [k[1] for k in cells]
+            bounds = (min(cols), min(rows), max(cols), max(rows))
+        else:
+            min_col, min_row, max_col, max_row = _range(dim.get("ref") or "")
+            last = max((r for (col, r) in stored if min_col <= col <= max_col and min_row <= r <= max_row),
+                       default=min_row - 1)
+            bounds = (min_col, min_row, max_col, last)
+    min_col, min_row, max_col, max_row = bounds
+    return [[cells.get((col, r)) for col in range(min_col, max_col + 1)] for r in range(min_row, max_row + 1)]
+
+
+def _sheet(workbook: bytes, part: str, infer: bool, headers: bool) -> Table:
+    rows = _grid(workbook, part, None, infer)
     width = len(rows[0]) if rows else 0
-    return Table([f"Column{i + 1}" for i in range(width)], rows, [ANY] * width)
+    table = Table([f"Column{i + 1}" for i in range(width)], rows, [ANY] * width)
+    if headers:
+        from .tables import TABLES
+        promoted: Table = TABLES["Table.PromoteHeaders"].invoke([table])
+        return promoted
+    return table
 
 
-def _table(workbook: bytes, sheet: str, t: dict) -> Table:
-    from openpyxl.utils.cell import range_boundaries
+def _table(workbook: bytes, part: str, t: dict) -> Table:
     if t["header"] != 1:
         raise _error(f"Excel.Workbook: table {t['name']!r} has no header row; not supported yet.")
-    if t["totals"]:
-        raise _error(f"Excel.Workbook: table {t['name']!r} has a totals row; whether Desktop reads it isn't known "
-                     "yet.")
-    min_col, min_row, max_col, max_row = range_boundaries(t["ref"])
-    body = _cells(workbook, sheet, (min_col, min_row + 1, max_col, max_row)) if max_row > min_row else []
+    min_col, min_row, max_col, max_row = _range(t["ref"])
+    body = _grid(workbook, part, (min_col, min_row + 1, max_col, max_row), False) if max_row > min_row else []
     return Table(list(t["columns"]), body, [ANY] * len(t["columns"]))
-
-
-def _cell(c: Any) -> Any:
-    """A cell's value: number, text, logical, a date-formatted number as datetime (openpyxl reads the number
-    format), empty as null. An error value (#N/A, #DIV/0!, ...) isn't settled by the reference yet."""
-    v = getattr(c, "value", None)
-    where = getattr(c, "coordinate", "?")
-    if getattr(c, "data_type", None) == "e":
-        raise _error(f"Excel.Workbook: the cell {where} holds the error {v}; how Desktop reads it isn't known yet.",
-                     "DataFormat.Error")
-    if isinstance(v, (bool, int, float, str)) or v is None:
-        return v
-    if isinstance(v, dt.datetime):
-        return v
-    if isinstance(v, dt.date):
-        return dt.datetime(v.year, v.month, v.day)
-    if isinstance(v, dt.time):
-        return v
-    raise _error(f"Excel.Workbook: the cell {where} holds a value of an unknown kind.")
 
 
 # --- Parquet.Document -------------------------------------------------------------
 
 def _parquet_document(source: Any, options: Any = None) -> Table:
-    """A Parquet file's columns. Microsoft's reference has no page for it: only types with one plain M counterpart
-    are read (integers within Int64, floating point, text, logical, date, timestamp without a zone); any other is
-    refused."""
+    """A Parquet file's columns. Microsoft's reference has no page for it; each type reads as a Desktop refresh
+    reads it (#104's D3 probes): integers (unsigned 64-bit too) and floating point as numbers (a float32 widened),
+    text, logical, date, a timestamp without a zone as datetime and with one as a datetimezone at UTC (+00:00,
+    whatever the zone), time, binary, and a decimal as its number (one a double can't hold exactly is refused
+    here)."""
     if options is not None:
         raise _error("Parquet.Document: options aren't supported yet.")
     if not isinstance(source, bytes):
@@ -369,7 +468,8 @@ def _parquet_document(source: Any, options: Any = None) -> Table:
     names, types, columns = [], [], []
     for field, column in zip(table.schema, table.columns):
         t = field.type
-        if pa.types.is_integer(t) and not (pa.types.is_unsigned_integer(t) and t.bit_width == 64):
+        convert: Callable[[Any], Any] = lambda v: v  # noqa: E731
+        if pa.types.is_integer(t):
             mtype = MType("number", True, "Int64.Type")
         elif pa.types.is_floating(t):
             mtype = MType("number", True)
@@ -381,10 +481,20 @@ def _parquet_document(source: Any, options: Any = None) -> Table:
             mtype = MType("date", True)
         elif pa.types.is_timestamp(t) and t.tz is None:
             mtype = MType("datetime", True)
+        elif pa.types.is_timestamp(t):
+            mtype = MType("datetimezone", True)
+            convert = lambda v: v.astimezone(dt.timezone.utc)  # noqa: E731
+        elif pa.types.is_time(t):
+            mtype = MType("time", True)
+        elif pa.types.is_binary(t) or pa.types.is_large_binary(t):
+            mtype = MType("binary", True)
+        elif pa.types.is_decimal(t):
+            mtype = MType("number", True)
+            convert = partial(_decimal_number, field.name)
         else:
             raise _error(f"Parquet.Document: column {field.name!r} has type {t}, not supported yet.")
         try:
-            values = column.to_pylist()
+            values = [None if v is None else convert(v) for v in column.to_pylist()]
         except (ValueError, OverflowError, ArithmeticError) as e:
             raise _error(f"Parquet.Document: column {field.name!r} can't be read: {e}", "DataFormat.Error") from None
         names.append(field.name)
@@ -392,6 +502,14 @@ def _parquet_document(source: Any, options: Any = None) -> Table:
         columns.append(values)
     rows = [list(r) for r in zip(*columns)] if columns else []
     return Table(names, rows, types)
+
+
+def _decimal_number(column: str, v: Any) -> int | float:
+    f = float(v)
+    if Decimal(repr(f)) != v.normalize() and Decimal(f) != v:
+        raise _error(f"Parquet.Document: column {column!r} holds {v}, more digits than a double keeps; not supported "
+                     "yet.")
+    return int(v) if v == v.to_integral_value() and abs(v) < 2 ** 63 else f
 
 
 def _fn(name: str, call: Any, lo: int, hi: int) -> Function:

@@ -22,7 +22,7 @@ import math
 import re
 import zlib
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 
 from .values import ANY, CellError, Function, MError, MType, Record, Table, force, kind_of
 
@@ -55,22 +55,26 @@ def _culture(culture: Any, default: str) -> str:
 
 # --- text to number and date (en-US) ------------------------------------------
 
-_NUMBER = re.compile(r"""^(?P<sign>[+-])?\$?
-                         (?P<int>\d{1,3}(?:,\d{3})+|\d*)
+_NUMBER = re.compile(r"""^(?P<open>\()?
+                         (?P<sign>[+-])?\$?(?P<sign2>[+-])?
+                         (?P<int>\d+(?:,\d+)*|)
                          (?:\.(?P<frac>\d*))?
                          (?:[eE](?P<exp>[+-]?\d+))?
-                         (?P<pct>%)?$""", re.X)
+                         (?P<pct>%)?
+                         (?P<close>\))?$""", re.X)
 
 
-def number_from_text(text: str, culture: str, *, percent: bool = True) -> int | float:
-    """en-US number text: digits with optional "," grouping (in threes; anything else is refused until a
-    Desktop refresh shows otherwise), ".", an exponent, a leading sign or "$", and with ``percent`` a trailing
-    "%" (Number.From("12.3%") is 0.123 in Microsoft's reference; Number.FromText's own forms don't include it).
-    "$" is accepted because Desktop's saved refreshes load "$356,981" typed as Currency.Type as 356981. A
-    number beyond a double's range is an error."""
+def number_from_text(text: str, culture: str) -> int | float | None:
+    """en-US number text, as a Desktop refresh reads it (#104's D1 probes): digits with "," between any of
+    them ("1,23" is 123), ".", an exponent, a sign before or after a leading "$" ("-$5", "$-5"), a trailing "%"
+    (a hundredth), and an accounting negative in parentheses ("(1,000)" is -1000). Empty text is null. A number
+    beyond a double's range is infinite ("1e400")."""
+    if text == "":
+        return None
     s = text.strip()
     m = _NUMBER.match(s)
-    if not m or not (m.group("int") or m.group("frac")) or m.group("pct") and not percent:
+    if (not m or not (m.group("int") or m.group("frac")) or bool(m.group("open")) != bool(m.group("close"))
+            or m.group("sign") and m.group("sign2") or m.group("open") and (m.group("sign") or m.group("sign2"))):
         raise _error("We couldn't convert to Number.", "DataFormat.Error")
     digits = (m.group("int") or "0").replace(",", "") + ("." + m.group("frac") if m.group("frac") else "")
     value = Decimal(digits)
@@ -78,33 +82,49 @@ def number_from_text(text: str, culture: str, *, percent: bool = True) -> int | 
         value = value.scaleb(int(m.group("exp")))
     if m.group("pct"):
         value = value / 100
-    if m.group("sign") == "-":
+    if "-" in (m.group("sign"), m.group("sign2")) or m.group("open"):
         value = -value
     if value == value.to_integral_value() and not (m.group("frac") or m.group("exp") or m.group("pct")):
         return int(value)
-    result = float(value)
-    if math.isinf(result):
-        raise _error("The number is out of range of a double value.", "DataFormat.Error")
-    return result
+    return float(value)
 
 
 _DATETIME_FORMATS = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S.%f",
                      "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-                     "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y")
+                     "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+                     "%b %d, %Y")
+_TWO_DIGIT_YEAR = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2})$")
 
 
-def datetime_from_text(text: str, culture: str) -> dt.datetime:
-    """ISO 8601 forms, or en-US month/day/year with an optional 12- or 24-hour time."""
+def _parse_datetime(text: str) -> tuple[dt.datetime, bool]:
+    """(the value, whether the text gave a time of day)."""
     s = " ".join(text.split())
     if len(s) > 26 and "." in s:   # Python keeps 6 fractional digits; M keeps 7
         head, _, frac = s.rpartition(".")
         s = head + "." + frac[:6]
     for fmt in _DATETIME_FORMATS:
         try:
-            return dt.datetime.strptime(s, fmt)
+            return dt.datetime.strptime(s, fmt), "%H" in fmt or "%I" in fmt
         except ValueError:
             continue
+    m = _TWO_DIGIT_YEAR.match(s)
+    if m:
+        # A two-digit year falls in 1950-2049, Windows' and .NET's default window (Microsoft's
+        # Calendar.TwoDigitYearMax); Desktop reads "11/20/15" as 2015.
+        yy = int(m.group(3))
+        try:
+            return dt.datetime(2000 + yy if yy <= 49 else 1900 + yy, int(m.group(1)), int(m.group(2))), False
+        except ValueError:
+            pass
     raise _error("We couldn't parse the input provided as a DateTime value.", "DataFormat.Error")
+
+
+def datetime_from_text(text: str, culture: str) -> dt.datetime | None:
+    """ISO 8601 forms, en-US month/day/year with an optional 12- or 24-hour time, a two-digit year, or
+    "Nov 20, 2015" (#104's D1 probes). Empty text is null."""
+    if text == "":
+        return None
+    return _parse_datetime(text)[0]
 
 
 _OLE_EPOCH = dt.datetime(1899, 12, 30)
@@ -154,12 +174,12 @@ def to_number(v: Any, culture: str) -> Any:
 
 
 def _number_or_text(v: Any, culture: str, what: str) -> Any:
-    """Int64.From and Currency.From take a number, or text read by Number.FromText (Microsoft's reference: "any
-    other type ... converted to a number using Number.FromText"), so no "%" and no logicals."""
+    """Int64.From and Currency.From take a number, or text read as Number.From reads it: a Desktop refresh
+    gives Int64.From("10%") 0 and Currency.From("10%") 0.1 (#104's D1 probes). No logicals."""
     if v is None or isinstance(v, (int, float)) and not isinstance(v, bool):
         return v
     if isinstance(v, str):
-        return number_from_text(v, culture, percent=False)
+        return number_from_text(v, culture)
     raise _error(f"We cannot convert a value of type {kind_of(v)} to type {what}.")
 
 
@@ -192,13 +212,29 @@ def to_currency(v: Any, culture: str) -> Any:
 
 
 def to_text(v: Any, culture: str) -> Any:
+    """Text.From, en-US, as a Desktop refresh writes it (#104's D1 probes): a whole number in full digits
+    (1e21 is "1000000000000000000000"), any other number in 15 significant digits, or 17 when 15 don't give the
+    number back ("0.33333333333333331"), with an exponent below 1e-4 ("1E-05"); "true"/"false"; a date as
+    "11/20/2015" and a datetime as "11/20/2015 10:59:00 AM"."""
     if v is None or isinstance(v, str):
         return v
     if isinstance(v, bool):
         return "true" if v else "false"
-    if isinstance(v, int) or isinstance(v, float) and v.is_integer() and abs(v) < 2 ** 53:
-        return str(int(v))    # Text.From(3) is "3" (Microsoft's reference)
-    # Fractions, dates and times are written per culture in ways no reference or saved refresh shows yet.
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float) and math.isfinite(v):
+        if v.is_integer():
+            if abs(v) > 1e21:
+                raise _error("Converting a number above 1e21 to text isn't supported yet.")
+            return str(int(v))
+        text = "%.15G" % v
+        return text if float(text) == v else "%.17G" % v
+    if isinstance(v, dt.datetime) and not v.tzinfo and not v.microsecond:
+        hour = v.hour % 12 or 12
+        return f"{v.month}/{v.day}/{v.year} {hour}:{v.minute:02d}:{v.second:02d} {'AM' if v.hour < 12 else 'PM'}"
+    if isinstance(v, dt.date) and not isinstance(v, dt.datetime):
+        return f"{v.month}/{v.day}/{v.year}"
+    # Infinities, fractional seconds, zones, times and durations aren't settled by a Desktop refresh yet.
     raise _error(f"Converting a {kind_of(v)} value to text isn't supported yet.")
 
 
@@ -215,6 +251,14 @@ def to_datetime(v: Any, culture: str) -> Any:
 
 
 def to_date(v: Any, culture: str) -> Any:
+    """Date.From. Text with a time of day is an error ("11/20/2015 10:59" fails in a Desktop refresh, #104)."""
+    if isinstance(v, str):
+        if v == "":
+            return None
+        d, timed = _parse_datetime(v)
+        if timed:
+            raise _error("We couldn't parse the input provided as a Date value.", "DataFormat.Error")
+        return d.date()
     d = to_datetime(v, culture)
     return None if d is None else d.date()
 
@@ -224,6 +268,8 @@ def to_logical(v: Any, culture: str) -> Any:
     if v is None or isinstance(v, bool):
         return v
     if isinstance(v, str):
+        if v == "":
+            return None           # a Desktop refresh: Logical.From("") is null (#104)
         low = v.lower()
         if low in ("true", "false"):
             return low == "true"
@@ -400,6 +446,69 @@ def _fn(name: str, call: Callable[..., Any], lo: int, hi: int) -> Function:
     return Function(name, call, lo, hi)
 
 
+# --- #date, #datetime, #datetimezone, #time, #duration (the M specification's constructors) ----------------
+
+def _whole(v: Any, what: str) -> int:
+    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and float(v).is_integer()):
+        raise _error(f"{what} needs whole numbers.")
+    return int(v)
+
+
+def _seconds(v: Any, what: str) -> tuple[int, int]:
+    """Whole seconds and microseconds of a seconds argument (fractions to 7 places in M; 6 kept here)."""
+    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)):
+        raise _error(f"{what} needs a number of seconds.")
+    whole = math.floor(v)
+    return whole, round((Decimal(str(v)) - whole) * 1_000_000)
+
+
+_V = TypeVar("_V")
+
+
+def _make(what: str, build: Callable[[], _V]) -> _V:
+    try:
+        return build()
+    except (ValueError, OverflowError):
+        raise _error(f"The arguments of {what} don't make a valid value.") from None
+
+
+def _date(y: Any, m: Any, d: Any) -> dt.date:
+    return _make("#date", lambda: dt.date(_whole(y, "#date"), _whole(m, "#date"), _whole(d, "#date")))
+
+
+def _time_parts(h: Any, mi: Any, s: Any, what: str) -> tuple[int, int, int, int]:
+    sec, micro = _seconds(s, what)
+    if not 0 <= sec < 60 or micro >= 1_000_000:
+        raise _error(f"The arguments of {what} don't make a valid value.")
+    return _whole(h, what), _whole(mi, what), sec, micro
+
+
+def _datetime(y: Any, m: Any, d: Any, h: Any, mi: Any, s: Any) -> dt.datetime:
+    hh, mm, ss, us = _time_parts(h, mi, s, "#datetime")
+    return _make("#datetime", lambda: dt.datetime(_whole(y, "#datetime"), _whole(m, "#datetime"),
+                                                  _whole(d, "#datetime"), hh, mm, ss, us))
+
+
+def _datetimezone(y: Any, m: Any, d: Any, h: Any, mi: Any, s: Any, oh: Any, om: Any) -> dt.datetime:
+    base = _datetime(y, m, d, h, mi, s)
+    hours, minutes = _whole(oh, "#datetimezone"), _whole(om, "#datetimezone")
+    if hours * minutes < 0 or not -14 * 60 <= hours * 60 + minutes <= 14 * 60:
+        raise _error("The arguments of #datetimezone don't make a valid value.")
+    return base.replace(tzinfo=dt.timezone(dt.timedelta(hours=hours, minutes=minutes)))
+
+
+def _time(h: Any, mi: Any, s: Any) -> dt.time:
+    hh, mm, ss, us = _time_parts(h, mi, s, "#time")
+    return _make("#time", lambda: dt.time(hh, mm, ss, us))
+
+
+def _duration(d: Any, h: Any, mi: Any, s: Any) -> dt.timedelta:
+    for v in (d, h, mi, s):
+        if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)):
+            raise _error("#duration needs numbers.")
+    return _make("#duration", lambda: dt.timedelta(days=d, hours=h, minutes=mi, seconds=s))
+
+
 # A value, or a callable that takes the evaluator (for functions that read its culture).
 LIBRARY: dict[str, Any] = {
     "Binary.FromText": _fn("Binary.FromText", _binary_from_text, 1, 2),
@@ -413,6 +522,11 @@ LIBRARY: dict[str, Any] = {
     "#table": _fn("#table", lambda columns, rows: _rows_table(rows, columns, "#table"), 2, 2),
     "Table.TransformColumnTypes": _transform_column_types,
     "Table.Combine": _fn("Table.Combine", _table_combine, 1, 2),
+    "#date": _fn("#date", _date, 3, 3),
+    "#datetime": _fn("#datetime", _datetime, 6, 6),
+    "#datetimezone": _fn("#datetimezone", _datetimezone, 8, 8),
+    "#time": _fn("#time", _time, 3, 3),
+    "#duration": _fn("#duration", _duration, 4, 4),
     "#infinity": float("inf"),
     "#nan": float("nan"),
     "Int64.Type": INT64_TYPE,
