@@ -481,7 +481,8 @@ class TestSecondReview:
         assert [model_value(v, "int64") for v in ("+5", ".5", "   ", "5\n", "0.5", "-0.5")] == [5, 1, 0, 5, 1, -1]
         assert [model_value(v, "double") for v in ("-$5", "$-5", "1.", ".5", "+5")] == [-5, -5, 1, 0.5, 5]
         assert [model_value(v, "boolean") for v in ("2.5", "-1", " 1 ", float("nan"), float("inf"))] == [True] * 5
-        for v, ty in (("1.", "int64"), ("５", "int64"), ("1e400", "double"), ("５", "double"),
+        for v, ty in (("1.", "int64"), ("\u2155", "int64"), ("\U0001d7d3", "int64"), ("\u00b9", "int64"),
+                      ("\uff15e2", "int64"), ("1e400", "double"), ("\uff15", "double"), ("\u0665", "boolean"),
                       (" TRUE ", "boolean")):
             with pytest.raises(MError):
                 model_value(v, ty)
@@ -490,3 +491,10 @@ class TestSecondReview:
     def test_constructor_fractions_keep_their_microseconds(self):
         assert evaluate("#time(10, 59, 59.9999999)") == dt.time(10, 59, 59, 999999)
         assert evaluate("#datetimezone(2015, 1, 1, 0, 0, 0, 0, 120)").utcoffset() == dt.timedelta(hours=2)
+
+    def test_int64_reads_any_decimal_digit_as_its_code_less_zeros(self):
+        # Desktop's refresh (pivot-studio #104): "５" is U+FF15, 65301 - 48.
+        cases = {"\uff15": 65253, "\u0665": 1589, "\uff11\uff12": 717740, "1\uff15": 65263, "\uff15.\uff15": 65254,
+                 "-\uff15": -65253, " \uff15 ": 65253, "\u0967": 2359, "\u00b2": 130,
+                 "\uff15" + "\uff10" * 14: 7250277777777770528}
+        assert {v: model_value(v, "int64") for v in cases} == cases

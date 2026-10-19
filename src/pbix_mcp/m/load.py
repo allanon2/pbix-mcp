@@ -11,9 +11,9 @@ dateTime column as 2014-02-09):
    "5" or true in an Int64.Type column, 5 in a text column.
 2. The model column converts the value:
    - int64: a number rounds half away from zero (2.5 is 3, -2.5 is -3); a
-     logical is -1 or 0; text of ASCII digits with an optional sign, fraction
-     and surrounding whitespace is read so (".5" is 1; "" and "   " are 0;
-     "1." fails);
+     logical is -1 or 0; text of digits with an optional sign, fraction and
+     surrounding whitespace is read so (".5" is 1; "" and "   " are 0; "1."
+     fails), each digit worth its code less "0"'s, so "５" is 65253;
    - double: a number; text as en-US numbers read ("1,234", "1e3", "$5",
      "-$5", "1."), finite;
    - decimal: 4 decimal places, half to even, of the number's exact binary
@@ -88,6 +88,41 @@ def _int64(n: Any) -> int:
     return r
 
 
+def _digit(c: str) -> Optional[int]:
+    """A character's worth as an int64 column reads text: its code less "0"'s, for any decimal digit of the Basic
+    Multilingual Plane, not only ASCII ("５" U+FF15 is 65253, "٥" 1589, "²" 130), as a Desktop refresh shows (#104,
+    13 points). Digits the refresh refused ("⅕", "Ⅻ", the astral "𝟓"), or that none measured ("¹", "③"), are None."""
+    if "0" <= c <= "9" or ord(c) <= 0xFFFF and c.isdecimal() or c == "\u00b2":
+        return ord(c) - 48
+    return None
+
+
+def _int64_text(text: str) -> int:
+    """Text into an int64 column (#104): surrounding whitespace, a sign, digits (``_digit``), and optionally "." and
+    more digits, the first of which rounds the whole number up when it is worth 5 or more ("2.5" is 3, "-0.5" is
+    -1, ".5" is 1). Empty or blank text is 0; no exponent, grouping or "$"; "1." fails."""
+    s = text.strip(_SPACE)
+    if s == "":
+        return 0
+    sign = -1 if s[0] == "-" else 1
+    if s[0] in "+-":
+        s = s[1:]
+    whole, _, frac = s.partition(".")
+    digits = [_digit(c) for c in whole]
+    fraction = [_digit(c) for c in frac]
+    if (not whole and not frac or "." in s and not frac or None in digits or None in fraction):
+        raise _fail(f"The text '{text}' can't be loaded into an int64 column.")
+    n = 0
+    for d in digits:
+        n = n * 10 + d  # type: ignore[operator]
+    if fraction and fraction[0] >= 5:  # type: ignore[operator]
+        n += 1
+    n *= sign
+    if not _INT64[0] <= n <= _INT64[1]:
+        raise _fail("The number is out of range of an int64 column.")
+    return n
+
+
 def _decimal(n: Any, m_type: Optional[MType]) -> float:
     if not math.isfinite(n):
         raise _fail("A non-finite number can't be loaded into a decimal column.")
@@ -143,11 +178,7 @@ def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> A
         if kind == "logical":
             return -1 if value else 0
         if kind == "text":
-            if value.strip(_SPACE) == "":
-                return 0
-            if _PLAIN.match(value):
-                return _int64(Decimal(value.strip(_SPACE)))
-            raise _fail(f"The text '{value}' can't be loaded into an int64 column.")
+            return _int64_text(value)
     elif data_type == "double":
         if kind == "number":
             return float(value)
