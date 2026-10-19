@@ -3899,10 +3899,7 @@ class DAXContext:
         if isinstance(allowed, _DatePartKeys):
             # Across a DatePartOnly join the keys ARE date parts (issue #126).
             dmap = self._date_part_index_map(tbl, col_idx)
-            found = [dmap[k] for k in allowed if k in dmap]
-            if not found:
-                return frozenset()
-            return found[0] if len(found) == 1 else frozenset().union(*found)
+            return self._union_of(dmap, [k for k in allowed if k in dmap], (id(tbl), 'dp', col_idx))
         values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
             else [allowed]
         vmap = self._value_index_map(tbl, col_idx)
@@ -3933,18 +3930,45 @@ class DAXContext:
                     keys.add(str(fv))
                     if fv.is_integer():
                         keys.add(str(int(fv)))
-        found = [vmap[k] for k in keys if k in vmap]
-        if not found:
+        return self._union_of(vmap, [k for k in keys if k in vmap], (id(tbl), 'v', col_idx))
+
+    # The row indices the union memo below may hold per model, in all: about
+    # 100 MB of sets at most. Past it the memo starts again.
+    _UNION_MEMO_MAX_ROWS = 2_000_000
+
+    def _union_of(self, index_map: dict, keys: list, where: tuple) -> frozenset:
+        """The rows of an index map's ``keys``, all together. A union of more
+        than one key is memoized on the model-wide cache by the keys it unites:
+        a query asks the same one again and again. A year-to-date measure over
+        a matrix of countries by month filters its fact table to the same
+        dates for every country of a month, and each such union of a 166,216
+        row table's date index sets held up to 83,000 rows (1,656 unions, 37
+        distinct, were three quarters of the query's time)."""
+        if not keys:
             return frozenset()
-        if len(found) == 1:
-            return found[0]
+        if len(keys) == 1:
+            return index_map[keys[0]]
+        memo = self._filter_idx_cache.get('__in_set_unions__')
+        if memo is None:
+            memo = self._filter_idx_cache['__in_set_unions__'] = {}
+        mkey = (where, frozenset(keys))
+        hit = memo.get(mkey)
+        if hit is not None:
+            return hit
         # Accumulate into ONE mutable set. frozenset().union(*found) allocates a
         # new frozenset per operand, which is the dominant cost when a date
         # filter carries ~1000 single-value index sets.
         acc: set = set()
-        for f in found:
-            acc |= f
-        return frozenset(acc)
+        for k in keys:
+            acc |= index_map[k]
+        hit = frozenset(acc)
+        held = memo.get('__rows__', 0) + len(hit)
+        if held > self._UNION_MEMO_MAX_ROWS:
+            memo.clear()
+            held = len(hit)
+        memo[mkey] = hit
+        memo['__rows__'] = held
+        return hit
 
     def _typed_index_map(self, tbl: dict, col_idx: int) -> dict:
         """``{value key: frozenset(row indices)}`` for one column, keyed as DAX
