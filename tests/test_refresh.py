@@ -104,7 +104,7 @@ def test_a_column_the_query_no_longer_makes_fails_the_refresh(model):
 
 
 def test_names_outside_the_evaluator_fail_the_refresh(model):
-    server.pbix_set_partition_m(model, "Sales", 'Excel.Workbook(File.Contents("C:\\\\x.xlsx"))')
+    server.pbix_set_partition_m(model, "Sales", 'Csv.Document(Web.Contents("https://example.com/x.csv"))')
     with pytest.raises(RefreshError, match="wasn't recognized"):
         refresh_tables(model, ["Sales"])
 
@@ -232,9 +232,9 @@ class TestReview:
                              '{{"East", "4"}}), {{"Amount", Int64.Type}}) in Table.Combine({t, t})')
         refresh_tables(star, ["Sales"])
         assert rows_of(star, "Sales", "Amount") == [4, 4]
-        set_m(star, "Reg", 'Table.SelectColumns(Sales, {"Region"})')
-        with pytest.raises(RefreshError, match="wasn't recognized"):   # Table.SelectColumns: outside tier 1
-            refresh_tables(star, ["Reg"])
+        set_m(star, "Reg", 'Table.AddColumn(Table.SelectColumns(Sales, {"Region"}), "Mgr", each "M" & [Region])')
+        refresh_tables(star, ["Reg"])
+        assert rows_of(star, "Reg", "Mgr") == ["MEast", "MEast"]
 
 
 class TestTableNames:
