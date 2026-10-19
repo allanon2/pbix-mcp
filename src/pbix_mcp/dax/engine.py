@@ -1633,6 +1633,59 @@ def _midnight_date(v):
     return None
 
 
+def _index_spellings_uncached(v) -> tuple:
+    """The value-index-map keys an In-set filter value can match
+    (DAXContext._indices_for_values)."""
+    # the values are join spellings already (_jstr): 'None' is the
+    # blank key's sentinel and must not fold
+    keys = [str(v)]
+    # strict: no date-prefix aliasing (#42); midnight only (#126)
+    dv = _midnight_date(v)
+    if dv is not None:
+        keys.append(dv.isoformat())
+    # Numeric alternates (issue #39): the map is keyed str(cell), and
+    # str(2024) != str(2024.0), so an int literal missed every Double
+    # cell (and vice versa) — CALCULATE(expr, T[Year]=2024) selected
+    # zero rows and went BLANK. Add both spellings; bools excluded so
+    # True never aliases 1.
+    if not isinstance(v, bool):
+        fv = None
+        if isinstance(v, (int, float)):
+            fv = float(v)
+        elif isinstance(v, str):
+            try:
+                fv = float(v)
+            except ValueError:
+                pass
+        if fv is not None:
+            keys.append(str(fv))
+            if fv.is_integer():
+                keys.append(str(int(fv)))
+    return tuple(keys)
+
+
+# A value's spellings depend on the value alone, and a query asks for the same
+# ones again and again: a relationship carries a dimension's filter to its
+# fact table as hundreds of text keys on every call, and each one tried a
+# date parse and a float(). Keyed by type as well (True == 1, 1 == 1.0), and
+# started again past its bound.
+_INDEX_SPELLINGS: dict = {}
+_INDEX_SPELLINGS_MAX = 200_000
+
+
+def _index_spellings(v) -> tuple:
+    try:
+        key = (type(v), v)
+        hit = _INDEX_SPELLINGS.get(key)
+    except TypeError:            # an unhashable value
+        return _index_spellings_uncached(v)
+    if hit is None:
+        if len(_INDEX_SPELLINGS) >= _INDEX_SPELLINGS_MAX:
+            _INDEX_SPELLINGS.clear()
+        hit = _INDEX_SPELLINGS[key] = _index_spellings_uncached(v)
+    return hit
+
+
 _DP_PREFIX = 'dp:'
 
 
@@ -3908,31 +3961,7 @@ class DAXContext:
         vmap = self._value_index_map(tbl, col_idx)
         keys = set()
         for v in values:
-            # the values are join spellings already (_jstr): 'None' is the
-            # blank key's sentinel and must not fold
-            keys.add(str(v))
-            # strict: no date-prefix aliasing (#42); midnight only (#126)
-            dv = _midnight_date(v)
-            if dv is not None:
-                keys.add(dv.isoformat())
-            # Numeric alternates (issue #39): the map is keyed str(cell), and
-            # str(2024) != str(2024.0), so an int literal missed every Double
-            # cell (and vice versa) — CALCULATE(expr, T[Year]=2024) selected
-            # zero rows and went BLANK. Add both spellings; bools excluded so
-            # True never aliases 1.
-            if not isinstance(v, bool):
-                fv = None
-                if isinstance(v, (int, float)):
-                    fv = float(v)
-                elif isinstance(v, str):
-                    try:
-                        fv = float(v)
-                    except ValueError:
-                        pass
-                if fv is not None:
-                    keys.add(str(fv))
-                    if fv.is_integer():
-                        keys.add(str(int(fv)))
+            keys.update(_index_spellings(v))
         found = [vmap[k] for k in keys if k in vmap]
         if not found:
             return frozenset()
