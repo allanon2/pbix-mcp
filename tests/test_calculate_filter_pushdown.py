@@ -1,5 +1,5 @@
 """CALCULATE(<aggregate of T>, FILTER(T, <condition on one column of T>)) is
-evaluated as a column filter, KEEPFILTERS(FILTER(ALL(T[c]), <condition>)):
+evaluated as a column filter, KEEPFILTERS(FILTER(VALUES(T[c]), <condition>)):
 the same rows of T, taken from the column's index instead of one by one.
 
 Every case here is evaluated both ways, with the rewrite and without it (the
@@ -102,6 +102,24 @@ def test_no_rewrite_where_the_two_could_differ(name, monkeypatch):
             same = evaluate(NOT_PUSHED[name], filters, True, monkeypatch)
         assert same == slow, (name, filters)
     assert seen and not any(seen), f"no rewrite: {[s for s in seen if s]}"
+
+
+def test_a_condition_that_fails_on_a_hidden_value(monkeypatch):
+    # "abc" * 1 fails; the whole-table FILTER never sees it when Code is filtered to the numbers, so neither may the
+    # pushed-down filter (over ALL(F[Code]) it did, and the measure went BLANK)
+    tables = {"F": {"columns": ["Code", "V"], "rows": [["12", 1], ["abc", 2], ["30", 4]]}}
+    expr = "CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5))"
+    for filters in ({"F.Code": ["12", "30"]}, {"F.Code": ["30"]}, {}):
+        got = []
+        for pushdown in (False, True):
+            with monkeypatch.context() as m:
+                if not pushdown:
+                    m.setattr(de.DAXEngine, "_pushdown_table_filter", lambda self, args, ctx: None)
+                ctx = de.DAXContext({k: dict(v) for k, v in tables.items()}, {"M": expr}, None, None, dict(filters), [])
+                got.append(de.DAXEngine().evaluate_measure("M", ctx))
+        assert got[0] == got[1], (filters, got)
+    ctx = de.DAXContext(tables, {"M": expr}, None, None, {"F.Code": ["12", "30"]}, [])
+    assert de.DAXEngine().evaluate_measure("M", ctx) == 5
 
 
 def test_known_values():
