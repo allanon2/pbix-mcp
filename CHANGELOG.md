@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.143] - 2026-10-19
 
-Clean-room remediation: code that named Power BI Desktop's application scripts (`desktop.min.js`, `customVisualsHost.js`) as its source is replaced by behaviour derived from the community Desktop-saved files, Microsoft's published schemas and documentation, and OpenBI's own Desktop probes. The record, with every count and what is still open: `docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md`.
+Clean-room remediation (#196; the work of PR #197, written by ComposeBI's session without opening the scripts, released as it was written): code that named Power BI Desktop's application scripts (`desktop.min.js`, `customVisualsHost.js`) as its source is replaced by behaviour derived from the community Desktop-saved files, Microsoft's published schemas and documentation, and OpenBI's own Desktop probes. The record, with every count and what is still open: `docs/reverse-engineering/experiments/2026-10-19-clean-room-remediation.md`.
+
+Verified on main before release:
+
+- **Tests:** full suite 6,677 passed, 5 xfailed (the wells awaiting a Desktop save).
+- **Corpus round trip:** over the 395 Desktop-authored data visuals the binder rewrites none.
+- **Desktop:** a pbix-mcp-built matrix with every aggregate, including the renamed `DistinctCount(...)`, loads and computes as Desktop does in Power BI Desktop 2.152.
+- **Type annotation:** `_implicit_aggregate` takes `role: str | None`, which keeps mypy at its limit. No change in behaviour.
+
+Still open: #198, the 0.9.138 collation's use of Desktop's engine binary.
 
 ### Changed
 
