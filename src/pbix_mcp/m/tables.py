@@ -70,11 +70,19 @@ def _rename_columns(table: Any, renames: Any, missing: Any = None) -> Table:
     if not isinstance(pairs, list):
         raise _error("Table.RenameColumns needs {old, new} pairs.")
     columns = list(t.columns)
+    checked = []
     for pair in pairs:
         pair = [force(x) for x in pair] if isinstance(pair, list) else pair
         if not (isinstance(pair, list) and len(pair) == 2 and all(isinstance(x, str) for x in pair)):
             raise _error("Table.RenameColumns needs {old, new} pairs.")
-        old, new = pair
+        checked.append(pair)
+    named = [n for pair in checked for n in pair]
+    repeated = next((n for n in named if named.count(n) > 1 and not (checked.count([n, n]) == 1
+                                                                     and named.count(n) == 2)), None)
+    if repeated is not None:
+        raise _error(f"Table.RenameColumns: '{repeated}' is in more than one rename; whether they apply in order or "
+                     "at once isn't known yet.")
+    for old, new in checked:
         if old not in columns:
             if mode == MISSING_IGNORE:
                 continue

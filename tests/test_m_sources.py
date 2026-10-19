@@ -232,3 +232,95 @@ class TestRefreshFromFiles:
             assert out["results"][0]["value"] == 12
         finally:
             server.pbix_close(alias, force=True)
+
+
+class TestReviewFindings:
+    """Cases from an independent review of the first version."""
+
+    def test_an_unmapped_file_is_never_absorbed(self):
+        with pytest.raises(UnmappedSource):
+            ev('try File.Contents("x") otherwise 5')
+        with pytest.raises(UnmappedSource):
+            ev('Table.AddColumn(#table({"p"}, {{"x"}}), "b", each File.Contents([p]))')
+
+    def test_renames_that_overlap_are_refused(self):
+        T = '#table({"a", "b"}, {{1, 2}})'
+        for pairs in ('{{"a", "b"}, {"b", "a"}}', '{{"a", "b"}, {"b", "c"}}'):
+            with pytest.raises(MError, match="more than one rename"):
+                ev(f"Table.RenameColumns({T}, {pairs})")
+        assert ev(f'Table.RenameColumns({T}, {{{{"a", "a"}}}})').columns == ["a", "b"]
+
+    def test_csv_malformed_quoting_and_blank_lines_are_refused(self):
+        for data in (b'a,"b\n', b'a,"b"c,d\n', b"a\n\nb\n"):
+            with pytest.raises(MError):
+                ev('Csv.Document(File.Contents("f"))', files_of(f=data))
+        assert ev('Csv.Document(File.Contents("f"))', files_of(f=b'a,b"c\r1,2\r')).rows == [['a', 'b"c'], ["1", "2"]]
+
+    def test_csv_options_record_with_positional_arguments_is_refused(self):
+        with pytest.raises(MError, match="options record"):
+            ev('Csv.Document(File.Contents("f"), [Columns=1], ";")', files_of(f=b"a\n"))
+
+    def xlsx(self, build):
+        openpyxl = pytest.importorskip("openpyxl")
+        wb = openpyxl.Workbook()
+        build(wb)
+        buf = io.BytesIO()
+        wb.save(buf)
+        return buf.getvalue()
+
+    def test_excel_honours_the_stored_dimension_for_rows_too(self):
+        def build(wb):
+            ws = wb.active
+            ws.title = "S"
+            ws["A1"], ws["C3"] = "x", 3
+        data = self.xlsx(build)
+        sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]', files_of(w=data))
+        assert sheet.rows == [["x", None, None], [None, None, None], [None, None, 3]]
+
+    def test_excel_formulas_without_a_cached_value_are_refused(self):
+        def build(wb):
+            ws = wb.active
+            ws.title = "S"
+            ws["A1"], ws["A2"] = 1, "=A1+1"      # openpyxl writes no cached value
+        with pytest.raises(MError, match="no cached value"):    # Data is read when used
+            ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]',
+               files_of(w=self.xlsx(build))).rows
+
+    def test_excel_a_table_with_a_totals_row_is_refused_and_a_table_named_like_a_sheet_is_kept_apart(self):
+        from openpyxl.worksheet.table import Table as XTable
+
+        def build(wb):
+            ws = wb.active
+            ws.title = "Keys"
+            ws.append(["K"])
+            ws.append([1])
+            ws.add_table(XTable(displayName="Keys", ref="A1:A2"))
+            t = wb.create_sheet("Tot")
+            t.append(["V"])
+            t.append([1])
+            t.append([1])
+            x = XTable(displayName="Tot1", ref="A1:A3")
+            x.totalsRowCount = 1
+            t.add_table(x)
+        files = files_of(w=self.xlsx(build))
+        nav = ev('Excel.Workbook(File.Contents("w"), null, true)', files)
+        assert [(r[2], r[3]) for r in nav.rows] == [("Keys", "Sheet"), ("Keys", "Table"), ("Tot", "Sheet"),
+                                                    ("Tot1", "Table")]
+        table = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Keys",Kind="Table"]}[Data]', files)
+        assert table.columns == ["K"] and table.rows == [[1]]
+        with pytest.raises(MError, match="totals row"):
+            ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Tot1",Kind="Table"]}[Data]', files).rows
+
+    def test_parquet_out_of_range_values_are_refused(self):
+        pa = pytest.importorskip("pyarrow")
+        import pyarrow.parquet as pq
+
+        def parquet(**cols):
+            buf = io.BytesIO()
+            pq.write_table(pa.table(cols), buf)
+            return buf.getvalue()
+        with pytest.raises(MError, match="not supported"):
+            ev('Parquet.Document(File.Contents("p"))', files_of(p=parquet(u=pa.array([2 ** 64 - 1], pa.uint64()))))
+        ns = pa.array([1_000_000_001], pa.timestamp("ns"))
+        with pytest.raises(MError, match="can't be read"):
+            ev('Parquet.Document(File.Contents("p"))', files_of(p=parquet(t=ns)))
