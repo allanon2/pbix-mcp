@@ -8393,7 +8393,7 @@ class DAXEngine:
           transitioned row's filters on T and the two differ
           (SUMX(T, CALCULATE(SUM(T[v]), FILTER(T, ...))));
         - T is a model table, and the condition reads T's columns and
-          constants (_row_only_condition).
+          constants, or pure functions of them (_pushdown_condition).
 
         The Artificial Intelligence Sample's [Revenue Won],
         CALCULATE(SUMX(Opportunities, Opportunities[Value]),
@@ -8439,7 +8439,7 @@ class DAXEngine:
                 return None
         cond = parts[1].strip()
         row = {c: None for c in ctx.tables[table]['columns']}
-        cols = self._row_only_condition(cond, table, row)
+        cols = self._pushdown_condition(cond, table, row)
         if not cols:
             return None
         quoted = "'" + table.replace("'", "''") + "'"
@@ -9914,12 +9914,30 @@ class DAXEngine:
         r"""\s+|"(?:[^"]|"")*"|\d+(?:\.\d+)?|'(?:[^']|'')+'\s*\[[^\]]+\]|[A-Za-z_]\w*\s*\[[^\]]+\]"""
         r"""|&&|\|\||<>|<=|>=|[=<>+\-*/&(),{}]|[A-Za-z_]\w*""")
     _ROW_ONLY_WORDS = frozenset({'AND', 'OR', 'NOT', 'IN', 'TRUE', 'FALSE', 'BLANK', 'ISBLANK'})
+    # The filter pushdown's condition may also call functions whose value is a
+    # fixed function of their arguments: no filter context, no time, no
+    # randomness. It is evaluated on the visible values (VALUES / SUMMARIZE),
+    # the ones FILTER's rows have, so it answers, or fails, as the rows do.
+    # Not the case-sensitive ones (EXACT, FIND, SUBSTITUTE,
+    # CONTAINSSTRINGEXACT): the values it keeps are applied as a filter, which
+    # matches text ignoring case, so "won" came back with an EXACT "Won".
+    _PUSHDOWN_WORDS = _ROW_ONLY_WORDS | frozenset({
+        'VALUE', 'LEFT', 'RIGHT', 'MID', 'LEN', 'UPPER', 'LOWER', 'TRIM', 'CONCATENATE', 'SEARCH',
+        'CONTAINSSTRING', 'ABS', 'INT', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'TRUNC', 'MOD', 'SIGN', 'DIVIDE',
+        'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND', 'IF', 'ISERROR'})
 
     def _row_only_condition(self, cond_expr: str, table: str, row_item: dict):
         """The columns of ``row_item`` a FILTER condition reads, when that is
         all it reads -- Table[Column] of the iterated table, constants,
         comparisons, IN { }, AND / OR / NOT, ISBLANK, arithmetic -- else None.
         Such a condition has one value per combination of those columns."""
+        return self._condition_columns(cond_expr, table, row_item, self._ROW_ONLY_WORDS)
+
+    def _pushdown_condition(self, cond_expr: str, table: str, row_item: dict):
+        """_row_only_condition, with _PUSHDOWN_WORDS' functions too."""
+        return self._condition_columns(cond_expr, table, row_item, self._PUSHDOWN_WORDS)
+
+    def _condition_columns(self, cond_expr: str, table: str, row_item: dict, words: frozenset):
         cols: list = []
         lower = {k.lower(): k for k in row_item if not k.startswith('__')}
         pos = 0
@@ -9946,7 +9964,7 @@ class DAXEngine:
                     cols.append(key)
                 continue
             if tok[0].isalpha() or tok[0] == '_':
-                if tok.upper() not in self._ROW_ONLY_WORDS:
+                if tok.upper() not in words:
                     return None
             # operators and punctuation
         return cols

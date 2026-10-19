@@ -41,6 +41,9 @@ PUSHED = {
     "two_columns_not": 'CALCULATE(SUM(F[Value]), FILTER(F, NOT (F[Status] = "Won" && F[Region] = "S")))',
     "three_columns": 'CALCULATE(SUMX(F, F[Value]), FILTER(F, F[Key] IN {1, 2} && (ISBLANK(F[Status]) || F[Region] = "N")))',
     "column_vs_column": "CALCULATE(COUNTROWS(F), FILTER(F, F[Key] * 10 < F[Value]))",
+    "text_functions": 'CALCULATE(SUM(F[Value]), FILTER(F, UPPER(LEFT(F[Status], 1)) = "W" && LEN(F[Region]) = 1))',
+    "number_functions": "CALCULATE(COUNTROWS(F), FILTER(F, MOD(INT(F[Value] / 10), 2) = 1 || ROUND(F[Key] / 3, 0) = 1))",
+    "if_and_search": 'CALCULATE(SUM(F[Value]), FILTER(F, IF(ISBLANK(F[Status]), FALSE, SEARCH("o", F[Status], 1, 0) > 0)))',
 }
 NOT_PUSHED = {
     "row_context": 'SUMX(D, CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = "Won")))',
@@ -51,6 +54,11 @@ NOT_PUSHED = {
     "measure_expression": 'CALCULATE([Total], FILTER(F, F[Status] = "Won"))',
     "filter_over_all": 'CALCULATE(SUM(F[Value]), FILTER(ALL(F), F[Status] = "Won"))',
     "condition_with_measure": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Value] > [Total] / 10))',
+    "condition_reads_context": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Status] = SELECTEDVALUE(F[Status])))',
+    "condition_reads_time": "CALCULATE(SUM(F[Value]), FILTER(F, F[Key] < YEAR(TODAY())))",
+    # case-sensitive: the values kept are applied as a filter, which ignores case ("won" would come back)
+    "case_sensitive": 'CALCULATE(SUM(F[Value]), FILTER(F, EXACT(F[Status], "Won")))',
+    "case_sensitive_find": 'CALCULATE(SUM(F[Value]), FILTER(F, FIND("W", F[Status], 1, 0) = 1))',
     "table_in_another_case": 'CALCULATE(SUM(F[Value]), FILTER(f, F[Status] = "Won"))',
     "quoted_in_another_case": "CALCULATE(SUM(F[Value]), FILTER('f', F[Status] = \"Won\"))",
     "measure_as_a_column": 'CALCULATE(SUMX(F, F[Total]), FILTER(F, F[Status] = "Won"))',
@@ -117,7 +125,9 @@ def test_a_condition_that_fails_on_a_hidden_value(monkeypatch):
     # pushed-down filter (over ALL(F[Code]) it did, and the measure went BLANK)
     tables = {"F": {"columns": ["Code", "V", "R"], "rows": [["12", 1, "N"], ["abc", 2, "S"], ["30", 4, "N"]]}}
     for expr, filters in [(e, f) for e in ("CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5))",
-                                           'CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5 && F[R] = "N"))')
+                                           'CALCULATE(SUM(F[V]), FILTER(F, F[Code] * 1 > 5 && F[R] = "N"))',
+                                           "CALCULATE(SUM(F[V]), FILTER(F, VALUE(F[Code]) > 5))",
+                                           'CALCULATE(SUM(F[V]), FILTER(F, VALUE(LEFT(F[Code], 1)) >= 1 && F[R] = "N"))')
                           for f in ({"F.Code": ["12", "30"]}, {"F.R": ["N"]}, {"F.Code": ["30"]}, {})]:
         got = []
         for pushdown in (False, True):
