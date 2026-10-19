@@ -8392,7 +8392,7 @@ class DAXEngine:
 
     def _pushdown_table_filter(self, args: list, ctx: DAXContext):
         """``CALCULATE(<aggregate of T>, FILTER(T, <condition on one column of
-        T>))`` as ``CALCULATE(<aggregate of T>, KEEPFILTERS(FILTER(ALL(T[c]),
+        T>))`` as ``CALCULATE(<aggregate of T>, KEEPFILTERS(FILTER(VALUES(T[c]),
         <condition>)))``, or None when the rewrite would not give the same
         value.
 
@@ -8400,7 +8400,9 @@ class DAXEngine:
         one by one; the column filter takes them from the column's index. The
         two keep the same rows of T: FILTER's rows are T's rows visible in the
         outer context that satisfy the condition, and KEEPFILTERS keeps the
-        outer context and adds the condition. They differ only in what ELSE is
+        outer context and adds the condition. VALUES, not ALL: the condition
+        sees only the values FILTER's rows have, so one that fails on a hidden
+        value (text arithmetic on "abc") fails in both or in neither. They differ only in what ELSE is
         filtered (every column of T's expanded table, against one column), so
         the rewrite is made only where nothing else can be seen:
 
@@ -8455,7 +8457,7 @@ class DAXEngine:
         if not cols or len(cols) != 1:
             return None
         quoted = "'" + table.replace("'", "''") + "'"
-        return [args[0], f"KEEPFILTERS(FILTER(ALL({quoted}[{cols[0]}]), {cond}))"]
+        return [args[0], f"KEEPFILTERS(FILTER(VALUES({quoted}[{cols[0]}]), {cond}))"]
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
