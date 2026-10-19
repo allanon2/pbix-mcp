@@ -43,6 +43,7 @@ PUSHED = {
     "column_vs_column": "CALCULATE(COUNTROWS(F), FILTER(F, F[Key] * 10 < F[Value]))",
     "text_functions": 'CALCULATE(SUM(F[Value]), FILTER(F, UPPER(LEFT(F[Status], 1)) = "W" && LEN(F[Region]) = 1))',
     "number_functions": "CALCULATE(COUNTROWS(F), FILTER(F, MOD(INT(F[Value] / 10), 2) = 1 || ROUND(F[Key] / 3, 0) = 1))",
+    "formatted": 'CALCULATE ( SUMX ( F, F[Value] ), FILTER ( F, F[Status] = "Won" && VALUE ( LEFT ( F[Key], 1 ) ) >= 1 ) )',
     "if_and_search": 'CALCULATE(SUM(F[Value]), FILTER(F, IF(ISBLANK(F[Status]), FALSE, SEARCH("o", F[Status], 1, 0) > 0)))',
 }
 NOT_PUSHED = {
