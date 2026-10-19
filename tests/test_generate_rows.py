@@ -27,3 +27,32 @@ def test_a_table_row_still_resolves_by_its_table():
     got, err = calc('GENERATE(T, ROW("Twice", [Amount] * 2))', tables)
     assert err is None and got["columns"] == ["Region", "Amount", "Twice"]
     assert got["rows"] == [["E", 1, 2], ["W", 2, 4]]
+
+
+T = {"T": {"columns": ["Region", "Amount"], "rows": [["E", 1], ["W", 2]]},
+     "U": {"columns": ["Region", "X"], "rows": [["E", 10]]}}
+
+
+def test_expressions_over_a_generate_still_read_its_first_table():
+    assert calc('ROW("s", SUMX(GENERATE(T, ROW("A", 1)), T[Amount]))', T)[0]["rows"] == [[3]]
+    assert calc('SELECTCOLUMNS(GENERATE(T, ROW("A", 1)), "R", T[Region])', T)[0]["rows"] == [["E"], ["W"]]
+    got, err = calc('FILTER(GENERATE(T, ROW("A", [Amount] * 2)), T[Amount] > 1)', T)
+    assert err is None and got["rows"] == [["W", 2, 4]]
+
+
+def test_a_column_both_sides_have_is_refused():
+    got, err = calc("GENERATE(T, U)", T)
+    assert got is None and "both tables" in err
+    got, err = calc('GENERATE(T, SELECTCOLUMNS(U, "region", U[X]))', T)
+    assert got is None and "both tables" in err
+
+
+def test_generateall_keeps_a_row_without_matches():
+    got, err = calc("GENERATEALL(T, FILTER(U, U[X] > 100))", T)
+    assert err is None and got["rows"] == [["E", 1], ["W", 2]]
+
+
+def test_a_measure_wins_over_a_row_column_whatever_the_case():
+    tables = {"T": {"columns": ["total"], "rows": [[1]]}}
+    got, err = calc('ADDCOLUMNS(T, "Z", [TOTAL])', tables, {"Total": "100"})
+    assert err is None and got["rows"] == [[1, 100]]
