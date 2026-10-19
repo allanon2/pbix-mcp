@@ -32,9 +32,9 @@ import os
 import sqlite3
 import tempfile
 from dataclasses import dataclass, field
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
-from pbix_mcp.m import MError, MSyntaxError, Table, evaluate
+from pbix_mcp.m import MError, MSyntaxError, Table, UnmappedSource, evaluate
 from pbix_mcp.m.load import load_rows
 
 # AMO Column data type -> pbix_mcp.m.load's names, and the calc-column materializer's.
@@ -55,6 +55,7 @@ class RefreshResult:
     tables: dict[str, int] = field(default_factory=dict)          # refreshed table -> rows
     calculated_columns: list[str] = field(default_factory=list)    # tables whose calculated columns were recomputed
     calculated_tables: list[str] = field(default_factory=list)     # recomputed, in order
+    unmapped: dict[str, str] = field(default_factory=dict)         # table -> a file the mapping doesn't cover
 
 
 def datamodel_fingerprint(info: dict) -> str:
@@ -63,17 +64,20 @@ def datamodel_fingerprint(info: dict) -> str:
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def refresh_tables(alias: str, names: Sequence[str]) -> RefreshResult:
-    """Refresh ``names`` (tables whose partitions are M) of the model open as ``alias``."""
+def refresh_tables(alias: str, names: Sequence[str], *,
+                   files: Optional[Callable[[str], bytes]] = None) -> RefreshResult:
+    """Refresh ``names`` (tables whose partitions are M) of the model open as ``alias``. ``files`` reads the files
+    the M names (the caller's path mapping, raising UnmappedSource for one it doesn't map): a table whose M needs an
+    unmapped file keeps its saved data and is listed in ``unmapped`` (ADR-0013), not failed."""
     try:
-        return _refresh(alias, list(names))
+        return _refresh(alias, list(names), files)
     except RefreshError:
         raise
     except Exception as e:  # noqa: BLE001 - whatever failed, the model is untouched; say so as a refresh error
         raise RefreshError(", ".join(names) or "(none)", f"{type(e).__name__}: {e}") from e
 
 
-def _refresh(alias: str, names: list[str]) -> RefreshResult:
+def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes]]) -> RefreshResult:
     from pbix_mcp import server
 
     info = server._ensure_open(alias)
@@ -91,7 +95,8 @@ def _refresh(alias: str, names: list[str]) -> RefreshResult:
             texts = meta.m.get(name)
             if not texts:
                 raise MError("Expression.Error", f"The name '{name}' wasn't recognized.")
-            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture) for t in texts], name)
+            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files)
+                                   for t in texts], name)
         return cache[name]
 
     for name in names:
@@ -106,11 +111,16 @@ def _refresh(alias: str, names: list[str]) -> RefreshResult:
                 raise MError("Expression.Error", "The query doesn't return a table.")
             rows = load_rows(value, [(src, _LOAD_TYPE.get(t, "string")) for _, src, t in data],
                              errors_as_null=meta.errors_as_null)
+        except UnmappedSource as e:
+            result.unmapped[name] = e.path
+            continue
         except (MError, MSyntaxError) as e:
             raise RefreshError(name, str(e)) from None
         rows = [[_stored(v) for v in r] for r in rows]
         work[name] = {"columns": [n for n, _, _ in data], "rows": rows}
         result.tables[name] = len(rows)
+
+    names = [n for n in names if n not in result.unmapped]
 
     # 2. What's calculated over them, in dependency order.
     nodes = _stale_nodes(meta, ctx, set(names))
@@ -409,6 +419,11 @@ def _typed(value: Any, amo: int, table: str, column: str) -> Any:
             return _stored(value)
         if isinstance(value, dt.date):
             return _stored(dt.datetime(value.year, value.month, value.day))
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            from pbix_mcp.formats.vertipaq_decoder import _oa_date_to_python
+            got = _oa_date_to_python(float(value))     # the engine's date arithmetic yields the OLE serial
+            if isinstance(got, dt.datetime):
+                return got
     elif amo == 6 and isinstance(value, (int, float)) and not isinstance(value, bool) and float(value).is_integer():
         return int(value)
     elif amo in (8, 10) and isinstance(value, (int, float)) and not isinstance(value, bool):
