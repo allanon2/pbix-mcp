@@ -51,6 +51,10 @@ NOT_PUSHED = {
     "measure_expression": 'CALCULATE([Total], FILTER(F, F[Status] = "Won"))',
     "filter_over_all": 'CALCULATE(SUM(F[Value]), FILTER(ALL(F), F[Status] = "Won"))',
     "condition_with_measure": 'CALCULATE(SUM(F[Value]), FILTER(F, F[Value] > [Total] / 10))',
+    "table_in_another_case": 'CALCULATE(SUM(F[Value]), FILTER(f, F[Status] = "Won"))',
+    "quoted_in_another_case": "CALCULATE(SUM(F[Value]), FILTER('f', F[Status] = \"Won\"))",
+    "measure_as_a_column": 'CALCULATE(SUMX(F, F[Total]), FILTER(F, F[Status] = "Won"))',
+    "unknown_column": 'CALCULATE(SUM(F[Nope]), FILTER(F, F[Status] = "Won"))',
 }
 CONTEXTS = [
     {},

@@ -1179,9 +1179,9 @@ _CALC_REMOVE_RE = re.compile(
 _TREF = r"(?:'(?:[^']|'')+'|[^\W\d][\w .]*?)"
 _PUSHDOWN_AGG_RE = re.compile(
     r"(?is)^\s*(?:"
-    r"(?:SUM|AVERAGE|MIN|MAX|COUNT|COUNTA|DISTINCTCOUNT)\s*\(\s*(?P<t1>" + _TREF + r")\s*\[[^\]]+\]\s*\)"
+    r"(?:SUM|AVERAGE|MIN|MAX|COUNT|COUNTA|DISTINCTCOUNT)\s*\(\s*(?P<t1>" + _TREF + r")\s*\[(?P<c1>[^\]]+)\]\s*\)"
     r"|(?:SUMX|AVERAGEX|MINX|MAXX|COUNTX)\s*\(\s*(?P<t2>" + _TREF + r")\s*,\s*(?P<t3>" + _TREF
-    + r")\s*\[[^\]]+\]\s*\)"
+    + r")\s*\[(?P<c3>[^\]]+)\]\s*\)"
     r"|COUNTROWS\s*\(\s*(?P<t4>" + _TREF + r")\s*\)"
     r")\s*$")
 _CALC_PRED_RE = re.compile(
@@ -8416,7 +8416,9 @@ class DAXEngine:
             tname = tref
         else:
             return None
-        table = ctx.model_table(tname)
+        # The model's own spelling only: the engine's FILTER doesn't resolve
+        # another case of a table's name, so the rewrite would change its answer.
+        table = tname
         if table not in ctx.tables:
             return None
         m = _PUSHDOWN_AGG_RE.match(args[0])
@@ -8428,6 +8430,12 @@ class DAXEngine:
             ref = ref.strip()
             name = ref[1:-1].replace("''", "'") if ref.startswith("'") else ref
             if ctx.model_table(name) != table:
+                return None
+        # T[c] must be a column of T, not a measure the engine would evaluate
+        # with its own filters
+        for col in (m.group(g) for g in ('c1', 'c3')):
+            if col is not None and (col.strip() in ctx.measures
+                                    or ctx._find_col_idx(ctx.tables[table]["columns"], col.strip()) < 0):
                 return None
         cond = parts[1].strip()
         row = {c: None for c in ctx.tables[table]['columns']}
