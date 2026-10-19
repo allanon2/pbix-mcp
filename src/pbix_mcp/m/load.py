@@ -19,13 +19,15 @@ Any other pairing is an error naming it, not a guess.
 from __future__ import annotations
 
 import datetime as dt
+import math
 from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Any, Sequence
 
+from .library import ole_to_datetime
 from .values import CellError, MError, Table, kind_of
 
 DATA_TYPES = ("string", "int64", "double", "decimal", "boolean", "dateTime")
-_OLE_EPOCH = dt.datetime(1899, 12, 30)
+_DECIMAL = (Decimal("-922337203685477.5808"), Decimal("922337203685477.5807"))   # a currency's range
 
 
 def model_value(value: Any, data_type: str) -> Any:
@@ -40,17 +42,22 @@ def model_value(value: Any, data_type: str) -> Any:
         return value
     if data_type == "int64" and kind == "number" and float(value).is_integer():
         return int(value)
+    if kind == "number" and not math.isfinite(value) and data_type != "double":
+        raise MError("Expression.Error", f"A non-finite number can't be loaded into a {data_type} column.")
     if data_type == "double" and kind == "number":
         return float(value)
     if data_type == "decimal" and kind == "number":
-        return float(Decimal(str(value)).quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN))
+        d = Decimal(str(value))
+        if not _DECIMAL[0] <= d <= _DECIMAL[1]:
+            raise MError("Expression.Error", "The number is out of range of a decimal column.")
+        return float(d.quantize(Decimal("0.0001"), rounding=ROUND_HALF_EVEN))
     if data_type == "dateTime":
         if kind == "datetime":
             return value
         if kind == "date":
             return dt.datetime(value.year, value.month, value.day)
         if kind == "number":
-            return _OLE_EPOCH + dt.timedelta(days=value)
+            return ole_to_datetime(value)
     raise MError("Expression.Error", f"A {kind} value can't be loaded into a {data_type} column yet.")
 
 
