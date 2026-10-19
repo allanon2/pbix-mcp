@@ -153,8 +153,8 @@ def _promote_headers(table: Any, options: Any = None) -> Table:
     """The first row's values become the column names: text and numbers by default (Microsoft's reference), any
     scalar with PromoteAllScalars, written as Text.From writes it; a null, or a value not promoted, keeps its
     ColumnN name. As a Desktop refresh shows (#104's probes): an empty name stays empty, and a name already taken
-    gets "_<n>" with one counter across the table ("a", "a", "a_1" become a, a_1, a_1_2; "a", "a", "b", "a"
-    become a, a_1, b, a_2)."""
+    gets "_<n>" with one counter across the table, counting on until the name is free ("a", "a", "a_1" become
+    a, a_1, a_1_2; "a", "a_1", "a" become a, a_1, a_2; "a", "a", "b", "a" become a, a_1, b, a_2)."""
     t = _need_table(table, "Table.PromoteHeaders")
     all_scalars = False
     if options is not None:
@@ -180,10 +180,11 @@ def _promote_headers(table: Any, options: Any = None) -> Table:
     names: list[str] = []
     counter = 0
     for name in first:
-        while name in names:
+        candidate = name
+        while candidate in names:
             counter += 1
-            name = f"{name}_{counter}"
-        names.append(name)
+            candidate = f"{name}_{counter}"
+        names.append(candidate)
     return Table(names, [list(r) for r in t.rows[1:]], [ANY] * len(names))
 
 
@@ -193,7 +194,8 @@ _SCALARS = ("number", "text", "logical", "date", "datetime", "datetimezone", "ti
 def _before_delimiter(text: Any, delimiter: Any, index: Any = None) -> Any:
     """The text before the delimiter's index-th occurrence (0: the first), counted from the start or, with
     {index, RelativePosition.FromEnd}, from the end (Microsoft's reference). When there aren't that many
-    occurrences, the whole text, as a Desktop refresh shows (#104)."""
+    occurrences: the whole text counting from the start, "" counting from the end, as a Desktop refresh shows
+    (#104)."""
     if text is None:
         return None
     if not isinstance(text, str) or not isinstance(delimiter, str) or delimiter == "":
@@ -215,7 +217,7 @@ def _before_delimiter(text: Any, delimiter: Any, index: Any = None) -> Any:
         positions.append(i)
         start = i + len(delimiter)
     if len(positions) <= n:
-        return text
+        return text if where == FROM_START else ""
     pos = positions[n] if where == FROM_START else positions[len(positions) - 1 - n]
     return text[:pos]
 

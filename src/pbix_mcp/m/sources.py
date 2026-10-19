@@ -8,22 +8,25 @@ raises ``UnmappedSource``. That isn't an M error -- ``try`` doesn't catch it
 and a column generator doesn't turn it into an error cell -- so a refresh
 always reports the table as unmapped rather than loading a fallback or nulls.
 
-Rules follow Microsoft's function reference. Where it is silent the reader
-refuses (an error naming what isn't known yet), so a refresh never stores a
-guess; each such rule is settled by a Desktop refresh of a purpose-built source
-(ADR-0013's D3). Excel.Workbook (openpyxl) and Parquet.Document (pyarrow) need
-the ``pbix-mcp[sources]`` extra.
+Rules follow Microsoft's function reference and, where it is silent, what a
+Desktop refresh of purpose-built sources shows (pivot-studio #104); what
+neither settles is refused (an error naming what isn't known yet), so a
+refresh never stores a guess. A malformed file is a DataFormat.Error.
+Excel.Workbook reads the package itself (zipfile, ElementTree);
+Parquet.Document needs the ``pbix-mcp[sources]`` extra (pyarrow).
 """
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
 import io
+import math
 import posixpath
 import re
 import threading
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from collections import OrderedDict
 from decimal import Decimal
 from functools import partial
@@ -76,14 +79,15 @@ def _csv_document(source: Any, columns: Any = None, delimiter: Any = None, extra
             raise _error("Csv.Document: an options record applies only when delimiter, extraValues and encoding are "
                          "null (Microsoft's reference).")
         options = columns
-        known = {"Delimiter", "Columns", "Encoding", "CsvStyle", "QuoteStyle", "ExtraValues", "IncludeByteOrderMark"}
+        known = {"Delimiter", "Columns", "Encoding", "CsvStyle", "QuoteStyle", "ExtraValues"}
         if any(k not in known for k in options.fields):
-            raise _error(f"Csv.Document: unknown options {sorted(set(options.fields) - known)}.")
+            raise _error(f"Csv.Document: options {sorted(set(options.fields) - known)} aren't supported.")
         get = lambda k: options[k] if k in options else None  # noqa: E731
         columns, delimiter, encoding, extra = get("Columns"), get("Delimiter"), get("Encoding"), get("ExtraValues")
         quote = QUOTE_CSV if get("QuoteStyle") is None else get("QuoteStyle")
         style = CSV_QUOTE_AFTER_DELIMITER if get("CsvStyle") is None else get("CsvStyle")
-    if quote not in (QUOTE_NONE, QUOTE_CSV) or style not in (CSV_QUOTE_AFTER_DELIMITER, CSV_QUOTE_ALWAYS):
+    if (type(quote) is not int or type(style) is not int or quote not in (QUOTE_NONE, QUOTE_CSV)
+            or style not in (CSV_QUOTE_AFTER_DELIMITER, CSV_QUOTE_ALWAYS)):
         raise _error("Csv.Document: unknown QuoteStyle or CsvStyle.")
     if style == CSV_QUOTE_ALWAYS:
         raise _error("Csv.Document: CsvStyle.QuoteAlways isn't supported yet.")
@@ -163,7 +167,10 @@ def _csv_columns(columns: Any, rows: list[list[str]]) -> list[str]:
     if type(columns) is int and columns >= 0:
         return [f"Column{i + 1}" for i in range(columns)]
     if isinstance(columns, list) and all(isinstance(force(c), str) for c in columns):
-        return [str(force(c)) for c in columns]
+        names = [str(force(c)) for c in columns]
+        if len(set(names)) != len(names):
+            raise _error("Csv.Document: a column name is repeated.")
+        return names
     if isinstance(columns, MType):
         raise _error("Csv.Document: Columns as a table type isn't supported yet (whether its types convert isn't "
                      "known).")
@@ -180,6 +187,8 @@ def _decode(source: Any, encoding: Any) -> str:
     name = ENCODINGS[encoding]
     # A byte order mark wins over the encoding given: a Desktop refresh reads a UTF-16 file given 65001, and a
     # UTF-8 one given 1252, by their marks (#104's D3 probes).
+    if source.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        raise _error("A UTF-32 file isn't supported yet.")
     for bom, by in ((b"\xef\xbb\xbf", "utf-8"), (b"\xff\xfe", "utf-16-le"), (b"\xfe\xff", "utf-16-be")):
         if source.startswith(bom):
             source, name = source[len(bom):], by
@@ -215,17 +224,20 @@ def _excel_workbook(workbook: Any, use_headers: Any = None, delay_types: Any = N
         options = use_headers
         if any(k not in ("UseHeaders", "DelayTypes", "InferSheetDimensions") for k in options.fields):
             raise _error("Excel.Workbook: unknown options.")
-        infer = bool(options["InferSheetDimensions"]) if "InferSheetDimensions" in options else False
+        infer = options["InferSheetDimensions"] if "InferSheetDimensions" in options else False
         use_headers = options["UseHeaders"] if "UseHeaders" in options else None
         delay_types = options["DelayTypes"] if "DelayTypes" in options else None
-    if use_headers not in (None, False, True):
-        raise _error("Excel.Workbook: useHeaders must be a logical.")
-    if not delay_types:
+    if use_headers is not None and not isinstance(use_headers, bool) or not isinstance(infer, bool):
+        raise _error("Excel.Workbook: useHeaders and InferSheetDimensions must be logicals.")
+    if delay_types is not True:
         raise _error("Excel.Workbook: column types without delayTypes aren't supported yet (Desktop writes true).")
     if not isinstance(workbook, bytes):
         raise _error(f"Excel.Workbook needs binary, not {kind_of(workbook)}.")
     digest = hashlib.sha256(workbook).hexdigest()
-    sheets, tables = _workbook_parts(workbook)
+    sheets, tables, names = _malformed_is_an_error(lambda: _workbook_parts(workbook))
+    if names and any(tables.values()):
+        raise _error("Excel.Workbook: a workbook with both tables and defined names isn't supported yet (their "
+                     "order isn't measured).")
     headers = bool(use_headers)
     rows: list[list[Any]] = []
     for name, state, part in sheets:
@@ -236,7 +248,25 @@ def _excel_workbook(workbook: Any, use_headers: Any = None, delay_types: Any = N
         for t in tables.get(name, []):
             load = partial(_table, workbook, part, t)
             rows.append([t["name"], LazyTable(_cached(digest, "table", t["name"], load)), t["name"], "Table", False])
+    for name, item in names:
+        rows.append([name, LazyTable(partial(_defined_name, item)), item, "DefinedName", False])
     return Table(list(_NAV), rows, [ANY] * len(_NAV))
+
+
+def _defined_name(item: str) -> Table:
+    raise _error(f"Excel.Workbook: reading the defined name {item!r} isn't supported yet.")
+
+
+_MALFORMED = (KeyError, ET.ParseError, ValueError, zipfile.BadZipFile, NotImplementedError, RuntimeError,
+              AttributeError, TypeError, EOFError, IndexError, zlib.error, UnicodeDecodeError)
+
+
+def _malformed_is_an_error(read: Callable[[], Any]) -> Any:
+    """``read()``, a broken package's exception reported as the file's error."""
+    try:
+        return read()
+    except _MALFORMED as e:
+        raise _error(f"The Excel workbook can't be read: {type(e).__name__}: {e}", "DataFormat.Error") from None
 
 
 def _cached(digest: str, kind: str, name: str, load: Callable[[], Table]) -> Callable[[], Table]:
@@ -247,7 +277,7 @@ def _cached(digest: str, kind: str, name: str, load: Callable[[], Table]) -> Cal
             if hit is not None:
                 _SHEETS.move_to_end(key)
                 return hit
-        table = load()
+        table: Table = _malformed_is_an_error(load)
         with _SHEETS_LOCK:
             _SHEETS[key] = table
             while len(_SHEETS) > _SHEETS_KEPT:
@@ -256,15 +286,14 @@ def _cached(digest: str, kind: str, name: str, load: Callable[[], Table]) -> Cal
     return get
 
 
-def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str, str]], dict[str, list[dict]]]:
-    """The sheets (name, state, part) in workbook order, and each sheet's tables (name, ref, header and totals
-    rows, column names) in the sheet's relationship order, read from the package's own parts."""
-    try:
-        z = zipfile.ZipFile(io.BytesIO(workbook))
-        wb = ET.fromstring(z.read("xl/workbook.xml"))
-        rels = _rels(z, "xl/workbook.xml")
-    except (zipfile.BadZipFile, KeyError, ET.ParseError) as e:
-        raise _error(f"The file isn't an Excel workbook (.xlsx): {e}", "DataFormat.Error") from None
+def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str, str]], dict[str, list[dict]],
+                                               list[tuple[str, str]]]:
+    """The sheets (name, state, part) in workbook order, each sheet's tables (name, ref, header and totals rows,
+    column names) in the sheet's relationship order, and the defined names (name, item: "Sheet!name" for one
+    local to a sheet, as a Desktop refresh lists it, #104), read from the package's own parts."""
+    z = zipfile.ZipFile(io.BytesIO(workbook))
+    wb = ET.fromstring(z.read("xl/workbook.xml"))
+    rels = _rels(z, "xl/workbook.xml")
     sheets, tables = [], {}
     for s in wb.iterfind("m:sheets/m:sheet", _NS):
         name, state = s.get("name") or "", s.get("state") or "visible"
@@ -281,7 +310,14 @@ def _workbook_parts(workbook: bytes) -> tuple[list[tuple[str, str, str]], dict[s
                           "header": int(t.get("headerRowCount", "1")), "totals": int(t.get("totalsRowCount", "0")),
                           "columns": [c.get("name") for c in t.iterfind("m:tableColumns/m:tableColumn", _NS)]})
         tables[name] = found
-    return sheets, tables
+    names = []
+    all_sheets = [s.get("name") or "" for s in wb.iterfind("m:sheets/m:sheet", _NS)]
+    for d in wb.iterfind("m:definedNames/m:definedName", _NS):
+        if d.get("hidden") in ("1", "true"):
+            raise _error("Excel.Workbook: a hidden defined name isn't supported yet.")
+        name, local = d.get("name") or "", d.get("localSheetId")
+        names.append((name, f"{all_sheets[int(local)]}!{name}" if local is not None else name))
+    return sheets, tables, names
 
 
 def _rels(z: zipfile.ZipFile, part: str) -> dict[str, str]:
@@ -298,7 +334,9 @@ def _rels(z: zipfile.ZipFile, part: str) -> dict[str, str]:
     return out
 
 
-_REF = re.compile(r"^\$?([A-Z]{1,3})\$?(\d+)$")
+_REF = re.compile(r"^\$?([A-Z]{1,3})\$?([0-9]{1,7})$")
+_MAX_COL, _MAX_ROW = 16384, 1048576          # Excel's sheet: XFD1048576
+_MAX_CELLS = 20_000_000
 
 
 def _cell_ref(ref: str) -> tuple[int, int]:
@@ -309,7 +347,10 @@ def _cell_ref(ref: str) -> tuple[int, int]:
     col = 0
     for ch in m.group(1):
         col = col * 26 + ord(ch) - 64
-    return col, int(m.group(2))
+    row = int(m.group(2))
+    if not (1 <= col <= _MAX_COL and 1 <= row <= _MAX_ROW):
+        raise _error(f"Excel.Workbook: the cell reference {ref!r} is outside a sheet.", "DataFormat.Error")
+    return col, row
 
 
 def _range(ref: str) -> tuple[int, int, int, int]:
@@ -332,7 +373,15 @@ def _text_of(node: Optional[ET.Element]) -> Optional[str]:
         elif tag == "r":
             t = child.find("m:t", _NS)
             parts.append(t.text or "" if t is not None else "")
-    return "".join(parts) if parts else None
+    return _unescape("".join(parts)) if parts else None
+
+
+_ESCAPE = re.compile(r"_x([0-9A-Fa-f]{4})_")
+
+
+def _unescape(text: str) -> str:
+    """OOXML's escapes for characters XML can't hold: "_x000D_" is CR (a Desktop refresh decodes them, #104)."""
+    return _ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
 
 
 def _shared_strings(z: zipfile.ZipFile) -> list[Optional[str]]:
@@ -344,8 +393,13 @@ def _shared_strings(z: zipfile.ZipFile) -> list[Optional[str]]:
 
 
 def _number(text: str) -> int | float:
+    if len(text) > 400:
+        raise ValueError(text[:20])
     if any(ch in text for ch in ".eE"):
-        return float(text)
+        f = float(text)
+        if not math.isfinite(f):
+            raise ValueError(text)
+        return f
     return int(text)
 
 
@@ -371,14 +425,19 @@ def _cell_value(c: ET.Element, shared: list[Optional[str]]) -> Any:
             raise _error(f"Excel.Workbook: the cell {where} holds {raw!r}, not a number.", "DataFormat.Error") from None
     if t == "s":
         try:
-            return shared[int(raw)]
+            index = int(raw)
+            if index < 0:
+                raise IndexError(index)
+            return shared[index]
         except (ValueError, IndexError):
             raise _error(f"Excel.Workbook: the cell {where} names a shared string that isn't there.",
                          "DataFormat.Error") from None
     if t == "str":
-        return raw
+        return _unescape(raw)
     if t == "b":
-        return raw.strip() not in ("0", "false")
+        if raw.strip() not in ("0", "1"):
+            raise _error(f"Excel.Workbook: the cell {where} holds {raw!r}, not a logical.", "DataFormat.Error")
+        return raw.strip() == "1"
     if t == "e":
         return CellError(MError("DataFormat.Error", f"Invalid cell value '{raw}'."))
     raise _error(f"Excel.Workbook: the cell {where} has type {t!r}, not supported yet.")
@@ -389,10 +448,7 @@ def _grid(workbook: bytes, part: str, bounds: Optional[tuple[int, int, int, int]
     columns, down to the last row that stores a cell (a formatted empty one too), or (``infer``) over the cells
     holding values."""
     z = zipfile.ZipFile(io.BytesIO(workbook))
-    try:
-        root = ET.fromstring(z.read(part))
-    except (KeyError, ET.ParseError) as e:
-        raise _error(f"Excel.Workbook: the sheet part {part!r} can't be read: {e}", "DataFormat.Error") from None
+    root = ET.fromstring(z.read(part))
     shared = _shared_strings(z)
     cells: dict[tuple[int, int], Any] = {}
     stored: list[tuple[int, int]] = []      # every cell the file stores, a formatted empty one too
@@ -422,6 +478,8 @@ def _grid(workbook: bytes, part: str, bounds: Optional[tuple[int, int, int, int]
                        default=min_row - 1)
             bounds = (min_col, min_row, max_col, last)
     min_col, min_row, max_col, max_row = bounds
+    if (max_col - min_col + 1) * max(0, max_row - min_row + 1) > _MAX_CELLS:
+        raise _error(f"Excel.Workbook: the sheet spans more than {_MAX_CELLS} cells; not supported.")
     return [[cells.get((col, r)) for col in range(min_col, max_col + 1)] for r in range(min_row, max_row + 1)]
 
 
@@ -437,6 +495,8 @@ def _sheet(workbook: bytes, part: str, infer: bool, headers: bool) -> Table:
 
 
 def _table(workbook: bytes, part: str, t: dict) -> Table:
+    if t["ref"] is None:
+        raise _error(f"Excel.Workbook: table {t['name']!r} has no range.", "DataFormat.Error")
     if t["header"] != 1:
         raise _error(f"Excel.Workbook: table {t['name']!r} has no header row; not supported yet.")
     min_col, min_row, max_col, max_row = _range(t["ref"])
@@ -450,8 +510,8 @@ def _parquet_document(source: Any, options: Any = None) -> Table:
     """A Parquet file's columns. Microsoft's reference has no page for it; each type reads as a Desktop refresh
     reads it (#104's D3 probes): integers (unsigned 64-bit too) and floating point as numbers (a float32 widened),
     text, logical, date, a timestamp without a zone as datetime and with one as a datetimezone at UTC (+00:00,
-    whatever the zone), time, binary, and a decimal as its number (one a double can't hold exactly is refused
-    here)."""
+    whatever the zone), time, binary, and a decimal as a double when the double gives its digits back (a wider
+    one is refused here)."""
     if options is not None:
         raise _error("Parquet.Document: options aren't supported yet.")
     if not isinstance(source, bytes):

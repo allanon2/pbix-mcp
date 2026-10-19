@@ -57,42 +57,55 @@ def _culture(culture: Any, default: str) -> str:
 
 _NUMBER = re.compile(r"""^(?P<open>\()?
                          (?P<sign>[+-])?\$?(?P<sign2>[+-])?
-                         (?P<int>\d+(?:,\d+)*|)
-                         (?:\.(?P<frac>\d*))?
-                         (?:[eE](?P<exp>[+-]?\d+))?
+                         (?P<int>[0-9]+(?:,[0-9]+)*|)
+                         (?:\.(?P<frac>[0-9]*))?
+                         (?:[eE](?P<exp>[+-]?[0-9]+))?
                          (?P<pct>%)?
                          (?P<close>\))?$""", re.X)
+_EXACT_DIGITS = 28            # a whole number up to this many digits stays exact, as M's decimals do
 
 
 def number_from_text(text: str, culture: str) -> int | float | None:
-    """en-US number text, as a Desktop refresh reads it (#104's D1 probes): digits with "," between any of
+    """en-US number text, as a Desktop refresh reads it (#104's probes): ASCII digits with "," between any of
     them ("1,23" is 123), ".", an exponent, a sign before or after a leading "$" ("-$5", "$-5"), a trailing "%"
-    (a hundredth), and an accounting negative in parentheses ("(1,000)" is -1000). Empty text is null. A number
-    beyond a double's range is infinite ("1e400")."""
+    (a hundredth), and an accounting negative in parentheses ("(1,000)", "($5)", "(1e3)"; not "(5%)"). Empty text
+    is null. A whole number keeps its digits ("9007199254740993"); a number beyond a double's range is infinite
+    ("1e99999") and one below it 0."""
     if text == "":
         return None
     s = text.strip()
     m = _NUMBER.match(s)
     if (not m or not (m.group("int") or m.group("frac")) or bool(m.group("open")) != bool(m.group("close"))
-            or m.group("sign") and m.group("sign2") or m.group("open") and (m.group("sign") or m.group("sign2"))):
+            or m.group("sign") and m.group("sign2") or m.group("open") and (m.group("sign") or m.group("sign2"))
+            or m.group("open") and m.group("pct")):
         raise _error("We couldn't convert to Number.", "DataFormat.Error")
+    negative = "-" in (m.group("sign"), m.group("sign2")) or bool(m.group("open"))
     digits = (m.group("int") or "0").replace(",", "") + ("." + m.group("frac") if m.group("frac") else "")
     value = Decimal(digits)
     if m.group("exp"):
-        value = value.scaleb(int(m.group("exp")))
+        exp = m.group("exp")
+        if len(exp.lstrip("+-")) > 6:                     # far beyond a double either way
+            if value == 0 or exp.startswith("-"):
+                return 0
+            return float("-inf") if negative else float("inf")
+        value = value.scaleb(int(exp))
     if m.group("pct"):
         value = value / 100
-    if "-" in (m.group("sign"), m.group("sign2")) or m.group("open"):
+    if negative:
         value = -value
-    if value == value.to_integral_value() and not (m.group("frac") or m.group("exp") or m.group("pct")):
+    whole = not (m.group("frac") or m.group("exp") or m.group("pct"))
+    if whole and len(digits.lstrip("0")) <= _EXACT_DIGITS:
         return int(value)
-    return float(value)
+    try:
+        return float(value)
+    except OverflowError:
+        return float("-inf") if negative else float("inf")
 
 
 _DATETIME_FORMATS = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S.%f",
                      "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
                      "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
-                     "%b %d, %Y")
+                     "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y")
 _TWO_DIGIT_YEAR = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2})$")
 
 
@@ -109,8 +122,8 @@ def _parse_datetime(text: str) -> tuple[dt.datetime, bool]:
             continue
     m = _TWO_DIGIT_YEAR.match(s)
     if m:
-        # A two-digit year falls in 1950-2049, Windows' and .NET's default window (Microsoft's
-        # Calendar.TwoDigitYearMax); Desktop reads "11/20/15" as 2015.
+        # A two-digit year falls in 1950-2049, as a Desktop refresh reads them ("11/20/49" is 2049, "11/20/50"
+        # 1950; #104).
         yy = int(m.group(3))
         try:
             return dt.datetime(2000 + yy if yy <= 49 else 1900 + yy, int(m.group(1)), int(m.group(2))), False
@@ -121,7 +134,8 @@ def _parse_datetime(text: str) -> tuple[dt.datetime, bool]:
 
 def datetime_from_text(text: str, culture: str) -> dt.datetime | None:
     """ISO 8601 forms, en-US month/day/year with an optional 12- or 24-hour time, a two-digit year, or
-    "Nov 20, 2015" (#104's D1 probes). Empty text is null."""
+    "Nov 20, 2015", "November 20, 2015" or "20 Nov 2015", month names in any case (#104's probes). Empty text is
+    null."""
     if text == "":
         return None
     return _parse_datetime(text)[0]
@@ -215,7 +229,7 @@ def to_text(v: Any, culture: str) -> Any:
     """Text.From, en-US, as a Desktop refresh writes it (#104's D1 probes): a whole number in full digits
     (1e21 is "1000000000000000000000"), any other number in 15 significant digits, or 17 when 15 don't give the
     number back ("0.33333333333333331"), with an exponent below 1e-4 ("1E-05"); "true"/"false"; a date as
-    "11/20/2015" and a datetime as "11/20/2015 10:59:00 AM"."""
+    "11/20/2015" and a datetime as "11/20/2015 10:59:00 AM", the year in four digits."""
     if v is None or isinstance(v, str):
         return v
     if isinstance(v, bool):
@@ -224,16 +238,17 @@ def to_text(v: Any, culture: str) -> Any:
         return str(v)
     if isinstance(v, float) and math.isfinite(v):
         if v.is_integer():
-            if abs(v) > 1e21:
-                raise _error("Converting a number above 1e21 to text isn't supported yet.")
+            # In full when the double is exactly its shortest digits (1e21, 2e21); others aren't measured.
+            if Decimal(repr(v)) != int(v):
+                raise _error("Converting this whole number to text isn't supported yet.")
             return str(int(v))
         text = "%.15G" % v
         return text if float(text) == v else "%.17G" % v
     if isinstance(v, dt.datetime) and not v.tzinfo and not v.microsecond:
         hour = v.hour % 12 or 12
-        return f"{v.month}/{v.day}/{v.year} {hour}:{v.minute:02d}:{v.second:02d} {'AM' if v.hour < 12 else 'PM'}"
+        return f"{v.month}/{v.day}/{v.year:04d} {hour}:{v.minute:02d}:{v.second:02d} {'AM' if v.hour < 12 else 'PM'}"
     if isinstance(v, dt.date) and not isinstance(v, dt.datetime):
-        return f"{v.month}/{v.day}/{v.year}"
+        return f"{v.month}/{v.day}/{v.year:04d}"           # #date(5, 1, 1) is "1/1/0005"
     # Infinities, fractional seconds, zones, times and durations aren't settled by a Desktop refresh yet.
     raise _error(f"Converting a {kind_of(v)} value to text isn't supported yet.")
 
@@ -459,7 +474,7 @@ def _seconds(v: Any, what: str) -> tuple[int, int]:
     if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)):
         raise _error(f"{what} needs a number of seconds.")
     whole = math.floor(v)
-    return whole, round((Decimal(str(v)) - whole) * 1_000_000)
+    return whole, int((Decimal(str(v)) - whole) * 1_000_000)     # M keeps 100 ns; the 7th digit is dropped
 
 
 _V = TypeVar("_V")
@@ -499,6 +514,8 @@ def _datetimezone(y: Any, m: Any, d: Any, h: Any, mi: Any, s: Any, oh: Any, om: 
 
 def _time(h: Any, mi: Any, s: Any) -> dt.time:
     hh, mm, ss, us = _time_parts(h, mi, s, "#time")
+    if (hh, mm, ss, us) == (24, 0, 0, 0):
+        return dt.time(0)          # the specification allows 24:00:00; a Desktop refresh gives 00:00:00 (#104)
     return _make("#time", lambda: dt.time(hh, mm, ss, us))
 
 
