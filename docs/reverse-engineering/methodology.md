@@ -37,3 +37,6 @@ the pbix-mcp package.
 - [experiments/cryptkey.md](experiments/cryptkey.md) — CryptKey.bin is
   independently generated (format scaffold + self-authored key region), not
   lifted from a Microsoft file.
+- [experiments/2026-10-19-clean-room-collation.md](experiments/2026-10-19-clean-room-collation.md) —
+  text collation and find (issue #198) re-derived from Microsoft's published
+  sorting weight table, [MS-UCODEREF] and Desktop's black-box answers.

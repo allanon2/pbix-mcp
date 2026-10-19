@@ -40,12 +40,18 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-19 (0.9.144): docs 1-66 and GitHub issues/PRs #1-#204 are
-closed except #198.** 0.9.144 closes #202, #203 and #204: @allanon2's PRs
+**Updated 2026-10-20 (0.9.145): docs 1-66 and GitHub issues/PRs #1-#204 are
+closed.** 0.9.145 closes #198: the collation 0.9.138 introduced is re-derived
+clean-room -- Microsoft's published Windows Server 2008 sorting weight table,
+[MS-UCODEREF] 3.1.5.2 and black-box Desktop answers (204 new probes) -- and the
+history from 0.9.138 on is rewritten to carry it
+(`docs/reverse-engineering/experiments/2026-10-19-clean-room-collation.md`).
+
+As of 0.9.144, docs 1-66 and GitHub issues/PRs #1-#204 were closed except
+#198. 0.9.144 closes #202, #203 and #204: @allanon2's PRs
 #199 (In-set union memo), #200 (CALCULATE filter pushdown) and #201 (index
 spellings memo), solved on our side; same answers, verified against Desktop
-(build_b200.py, 756 probes). #198: the 0.9.138 collation used Desktop's
-engine binary; to be re-derived clean-room.
+(build_b200.py, 756 probes); #198 was open.
 
 As of 0.9.143, docs 1-66 and GitHub issues/PRs #1-#197 were closed; #198 was
 open. 0.9.143 closes #196 with PR #197's clean-room re-derivation
@@ -531,6 +537,11 @@ Kept so the same items are not re-litigated:
 
 ## Recently closed
 
+- **GH #198** -- CLOSED (0.9.145). Part of 0.9.138's collation (#185, #180)
+  was derived from Desktop's engine binary; re-derived from the published
+  table, [MS-UCODEREF] and black-box Desktop answers (Q1-Q10, R, S, T: 204
+  probes), history from 0.9.138 rewritten. Regression:
+  tests/test_issue198_clean_room_probes.py and the batteries b181-b190.
 - **GH #202, #203, #204** (PRs #199, #200, #201 by @allanon2) -- CLOSED
   (0.9.144). In-set filters memoize their unions and each value's spellings;
   CALCULATE(<aggregate of T>, FILTER(T, <condition>)) runs as a column filter
