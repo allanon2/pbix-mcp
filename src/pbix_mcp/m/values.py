@@ -17,14 +17,22 @@ from typing import Any, Callable, Optional
 class MError(Exception):
     """An M error value: ``[Reason, Message, Detail]``."""
 
-    def __init__(self, reason: str, message: str, detail: Any = None):
+    def __init__(self, reason: Optional[str], message: Optional[str], detail: Any = None):
         super().__init__(f"[{reason}] {message}")
         self.reason, self.message, self.detail = reason, message, detail
 
 
 @dataclass(frozen=True)
 class CellError:
+    """A list item or table cell whose value is an error: raised when it is read."""
     error: MError
+
+
+def force(v: Any) -> Any:
+    """``v``, or the error a failed item or cell holds."""
+    if isinstance(v, CellError):
+        raise v.error
+    return v
 
 
 class Thunk:
@@ -53,6 +61,11 @@ class Thunk:
                 self._value = self._compute()
             except MError as e:
                 self._error = e
+            except RecursionError:
+                self._error = MError("Expression.Error", "Evaluation nested too deeply.")
+            except BaseException:
+                self._state = 0     # not an M error (a bug or an interrupt): let it be retried, not called a cycle
+                raise
             self._state = 2
             self._compute = None  # type: ignore[assignment]
         if self._error is not None:
@@ -132,7 +145,9 @@ class Function:
 
 
 def kind_of(value: Any) -> str:
-    """The primitive type name of a value."""
+    """The primitive type name of a value. A failed item or cell raises its error (reading it is what fails)."""
+    if isinstance(value, CellError):
+        raise value.error
     if value is None:
         return "null"
     if isinstance(value, bool):

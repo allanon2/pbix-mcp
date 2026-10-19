@@ -2,6 +2,7 @@
 M specification, conversions from Microsoft's function reference, and this
 package's own Enter-data M evaluated back to the rows it was built from."""
 import datetime as dt
+import math
 
 import pytest
 
@@ -162,7 +163,10 @@ class TestTables:
         assert LIBRARY_NAMES == {
             "Binary.FromText", "BinaryEncoding.Base64", "BinaryEncoding.Hex", "Binary.Decompress", "Compression.GZip",
             "Compression.Deflate", "Json.Document", "Table.FromRows", "#table", "Table.TransformColumnTypes",
-            "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type"}
+            "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type", "#infinity", "#nan"}
+        # The enumerations' values, from Microsoft's reference pages.
+        assert [evaluate(x) for x in ("BinaryEncoding.Base64", "BinaryEncoding.Hex", "Compression.GZip",
+                                      "Compression.Deflate")] == [0, 1, 0, 1]
 
 
 class TestEnterData:
@@ -201,3 +205,117 @@ class TestLoad:
     def test_load_rows_maps_columns_and_errors(self):
         t = evaluate('Table.TransformColumnTypes(#table({"a", "b"}, {{"1", "x"}, {"y", "z"}}), {{"a", Int64.Type}})')
         assert load_rows(t, [("b", "string"), ("a", "double")], errors_as_null=True) == [["x", 1.0], ["z", None]]
+
+
+class TestReviewFindings:
+    """Cases from an independent review against the specification and the function reference."""
+
+    def test_lists_are_lazy(self):
+        # The specification: { error "a", 1, error "c"}{1} is 1.
+        assert evaluate('{ error "a", 1, error "c"}{1}') == 1
+        with pytest.raises(MError, match="a"):
+            evaluate('{ error "a", 1}{0}')
+        assert evaluate('#table({"a"}, {{error "x"}, {1}}){1}[a]') == 1
+        t = evaluate('#table({"a"}, {{error "x"}, {1}})')
+        assert force_table(t, errors_as_null=True) == [[None], [1]]
+
+    def test_projections(self):
+        r = evaluate("[A = 1, B = 2][[B], [C]]?")
+        assert list(r.fields) == ["B", "C"] and r["C"] is None
+        assert evaluate('[A = error "x", B = 1][[B]][B]') == 1
+        with pytest.raises(MError, match="'C'"):
+            evaluate("[A = 1][[C]]")
+
+    def test_parameter_and_return_types_are_checked(self):
+        with pytest.raises(MError, match="parameter x"):
+            evaluate('((x as number) => x)("a")')
+        with pytest.raises(MError, match="returns number"):
+            evaluate('(() as number => "a")()')
+        assert evaluate("((optional x as number) => x)()") is None
+        assert evaluate("((x as nullable number) => x)(null)") is None
+
+    def test_table_equality_ignores_column_order(self):
+        assert evaluate('#table({"A","B"},{{1,2}}) = #table({"B","A"},{{2,1}})') is True
+        assert evaluate('#table({"A","B"},{{1,2}}) = #table({"A","B"},{{2,1}})') is False
+
+    def test_error_records(self):
+        e = evaluate('try error [Message = "m"]')["Error"]
+        assert e["Reason"] is None and e["Message"] == "m" and e["ErrorCode"] is None
+        e = evaluate('try error [Reason = "R", Message.Format = "v #{0} #{1}", Message.Parameters = {"z", 2}]')["Error"]
+        assert e["Reason"] == "R" and e["Message"] == "v z 2"
+        assert evaluate('try error "x" catch (e) => e[Reason]') == "Expression.Error"
+        assert evaluate('try error "x" catch () => 3') == 3
+
+    def test_ieee_division_and_nan(self):
+        assert evaluate("1 / -0.0") == float("-inf")
+        assert evaluate("-1 / 0") == float("-inf")
+        assert math.isnan(evaluate("(0/0) / 0"))
+        assert evaluate("#nan = #nan") is False
+
+    def test_null_with_operators_of_the_wrong_kind(self):
+        assert evaluate('"a" & null') is None
+        with pytest.raises(MError):
+            evaluate("{1} & null")
+        with pytest.raises(MError):
+            evaluate("null < {1}")
+        assert evaluate("null < 1") is None
+
+    def test_key_lookups(self):
+        t = '#table({"A", "B"}, {{1, 1}, {2, 1}})'
+        assert evaluate(t + "{[A = 3]}?") is None
+        with pytest.raises(MError, match="more than one"):
+            evaluate(t + "{[B = 1]}?")
+        with pytest.raises(MError, match="column 'Z'"):
+            evaluate(t + "{[Z = 1]}?")
+
+    def test_combine_with_a_table_type_and_without_a_count(self):
+        # The reference's Example 3: the type projects the result.
+        t = evaluate('Table.Combine({#table({"a", "b"}, {{"x", 1}})}, type table [a = text])')
+        assert t.columns == ["a"] and t.rows == [["x"]] and t.types[0].kind == "text"
+        with pytest.raises(MError):
+            evaluate('Table.Combine({#table({"a"}, {{1}})}, 1)')
+
+    def test_transform_single_pair(self):
+        # The reference's Example 1 passes one {column, type} pair.
+        t = evaluate('Table.TransformColumnTypes(#table({"a"}, {{"1"}}), {"a", type number})')
+        assert t.rows == [[1]]
+
+    def test_no_python_exception_escapes(self):
+        for m in ('Table.TransformColumnTypes(#table({"c"}, {{1/0}, {0/0}}), {{"c", Currency.Type}})',
+                  'Table.TransformColumnTypes(#table({"c"}, {{1e10}}), {{"c", type datetime}})',
+                  'Table.TransformColumnTypes(#table({"c"}, {{"1e400"}}), {{"c", type number}})'):
+            t = evaluate(m)
+            assert all(isinstance(r[0], CellError) for r in t.rows), m
+        with pytest.raises(MError, match="nested too deeply"):
+            evaluate("let f = (n) => @f(n) in f(1)")
+        for v, ty in ((1e10, "dateTime"), (1e30, "decimal"), (float("nan"), "decimal")):
+            with pytest.raises(MError):
+                model_value(v, ty)
+
+    def test_binary_and_json_inputs(self):
+        assert evaluate('Binary.FromText("QUJD")') == b"ABC"
+        assert evaluate('Binary.FromText("QU JD")') == b"ABC"
+        assert evaluate('Binary.FromText("414243", BinaryEncoding.Hex)') == b"ABC"
+        for m in ('Binary.FromText("QU!!JD")', 'Binary.FromText("QUJD", false)', 'Json.Document("NaN")',
+                  'Binary.Decompress(Binary.FromText("QUJD"), true)'):
+            with pytest.raises(MError):
+                evaluate(m)
+        r = evaluate('Json.Document("{""a"": [1, 2.5, true, null, ""x""]}")')
+        assert r["a"] == [1, 2.5, True, None, "x"]
+
+    def test_int64_and_currency_read_text_as_number_from_text(self):
+        # Microsoft's reference: other types go through Number.FromText, which has no "%" and takes no logical.
+        for cell in ('"10%"', "true"):
+            t = evaluate(f'Table.TransformColumnTypes(#table({{"c"}}, {{{{{cell}}}}}), {{{{"c", Int64.Type}}}})')
+            assert isinstance(t.rows[0][0], CellError), cell
+
+    def test_ole_dates(self):
+        assert model_value(-1.25, "dateTime") == dt.datetime(1899, 12, 29, 6)
+        assert model_value(0.5, "dateTime") == dt.datetime(1899, 12, 30, 12)
+        from pbix_mcp.m.library import datetime_to_ole
+        for d in (dt.datetime(1899, 12, 29, 6), dt.datetime(2014, 2, 9, 18)):
+            assert model_value(datetime_to_ole(d), "dateTime") == d
+
+    def test_text_from_refuses_what_no_source_shows(self):
+        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{3}, {1.5}}), {{"c", type text}})')
+        assert t.rows[0][0] == "3" and isinstance(t.rows[1][0], CellError)

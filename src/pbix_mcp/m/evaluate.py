@@ -11,12 +11,13 @@ the call. What the library holds is ``library.LIBRARY``; a name outside it is an
 from __future__ import annotations
 
 import datetime as dt
+import math
 from typing import Any, Callable, Optional
 
 from . import ast
 from .library import LIBRARY
 from .parser import parse_document
-from .values import ANY, CellError, Function, MError, MType, Record, Table, Thunk, kind_of
+from .values import ANY, CellError, Function, MError, MType, Record, Table, Thunk, force, kind_of
 
 Resolver = Callable[[str], Any]
 
@@ -30,7 +31,10 @@ def evaluate(source: str | ast.Node, *, resolve: Optional[Resolver] = None, cult
         for m in tree.members:
             scope.names[m.name] = ev.thunk(m.value, scope)
         return Record(dict(scope.names))
-    return ev.eval(tree, _Scope({}, None))
+    try:
+        return ev.eval(tree, _Scope({}, None))
+    except RecursionError:
+        raise MError("Expression.Error", "Evaluation nested too deeply.") from None
 
 
 def force_table(table: Table, *, errors_as_null: bool) -> list[list[Any]]:
@@ -113,7 +117,10 @@ class _Evaluator:
                     raise MError("Expression.Error", "A list range needs whole numbers.")
                 out.extend(range(int(first), int(last) + 1))
             else:
-                out.append(self.eval(item, scope))
+                try:
+                    out.append(self.eval(item, scope))
+                except MError as e:
+                    out.append(CellError(e))
         return out
 
     def _RecordExpr(self, n: ast.RecordExpr, scope: _Scope) -> Record:
@@ -134,31 +141,44 @@ class _Evaluator:
             if n.optional and n.name not in target.columns:
                 return None
             i = target.index(n.name)
-            return [_cell(row[i]) for row in target.rows]
+            return [row[i] for row in target.rows]
         raise MError("Expression.Error", f"Can't access field '{n.name}' of a {kind_of(target)} value.")
 
     def _FieldProjection(self, n: ast.FieldProjection, scope: _Scope) -> Any:
         target = self.lookup("_", scope) if n.target is None else self.eval(n.target, scope)
         if isinstance(target, Record):
-            names = [x for x in n.names if x in target] if n.optional else n.names
-            return Record({x: Thunk.of(target[x]) if x in target else Thunk.of(None) for x in names})
+            fields = {}
+            for x in n.names:
+                if x in target:
+                    fields[x] = target.fields[x]
+                elif n.optional:
+                    fields[x] = Thunk.of(None)
+                else:
+                    raise MError("Expression.Error", f"The field '{x}' of the record wasn't found.")
+            return Record(fields)
         if isinstance(target, Table):
-            keep = [x for x in n.names if x in target.columns] if n.optional else n.names
-            idx = [target.index(x) for x in keep]
-            return Table(keep, [[row[i] for i in idx] for row in target.rows], [target.types[i] for i in idx])
+            cols: list[Optional[int]] = []
+            for x in n.names:
+                if x in target.columns or not n.optional:
+                    cols.append(target.index(x))
+                else:
+                    cols.append(None)
+            rows = [[None if i is None else row[i] for i in cols] for row in target.rows]
+            types = [ANY if i is None else target.types[i] for i in cols]
+            return Table(list(n.names), rows, types)
         raise MError("Expression.Error", f"Can't project the fields of a {kind_of(target)} value.")
 
     def _ItemAccess(self, n: ast.ItemAccess, scope: _Scope) -> Any:
         target, index = self.eval(n.target, scope), self.eval(n.index, scope)
         if isinstance(target, list) and _is_whole(index):
             if 0 <= index < len(target):
-                return target[int(index)]
+                return force(target[int(index)])
         elif isinstance(target, Table) and _is_whole(index):
             if 0 <= index < len(target.rows):
                 return _row_record(target, target.rows[int(index)])
         elif isinstance(target, Table) and isinstance(index, Record):
-            matches = [row for row in target.rows
-                       if all(k in target.columns and _equal(_cell(row[target.index(k)]), index[k]) for k in index.fields)]
+            keys = [(target.index(k), index[k]) for k in index.fields]
+            matches = [row for row in target.rows if all(_equal(force(row[i]), v) for i, v in keys)]
             if len(matches) > 1:
                 raise MError("Expression.Error", "The key matched more than one row in the table.")
             if matches:
@@ -236,10 +256,22 @@ class _Evaluator:
     def _Function(self, n: ast.Function, scope: _Scope) -> Function:
         params = n.parameters
         required = sum(1 for p in params if not p.optional)
+        types = [None if p.type is None else self.type_value(p.type, scope) for p in params]
+        returns = None if n.return_type is None else self.type_value(n.return_type, scope)
 
         def call(*args: Any) -> Any:
-            names = {p.name: Thunk.of(args[i] if i < len(args) else None) for i, p in enumerate(params)}
-            return self.eval(n.body, _Scope(names, scope))
+            names = {}
+            for i, p in enumerate(params):
+                value = args[i] if i < len(args) else None
+                t = types[i]
+                if t is not None and not (value is None and p.optional) and not _conforms(value, t):
+                    raise MError("Expression.Error", f"The parameter {p.name} takes a {t.kind} value, "
+                                                     f"not {kind_of(value)}.")
+                names[p.name] = Thunk.of(value)
+            result = self.eval(n.body, _Scope(names, scope))
+            if returns is not None and not _conforms(result, returns):
+                raise MError("Expression.Error", f"The function returns {returns.kind}, not {kind_of(result)}.")
+            return result
         return Function("each" if n.each_ else "function", call, required, len(params))
 
     def _ErrorRaise(self, n: ast.ErrorRaise, scope: _Scope) -> Any:
@@ -247,16 +279,19 @@ class _Evaluator:
         if isinstance(v, str):
             raise MError("Expression.Error", v)
         if isinstance(v, Record):
-            reason = v["Reason"] if "Reason" in v else "Expression.Error"
-            message = v["Message"] if "Message" in v else ""
-            raise MError(reason, message, v["Detail"] if "Detail" in v else None)
+            get = lambda k: v[k] if k in v else None  # noqa: E731
+            message = get("Message")
+            if "Message.Format" in v:
+                message = _format_message(get("Message.Format"), get("Message.Parameters"))
+            raise MError(get("Reason"), message, get("Detail"))
         raise MError("Expression.Error", f"An error needs a text or record, not {kind_of(v)}.")
 
     def _Try(self, n: ast.Try, scope: _Scope) -> Any:
         try:
             value = self.eval(n.protected, scope)
         except MError as e:
-            error = Record.of({"Reason": e.reason, "Message": e.message, "Detail": e.detail})
+            error = Record.of({"Reason": e.reason, "Message": e.message, "Detail": e.detail,
+                               "Message.Format": None, "Message.Parameters": None, "ErrorCode": None})
             if n.otherwise is not None:
                 return self.eval(n.otherwise, scope)
             if n.catch is not None:
@@ -304,10 +339,19 @@ class _Evaluator:
 
 # --- helpers -------------------------------------------------------------------
 
-def _cell(v: Any) -> Any:
-    if isinstance(v, CellError):
-        raise v.error
-    return v
+def _format_message(fmt: Any, params: Any) -> Any:
+    """Message.Format's #{n} placeholders filled from Message.Parameters (the specification's error records)."""
+    if fmt is None:
+        return None
+    if not isinstance(fmt, str) or not (params is None or isinstance(params, list)):
+        raise MError("Expression.Error", "Message.Format needs text and Message.Parameters a list.")
+    out = fmt
+    for i, p in enumerate(params or []):
+        p = force(p)
+        if not isinstance(p, (str, int, float)) or isinstance(p, bool):
+            raise MError("Expression.Error", f"A {kind_of(p)} message parameter isn't supported yet.")
+        out = out.replace("#{" + str(i) + "}", p if isinstance(p, str) else str(p))
+    return out
 
 
 def _row_record(table: Table, row: list[Any]) -> Record:
@@ -341,16 +385,20 @@ def _equal(a: Any, b: Any) -> bool:
     if ka != kb:
         return False
     if ka == "list":
-        return len(a) == len(b) and all(_equal(x, y) for x, y in zip(a, b))
+        return len(a) == len(b) and all(_equal(force(x), force(y)) for x, y in zip(a, b))
     if ka == "record":
         return set(a.fields) == set(b.fields) and all(_equal(a[k], b[k]) for k in a.fields)
     if ka == "table":
-        return a.columns == b.columns and len(a.rows) == len(b.rows) and all(
-            _equal(_cell(x), _cell(y)) for ra, rb in zip(a.rows, b.rows) for x, y in zip(ra, rb))
+        # Same column names in any order, and the same rows in order (the specification's table equality).
+        if sorted(a.columns) != sorted(b.columns) or len(a.rows) != len(b.rows):
+            return False
+        order = [b.columns.index(c) for c in a.columns]
+        return all(_equal(force(x), force(rb[j])) for ra, rb in zip(a.rows, b.rows) for x, j in zip(ra, order))
     return bool(a == b)
 
 
-_ORDERED = ("number", "text", "date", "datetime", "datetimezone", "time", "duration", "logical")
+_ORDERED = ("number", "text", "date", "datetime", "datetimezone", "time", "duration", "logical", "binary")
+_ARITHMETIC = ("null", "number", "date", "datetime", "datetimezone", "time", "duration")
 
 
 def _binary(op: str, left: Any, right: Any) -> Any:
@@ -358,13 +406,19 @@ def _binary(op: str, left: Any, right: Any) -> Any:
         return _equal(left, right)
     if op == "<>":
         return not _equal(left, right)
-    if left is None or right is None:
-        return None
     kl, kr = kind_of(left), kind_of(right)
     if op in ("<", ">", "<=", ">="):
-        if kl != kr or kl not in _ORDERED:
+        if not (kl in _ORDERED + ("null",) and kr in _ORDERED + ("null",)) or "null" not in (kl, kr) and kl != kr:
             raise MError("Expression.Error", f"The operator {op} can't compare {kl} and {kr} values.")
+        if left is None or right is None:
+            return None
         return {"<": left < right, ">": left > right, "<=": left <= right, ">=": left >= right}[op]
+    if left is None or right is None:
+        other = kr if left is None else kl
+        allowed = ("null", "text", "date", "time") if op == "&" else _ARITHMETIC
+        if other not in allowed:
+            raise MError("Expression.Error", f"The operator {op} can't be applied to {kl} and {kr} values.")
+        return None
     if op == "&":
         if kl == kr == "text":
             return left + right
@@ -383,8 +437,10 @@ def _binary(op: str, left: Any, right: Any) -> Any:
         if op == "*":
             return left * right
         if op == "/":
-            if right == 0:
-                return float("nan") if left == 0 else float("inf") if left > 0 else float("-inf")
+            if right == 0:   # IEEE 754, as the specification's division table
+                if left == 0 or math.isnan(left):
+                    return float("nan")
+                return math.copysign(float("inf"), left) * math.copysign(1.0, right)
             return left / right
     if op in ("+", "-") and kr == "duration" and kl in ("date", "datetime", "datetimezone", "time", "duration"):
         return left + right if op == "+" else left - right
