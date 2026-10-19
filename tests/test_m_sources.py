@@ -6,6 +6,7 @@ import io
 import json
 import os
 import tempfile
+import re
 import uuid
 import zipfile
 
@@ -408,3 +409,92 @@ class TestReviewFindings:
         ns = pa.array([1_000_000_001], pa.timestamp("ns"))
         with pytest.raises(MError, match="can't be read"):
             ev('Parquet.Document(File.Contents("p"))', files_of(p=parquet(t=ns)))
+
+
+class TestSecondReview:
+    """An independent review of the Desktop rules (pivot-studio #104): a broken file is the file's error, never a
+    Python exception, and what the review found unmeasured was measured on Desktop and follows it."""
+
+    def book(self, patch=None, **sheets):
+        openpyxl = pytest.importorskip("openpyxl")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "S"
+        ws.append(["a", 1])
+        buf = io.BytesIO()
+        wb.save(buf)
+        if not patch:
+            return buf.getvalue()
+        src = zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as z:
+            for info in src.infolist():
+                body = src.read(info.filename)
+                z.writestr(info, patch(info.filename, body))
+            for name, body in sheets.items():
+                z.writestr(name, body)
+        return out.getvalue()
+
+    def sheet(self, data):
+        return ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]',
+                  files_of(w=data)).rows
+
+    def sheet_xml(self, cells, dimension="A1:A1"):
+        def patch(name, body):
+            if name != "xl/worksheets/sheet1.xml":
+                return body
+            head = body[:body.index(b"<sheetData>")]
+            head = re.sub(rb'<dimension ref="[^"]*"', b'<dimension ref="' + dimension.encode() + b'"', head)
+            return head + b"<sheetData>" + cells.encode() + b"</sheetData></worksheet>"
+        return self.book(patch)
+
+    def test_broken_packages_are_the_files_error(self):
+        broken = [
+            self.book(lambda n, b: b"<oops" if n == "xl/worksheets/sheet1.xml" else b),
+            self.book(lambda n, b: b"<oops" if n == "xl/worksheets/_rels/sheet1.xml.rels" else b,
+                      **{"xl/worksheets/_rels/sheet1.xml.rels": b""}),
+            self.sheet_xml('<row r="1"><c r="A1" t="s"><v>0</v></c></row>'),           # no shared strings part
+            self.sheet_xml('<row r="1"><c r="A1" t="s"><v>-1</v></c></row>'),
+            self.sheet_xml('<row r="1"><c r="A1" t="b"><v>2</v></c></row>'),
+            self.sheet_xml('<row r="1"><c r="A1"><v>-1E400</v></c></row>'),
+            self.sheet_xml('<row r="1"><c r="A1"><v>1</v></c></row>', "A1:A99999999"),
+            self.sheet_xml('<row r="1"><c r="A1"><v>1</v></c><c r="XFD1048576"/></row>', "A1:XFD1048576"),
+            b"PK\x03\x04 not a zip",
+        ]
+        for data in broken:
+            with pytest.raises(MError) as e:
+                self.sheet(data)
+            assert e.value.reason in ("DataFormat.Error", "Expression.Error")
+
+    def test_escapes_and_defined_names(self):
+        data = self.sheet_xml('<row r="1"><c r="A1" t="inlineStr"><is><t>x_x000D_y_x0009_z</t></is></c></row>')
+        assert self.sheet(data) == [["x\ry\tz"]]
+
+        def names(n, b):
+            if n != "xl/workbook.xml":
+                return b
+            return b.replace(b"</sheets>", b'</sheets><definedNames><definedName name="Rng">S!$A$1</definedName>'
+                                           b'<definedName name="_xlnm.Print_Area" localSheetId="0">S!$A$1</definedName>'
+                                           b'</definedNames>')
+        nav = ev('Excel.Workbook(File.Contents("w"), null, true)', files_of(w=self.book(names)))
+        assert [(r[0], r[2], r[3], r[4]) for r in nav.rows] == [
+            ("S", "S", "Sheet", False), ("Rng", "Rng", "DefinedName", False),
+            ("_xlnm.Print_Area", "S!_xlnm.Print_Area", "DefinedName", False)]
+        with pytest.raises(MError, match="defined name"):
+            nav.rows[1][1].rows
+
+    def test_option_types_are_checked(self):
+        files = files_of(w=self.book())
+        for m in ('Excel.Workbook(File.Contents("w"), 1, true)', 'Excel.Workbook(File.Contents("w"), null, "no")',
+                  'Excel.Workbook(File.Contents("w"), [DelayTypes=true, InferSheetDimensions=1])'):
+            with pytest.raises(MError):
+                ev(m, files)
+        for options in ('[QuoteStyle=true]', '[IncludeByteOrderMark=true]', '{"x", "x"}'):
+            with pytest.raises(MError):
+                ev(f'Csv.Document(File.Contents("f"), {options})', files_of(f=b"a,b\n"))
+        with pytest.raises(MError, match="UTF-32"):
+            ev('Csv.Document(File.Contents("f"))', files_of(f="a,b\n".encode("utf-32")))
+
+    def test_promote_and_before_delimiter(self):
+        assert ev('Table.PromoteHeaders(#table(3, {{"a", "a_1", "a"}, {1, 2, 3}}))').columns == ["a", "a_1", "a_2"]
+        assert ev('Text.BeforeDelimiter("a-b", "-", {3, RelativePosition.FromEnd})') == ""

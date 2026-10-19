@@ -324,7 +324,7 @@ class TestReviewFindings:
             assert model_value(datetime_to_ole(d), "dateTime") == d
 
     def test_text_from_refuses_what_no_source_shows(self):
-        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{3}, {#infinity}, {1e22}, '
+        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{3}, {#infinity}, {1.2345678901234567e19}, '
                      '{#datetime(2015, 11, 20, 10, 59, 0.5)}, {#time(1, 2, 3)}}), {{"c", type text}})')
         assert t.rows[0][0] == "3" and all(isinstance(r[0], CellError) for r in t.rows[1:])
 
@@ -375,7 +375,8 @@ class TestDesktopRefresh:
         assert evaluate("#datetimezone(2015, 11, 20, 10, 59, 0, -5, 0)").utcoffset() == dt.timedelta(hours=-5)
         assert evaluate("#time(10, 59, 30)") == dt.time(10, 59, 30)
         assert evaluate("#duration(1, 2, 0, 0)") == dt.timedelta(days=1, hours=2)
-        for m in ("#date(2015, 2, 30)", "#time(24, 0, 0)", "#datetime(2015, 1, 1, 0, 0, 60)", "#date(2015.5, 1, 1)"):
+        assert evaluate("#time(24, 0, 0)") == dt.time(0)                     # as a Desktop refresh gives it
+        for m in ("#date(2015, 2, 30)", "#time(24, 0, 1)", "#datetime(2015, 1, 1, 0, 0, 60)", "#date(2015.5, 1, 1)"):
             with pytest.raises(MError):
                 evaluate(m)
 
@@ -440,3 +441,52 @@ class TestDesktopLoad:
         assert model_value(dt.time(10, 59, 30), "dateTime") == dt.datetime(1899, 12, 30, 10, 59, 30)
         assert model_value(dt.timedelta(days=1, hours=2), "dateTime") == dt.datetime(1899, 12, 31, 2)
         assert model_value(60, "dateTime") == dt.datetime(1900, 2, 28)
+
+
+class TestSecondReview:
+    """The review's cases, each answered by a Desktop refresh (pivot-studio #104) or refused."""
+
+    def test_number_text_edges(self):
+        assert number_from_text("($5)", "en-US") == -5 and number_from_text("(1e3)", "en-US") == -1000
+        assert number_from_text("9007199254740993", "en-US") == 9007199254740993
+        assert number_from_text("1e99999", "en-US") == float("inf")
+        assert number_from_text("-1e99999", "en-US") == float("-inf") and number_from_text("1e-99999", "en-US") == 0
+        assert number_from_text("1e" + "9" * 5000, "en-US") == float("inf")
+        assert number_from_text("9" * 5000, "en-US") == float("inf")
+        for text in ("(5%)", "٥", "５"):
+            with pytest.raises(MError):
+                number_from_text(text, "en-US")
+
+    def test_dates(self):
+        t = TestConversions.transform
+        assert t(self, ['"11/20/30"', '"11/20/49"', '"11/20/50"', '"11/20/99"', '"nov 20, 2015"',
+                        '"November 20, 2015"', '"20 Nov 2015"'], "type datetime") == [
+            dt.datetime(2030, 11, 20), dt.datetime(2049, 11, 20), dt.datetime(1950, 11, 20), dt.datetime(1999, 11, 20)
+        ] + [dt.datetime(2015, 11, 20)] * 3
+        assert t(self, ["#date(5, 1, 1)", "12345678901234567890", "2e21"], "type text") == [
+            "1/1/0005", "12345678901234567890", "2000000000000000000000"]
+
+    def test_datetime_columns_keep_three_hundredths(self):
+        def at(seconds):
+            return dt.datetime(2015, 11, 20, 10, 59) + dt.timedelta(seconds=seconds)
+        cases = {0.0029: 1, 0.0099: 3, 0.0234: 7, 0.7777: 233, 0.0017: 0, 0.0049: 1, 0.005: 2, 59.9999: 18000}
+        for seconds, ticks in cases.items():
+            want = dt.datetime(2015, 11, 20, 10, 59) + dt.timedelta(microseconds=round(ticks * 1_000_000 / 300))
+            assert model_value(at(seconds), "dateTime") == want, seconds
+        assert model_value(1e-7, "dateTime") == dt.datetime(1899, 12, 30, 0, 0, 0, 10000)
+        assert model_value(42328.00000005, "dateTime") == dt.datetime(2015, 11, 20, 0, 0, 0, 3333)
+        assert model_value(-1.25, "dateTime") == dt.datetime(1899, 12, 29, 6)
+
+    def test_load_text(self):
+        assert [model_value(v, "int64") for v in ("+5", ".5", "   ", "5\n", "0.5", "-0.5")] == [5, 1, 0, 5, 1, -1]
+        assert [model_value(v, "double") for v in ("-$5", "$-5", "1.", ".5", "+5")] == [-5, -5, 1, 0.5, 5]
+        assert [model_value(v, "boolean") for v in ("2.5", "-1", " 1 ", float("nan"), float("inf"))] == [True] * 5
+        for v, ty in (("1.", "int64"), ("５", "int64"), ("1e400", "double"), ("５", "double"),
+                      (" TRUE ", "boolean")):
+            with pytest.raises(MError):
+                model_value(v, ty)
+        assert [model_value(v, "string") for v in ("a\r", "b\n", "c　", "d\x0b")] == ["a", "b", "c　", "d"]
+
+    def test_constructor_fractions_keep_their_microseconds(self):
+        assert evaluate("#time(10, 59, 59.9999999)") == dt.time(10, 59, 59, 999999)
+        assert evaluate("#datetimezone(2015, 1, 1, 0, 0, 0, 0, 120)").utcoffset() == dt.timedelta(hours=2)

@@ -11,21 +11,26 @@ dateTime column as 2014-02-09):
    "5" or true in an Int64.Type column, 5 in a text column.
 2. The model column converts the value:
    - int64: a number rounds half away from zero (2.5 is 3, -2.5 is -3); a
-     logical is -1 or 0; text of digits with an optional sign, fraction and
-     surrounding spaces is read so ("" is 0);
-   - double: a number; text as en-US numbers read ("1,234", "1e3", "$5");
+     logical is -1 or 0; text of ASCII digits with an optional sign, fraction
+     and surrounding whitespace is read so (".5" is 1; "" and "   " are 0;
+     "1." fails);
+   - double: a number; text as en-US numbers read ("1,234", "1e3", "$5",
+     "-$5", "1."), finite;
    - decimal: 4 decimal places, half to even, of the number's exact binary
      value (1.23465 is 1.2347, 0.03125 is 0.0312), or of its decimal digits in
      a Currency.Type column (1.23465 is 1.2346);
-   - boolean: a logical; a number is true unless 0; "true"/"false" in any case
-     or digits;
-   - string: text without trailing spaces and tabs ("x " is "x", " " is "");
+   - boolean: a logical; a number is true unless 0 (NaN too); "true"/"false"
+     in any case, exactly, or digits (" 1 " is true, " TRUE " fails);
+   - string: text without trailing spaces, tabs, CR, LF and VT ("x " is "x",
+     " " is ""; U+3000 and NBSP stay);
      a logical is "TRUE" or "FALSE"; and one column holds one spelling per
      value under ASCII case folding, the first loaded ("a" then "A" both load
      as "a"; "É" and "é" stay apart);
    - dateTime: a date at midnight; a number or logical as an OLE Automation
      date (true is -1, 1899-12-29); a datetimezone's clock time without its
-     offset; a time on 1899-12-30; a duration as days after 1899-12-30.
+     offset; a time on 1899-12-30; a duration as days after 1899-12-30. The
+     time of day is kept in 1/300 s: a datetime's truncated to the
+     millisecond, then rounded half up; a number's rounded half up.
    A value the model column can't take fails the whole load, as it fails
    Desktop's refresh (1e300 into int64, "abc" into int64).
 
@@ -49,8 +54,12 @@ from .values import CellError, MError, MType, Table, kind_of
 DATA_TYPES = ("string", "int64", "double", "decimal", "boolean", "dateTime")
 _DECIMAL = (Decimal("-922337203685477.5808"), Decimal("922337203685477.5807"))   # a currency's range
 _INT64 = (-(2 ** 63), 2 ** 63 - 1)
-_PLAIN = re.compile(r"^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)\s*$")
-_EN_NUMBER = re.compile(r"^\s*[+-]?\$?[+-]?(?:\d{1,3}(?:,\d{3})+|\d*)(?:\.\d*)?(?:[eE][+-]?\d+)?\s*$")
+_SPACE = " \t\n\r\x0b\x0c"
+_PLAIN = re.compile(r"^[ \t\n\r\x0b\x0c]*[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)[ \t\n\r\x0b\x0c]*$")
+_EN_NUMBER = re.compile(r"^[ \t\n\r\x0b\x0c]*[+-]?\$?[+-]?(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]*)(?:\.[0-9]*)?"
+                        r"(?:[eE][+-]?[0-9]+)?[ \t\n\r\x0b\x0c]*$")
+_TRAILING = " \t\r\n\x0b"     # what a string column drops from a value's end (U+3000 and NBSP stay)
+_TICKS_PER_DAY = 300 * 86400    # a dateTime column keeps time in 1/300 s
 _OLE_EPOCH = dt.datetime(1899, 12, 30)
 _ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 
@@ -93,10 +102,27 @@ def _decimal(n: Any, m_type: Optional[MType]) -> float:
 
 
 def _ole(days: float) -> dt.datetime:
+    """A number of days as the column stores it: rounded half up to 1/300 s (#104: 1e-7 days is 10 ms)."""
     try:
-        return ole_to_datetime(days)
+        ole_to_datetime(days)
     except MError:
         raise _fail("The number is out of range of a dateTime column.") from None
+    whole = math.trunc(days)       # the fraction is the time of day, below zero too (-1.25 is 1899-12-29 06:00)
+    ticks = math.floor(abs(Decimal(days) - whole) * _TICKS_PER_DAY + Decimal("0.5"))
+    return _ticks(_OLE_EPOCH + dt.timedelta(days=whole), ticks)
+
+
+def _ticks(day: dt.datetime, ticks: int) -> dt.datetime:
+    """``day`` plus ``ticks`` 300ths of a second, to the nearest microsecond."""
+    return day + dt.timedelta(microseconds=round(Decimal(ticks) * 1_000_000 / 300))
+
+
+def _stored_datetime(v: dt.datetime) -> dt.datetime:
+    """A datetime as a dateTime column stores it, as Desktop's refresh shows (#104, 21 points): truncated to the
+    millisecond, then rounded half up to 1/300 s (.0017 s is 0, .005 s is 2/300, 59.9999 s is the next minute)."""
+    ms = (v.hour * 3600 + v.minute * 60 + v.second) * 1000 + v.microsecond // 1000
+    midnight = dt.datetime(v.year, v.month, v.day)
+    return _ticks(midnight, (3 * ms + 5) // 10)
 
 
 def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> Any:
@@ -108,7 +134,7 @@ def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> A
     kind = kind_of(value)
     if data_type == "string":
         if kind == "text":
-            return value.rstrip(" \t")
+            return value.rstrip(_TRAILING)
         if kind == "logical":
             return "TRUE" if value else "FALSE"
     elif data_type == "int64":
@@ -117,19 +143,19 @@ def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> A
         if kind == "logical":
             return -1 if value else 0
         if kind == "text":
-            if value.strip() == "":
+            if value.strip(_SPACE) == "":
                 return 0
             if _PLAIN.match(value):
-                return _int64(Decimal(value.strip()))
+                return _int64(Decimal(value.strip(_SPACE)))
             raise _fail(f"The text '{value}' can't be loaded into an int64 column.")
     elif data_type == "double":
         if kind == "number":
             return float(value)
         if kind == "text":
-            if _EN_NUMBER.match(value) and any(c.isdigit() for c in value):
-                n = number_from_text(value.strip(), "en-US")
-                assert n is not None            # digits were matched
-                return float(n)
+            if _EN_NUMBER.match(value) and any("0" <= c <= "9" for c in value):
+                n = number_from_text(value.strip(_SPACE), "en-US")
+                if n is not None and math.isfinite(n):        # "1e400" fails the load (#104)
+                    return float(n)
             raise _fail(f"The text '{value}' can't be loaded into a double column.")
     elif data_type == "decimal":
         if kind == "number":
@@ -138,17 +164,17 @@ def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> A
         if kind == "logical":
             return value
         if kind == "number":
-            return value != 0
+            return value != 0                 # NaN and infinities are true (#104)
         if kind == "text":
-            low = value.strip().lower()
-            if low in ("true", "false"):
+            low = value.lower()
+            if low in ("true", "false"):      # exactly: " TRUE " fails the load (#104)
                 return low == "true"
             if _PLAIN.match(value):
-                return Decimal(value.strip()) != 0
+                return Decimal(value.strip(_SPACE)) != 0
             raise _fail(f"The text '{value}' can't be loaded into a boolean column.")
     elif data_type == "dateTime":
         if kind == "datetime":
-            return value
+            return _stored_datetime(value)
         if kind == "date":
             return dt.datetime(value.year, value.month, value.day)
         if kind == "number":
@@ -158,11 +184,11 @@ def model_value(value: Any, data_type: str, m_type: Optional[MType] = None) -> A
         if kind == "logical":
             return _ole(-1 if value else 0)
         if kind == "datetimezone":
-            return value.replace(tzinfo=None)
+            return _stored_datetime(value.replace(tzinfo=None))
         if kind == "time":
-            return dt.datetime.combine(_OLE_EPOCH.date(), value)
+            return _stored_datetime(dt.datetime.combine(_OLE_EPOCH.date(), value))
         if kind == "duration" and value >= dt.timedelta(0):
-            return _OLE_EPOCH + value
+            return _stored_datetime(_OLE_EPOCH + value)
     raise _fail(f"A {kind} value can't be loaded into a {data_type} column yet.")
 
 
