@@ -177,3 +177,34 @@ def kind_of(value: Any) -> str:
     if isinstance(value, Function):
         return "function"
     raise TypeError(f"not an M value: {value!r}")
+
+
+class LazyTable(Table):
+    """A table computed when first read (a workbook sheet a navigation table lists). An error computing it is
+    raised where it is read, as a field's would be."""
+
+    def __init__(self, load: Callable[[], Table]):   # noqa: D107 - no dataclass fields of its own
+        self._load: Optional[Callable[[], Table]] = load
+        self._table: Optional[Table] = None
+
+    def _get(self) -> Table:
+        if self._table is None:
+            assert self._load is not None
+            self._table = self._load()
+            self._load = None
+        return self._table
+
+    @property
+    def columns(self) -> list[str]:  # type: ignore[override]
+        return self._get().columns
+
+    @property
+    def rows(self) -> list[list[Any]]:  # type: ignore[override]
+        return self._get().rows
+
+    @property
+    def types(self) -> list[MType]:  # type: ignore[override]
+        return self._get().types
+
+    def __repr__(self) -> str:
+        return "LazyTable(loaded)" if self._table is not None else "LazyTable(pending)"
