@@ -98,7 +98,7 @@ class TestConversions:
     def test_number_text(self, text, value):
         assert number_from_text(text, "en-US") == pytest.approx(value)
 
-    @pytest.mark.parametrize("text", ["", "abc", "1,2", "12,34.5", "1.2.3", "$"])
+    @pytest.mark.parametrize("text", ["abc", "1.2.3", "$", "1 234", "0x10", "(-5)", "(5", "-$-5"])
     def test_not_numbers(self, text):
         with pytest.raises(MError) as e:
             number_from_text(text, "en-US")
@@ -165,7 +165,8 @@ class TestTables:
         assert tier(1) == {
             "Binary.FromText", "BinaryEncoding.Base64", "BinaryEncoding.Hex", "Binary.Decompress", "Compression.GZip",
             "Compression.Deflate", "Json.Document", "Table.FromRows", "#table", "Table.TransformColumnTypes",
-            "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type", "#infinity", "#nan"}
+            "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type", "#infinity", "#nan", "#date", "#datetime",
+            "#datetimezone", "#time", "#duration"}
         assert {"Table.RenameColumns", "Table.RemoveColumns", "Table.SelectColumns", "Table.AddColumn",
                 "Table.PromoteHeaders", "Text.BeforeDelimiter"} <= tier(2)
         assert {"File.Contents", "Csv.Document", "Excel.Workbook", "Parquet.Document"} <= tier(3)
@@ -205,8 +206,10 @@ class TestLoad:
     def test_other_pairings_are_errors(self):
         with pytest.raises(MError, match="can't be loaded"):
             model_value("x", "int64")
-        with pytest.raises(MError):
-            model_value(1.5, "int64")
+        for v, ty in ((1e300, "int64"), (5, "string"), (dt.date(2015, 11, 20), "string"), ("2015-11-20", "dateTime"),
+                      ("1", "decimal"), (True, "double")):
+            with pytest.raises(MError):
+                model_value(v, ty)
 
     def test_load_rows_maps_columns_and_errors(self):
         t = evaluate('Table.TransformColumnTypes(#table({"a", "b"}, {{"1", "x"}, {"y", "z"}}), {{"a", Int64.Type}})')
@@ -289,7 +292,7 @@ class TestReviewFindings:
     def test_no_python_exception_escapes(self):
         for m in ('Table.TransformColumnTypes(#table({"c"}, {{1/0}, {0/0}}), {{"c", Currency.Type}})',
                   'Table.TransformColumnTypes(#table({"c"}, {{1e10}}), {{"c", type datetime}})',
-                  'Table.TransformColumnTypes(#table({"c"}, {{"1e400"}}), {{"c", type number}})'):
+                  'Table.TransformColumnTypes(#table({"c"}, {{"1e400"}}), {{"c", Int64.Type}})'):
             t = evaluate(m)
             assert all(isinstance(r[0], CellError) for r in t.rows), m
         with pytest.raises(MError, match="nested too deeply"):
@@ -309,11 +312,9 @@ class TestReviewFindings:
         r = evaluate('Json.Document("{""a"": [1, 2.5, true, null, ""x""]}")')
         assert r["a"] == [1, 2.5, True, None, "x"]
 
-    def test_int64_and_currency_read_text_as_number_from_text(self):
-        # Microsoft's reference: other types go through Number.FromText, which has no "%" and takes no logical.
-        for cell in ('"10%"', "true"):
-            t = evaluate(f'Table.TransformColumnTypes(#table({{"c"}}, {{{{{cell}}}}}), {{{{"c", Int64.Type}}}})')
-            assert isinstance(t.rows[0][0], CellError), cell
+    def test_int64_and_currency_take_no_logical(self):
+        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{true}}), {{"c", Int64.Type}})')
+        assert isinstance(t.rows[0][0], CellError)
 
     def test_ole_dates(self):
         assert model_value(-1.25, "dateTime") == dt.datetime(1899, 12, 29, 6)
@@ -323,5 +324,119 @@ class TestReviewFindings:
             assert model_value(datetime_to_ole(d), "dateTime") == d
 
     def test_text_from_refuses_what_no_source_shows(self):
-        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{3}, {1.5}}), {{"c", type text}})')
-        assert t.rows[0][0] == "3" and isinstance(t.rows[1][0], CellError)
+        t = evaluate('Table.TransformColumnTypes(#table({"c"}, {{3}, {#infinity}, {1e22}, '
+                     '{#datetime(2015, 11, 20, 10, 59, 0.5)}, {#time(1, 2, 3)}}), {{"c", type text}})')
+        assert t.rows[0][0] == "3" and all(isinstance(r[0], CellError) for r in t.rows[1:])
+
+
+class TestDesktopRefresh:
+    """Rules a Desktop 2.157 refresh shows where Microsoft's reference is silent or says otherwise: Enter-data and
+    #table values refreshed by Desktop and read back over its model (pivot-studio #104's probes)."""
+
+    transform = TestConversions.transform
+
+    def test_number_text(self):
+        cases = {"1,23": 123, "(5)": -5, "(1,000)": -1000, "$-5": -5, "-$5": -5, "1,234.5": 1234.5, "+3": 3,
+                 "5.": 5, " 12 ": 12}
+        for text, value in cases.items():
+            assert number_from_text(text, "en-US") == value, text
+        assert number_from_text("1e400", "en-US") == float("inf")
+
+    def test_empty_text_is_null(self):
+        for ty in ("Int64.Type", "type number", "Currency.Type", "Percentage.Type", "type datetime", "type date",
+                   "type logical"):
+            assert self.transform(['""'], ty) == [None], ty
+
+    def test_int64_and_currency_take_percent(self):
+        assert self.transform(['"10%"'], "Int64.Type") == [0]
+        assert self.transform(['"10%"'], "Currency.Type") == [0.1]
+        assert self.transform(['"1,23"', '"(5)"', '" 7 "'], "Int64.Type") == [123, -5, 7]
+
+    def test_datetime_text(self):
+        assert self.transform(['"Nov 20, 2015"', '"11/20/15"', '"11/20/2015 12:00 AM"'], "type datetime") == [
+            dt.datetime(2015, 11, 20)] * 3
+        for text in ('"20/11/2015"', '"11/20/2015 24:00"'):
+            assert isinstance(self.transform([text], "type datetime")[0], CellError), text
+
+    def test_date_text_with_a_time_is_an_error(self):
+        out = self.transform(['"11/20/2015 10:59"', '"2015-11-20"', '"11/20/2015"'], "type date")
+        assert isinstance(out[0], CellError) and out[1:] == [dt.date(2015, 11, 20)] * 2
+
+    def test_text_from(self):
+        cells = ["0.1", "1e21", "1e15", "1e-5", "1e-4", "-0.0", "true", "#date(2015, 11, 20)",
+                 "#datetime(2015, 11, 20, 10, 59, 0)", "1/3", "123456789.125", "-2.5", "#datetime(2015, 11, 20, 22, 5, 9)"]
+        assert self.transform(cells, "type text") == [
+            "0.1", "1000000000000000000000", "1000000000000000", "1E-05", "0.0001", "0", "true", "11/20/2015",
+            "11/20/2015 10:59:00 AM", "0.33333333333333331", "123456789.125", "-2.5", "11/20/2015 10:05:09 PM"]
+
+    def test_constructors(self):
+        assert evaluate("#date(2015, 11, 20)") == dt.date(2015, 11, 20)
+        assert evaluate("#datetime(2015, 11, 20, 10, 59, 30.25)") == dt.datetime(2015, 11, 20, 10, 59, 30, 250000)
+        assert evaluate("#datetimezone(2015, 11, 20, 10, 59, 0, -5, 0)").utcoffset() == dt.timedelta(hours=-5)
+        assert evaluate("#time(10, 59, 30)") == dt.time(10, 59, 30)
+        assert evaluate("#duration(1, 2, 0, 0)") == dt.timedelta(days=1, hours=2)
+        for m in ("#date(2015, 2, 30)", "#time(24, 0, 0)", "#datetime(2015, 1, 1, 0, 0, 60)", "#date(2015.5, 1, 1)"):
+            with pytest.raises(MError):
+                evaluate(m)
+
+
+class TestDesktopLoad:
+    """How Desktop's model stores M values (#104's load probes); see pbix_mcp.m.load."""
+
+    def load(self, m, columns):
+        return load_rows(evaluate(m), columns, errors_as_null=True)
+
+    def test_a_value_not_of_its_column_type_is_a_failed_cell(self):
+        assert self.load('#table(type table [v = Int64.Type], {{2.5}, {"5"}, {3}, {true}})',
+                         [("v", "int64")]) == [[None], [None], [3], [None]]
+        assert self.load('#table(type table [v = text], {{5}, {"x"}})', [("v", "string")]) == [[None], ["x"]]
+
+    def test_int64(self):
+        assert self.load('#table(type table [v = number], {{2.5}, {3.5}, {-2.5}, {2.4}, {2.6}, {-3.5}, {0.5}})',
+                         [("v", "int64")]) == [[3], [4], [-3], [2], [3], [-4], [1]]
+        assert [model_value(v, "int64") for v in (True, False, "2.5", " 7 ", "-3", "")] == [-1, 0, 3, 7, -3, 0]
+        for v in ("1,234", "1e3", "$5", "(5)", "abc", 1e300, float("inf")):
+            with pytest.raises(MError):
+                model_value(v, "int64")
+
+    def test_double(self):
+        assert [model_value(v, "double") for v in ("2.5", "1,234", "1e3", "$5", " 7 ", "-0.5")] == [
+            2.5, 1234, 1000, 5, 7, -0.5]
+        assert model_value(float("inf"), "double") == float("inf")
+        for v in ("10%", "", "abc"):
+            with pytest.raises(MError):
+                model_value(v, "double")
+
+    def test_decimal_rounds_the_exact_binary_value_half_to_even(self):
+        values = [1.23455, 1.23465, 0.00005, -0.00005, 1.00005, 2.00005, 0.00015, 0.00025, 0.00035, 123.45675,
+                  0.03125, 0.09375, 0.15625, -0.03125]
+        assert [model_value(v, "decimal") for v in values] == [
+            1.2346, 1.2347, 0.0001, -0.0001, 1.0001, 2.0, 0.0001, 0.0003, 0.0003, 123.4567,
+            0.0312, 0.0938, 0.1562, -0.0312]
+
+    def test_a_currency_column_rounds_its_digits(self):
+        assert self.load('#table(type table [v = Currency.Type], {{1.23455}, {1.23465}, {0.00005}, {-0.00005}, '
+                         '{1.00015}, {0.00025}})', [("v", "decimal")]) == [
+            [1.2346], [1.2346], [0.0], [0.0], [1.0002], [0.0002]]
+
+    def test_boolean(self):
+        assert [model_value(v, "boolean") for v in ("true", "True", "FALSE", "1", "0", 2.5, -1, 0)] == [
+            True, True, False, True, False, True, True, False]
+        for v in ("yes", ""):
+            with pytest.raises(MError):
+                model_value(v, "boolean")
+
+    def test_strings_lose_trailing_spaces_and_fold_ascii_case(self):
+        assert self.load('#table({"v"}, {{"a"}, {"A"}, {"x "}, {"x"}, {"B"}, {"b "}, {" "}, {" y"}, {"z#(tab)"}, '
+                         '{"w#(00A0)"}, {"É"}, {"é"}, {"ß"}, {"SS"}, {"Ä"}, {"ä "}})', [("v", "string")]) == [
+            ["a"], ["a"], ["x"], ["x"], ["B"], ["B"], [""], [" y"], ["z"], ["w\u00a0"], ["É"], ["é"], ["ß"], ["SS"],
+            ["Ä"], ["ä"]]
+        assert model_value(True, "string") == "TRUE" and model_value(False, "string") == "FALSE"
+
+    def test_datetime(self):
+        assert model_value(True, "dateTime") == dt.datetime(1899, 12, 29)
+        assert model_value(evaluate("#datetimezone(2015, 11, 20, 23, 59, 0, -5, 0)"), "dateTime") == \
+            dt.datetime(2015, 11, 20, 23, 59)
+        assert model_value(dt.time(10, 59, 30), "dateTime") == dt.datetime(1899, 12, 30, 10, 59, 30)
+        assert model_value(dt.timedelta(days=1, hours=2), "dateTime") == dt.datetime(1899, 12, 31, 2)
+        assert model_value(60, "dateTime") == dt.datetime(1900, 2, 28)

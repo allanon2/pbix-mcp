@@ -7,6 +7,7 @@ import json
 import os
 import tempfile
 import uuid
+import zipfile
 
 import pytest
 
@@ -58,16 +59,26 @@ class TestTableFunctions:
         assert ev('Text.BeforeDelimiter("111-222-333", "-")') == "111"
         assert ev('Text.BeforeDelimiter("111-222-333", "-", 1)') == "111-222"
         assert ev('Text.BeforeDelimiter("111-222-333", "-", {1, RelativePosition.FromEnd})') == "111"
-        with pytest.raises(MError, match="wasn't found"):
-            ev('Text.BeforeDelimiter("111", "-")')
+        # Not found: the whole text, as a Desktop refresh shows (pivot-studio #104).
+        assert ev('Text.BeforeDelimiter("111", "-")') == "111"
+        assert ev('Text.BeforeDelimiter("a-b-c", "-", 5)') == "a-b-c"
 
     def test_promote_headers(self):
         t = ev('Table.PromoteHeaders(#table({"Column1", "Column2", "Column3"}, {{"ID", 2024, null}, {1, 2, 3}}))')
         assert t.columns == ["ID", "2024", "Column3"] and t.rows == [[1, 2, 3]]
-        with pytest.raises(MError, match="repeats"):
-            ev('Table.PromoteHeaders(#table({"Column1", "Column2"}, {{"x", "x"}}))')
-        with pytest.raises(MError, match="empty header"):
-            ev('Table.PromoteHeaders(#table({"Column1"}, {{""}}))')
+        # As a Desktop refresh names them (pivot-studio #104): empty stays empty, a repeat gets "_<n>" from one
+        # counter, a number its Text.From, and PromoteAllScalars writes the rest as Text.From does.
+        assert ev('Table.PromoteHeaders(#table(3, {{"a", "", "b"}, {1, 2, 3}}))').columns == ["a", "", "b"]
+        assert ev('Table.PromoteHeaders(#table(4, {{"a", "a", "b", "a"}, {1, 2, 3, 4}}))').columns == [
+            "a", "a_1", "b", "a_2"]
+        assert ev('Table.PromoteHeaders(#table(3, {{"a", "a", "a_1"}, {1, 2, 3}}))').columns == ["a", "a_1", "a_1_2"]
+        assert ev('Table.PromoteHeaders(#table(3, {{"Column3", "x", null}, {1, 2, 3}}))').columns == [
+            "Column3", "x", "Column3_1"]
+        assert ev('Table.PromoteHeaders(#table(2, {{1, 2.5}, {1, 2}}))').columns == ["1", "2.5"]
+        assert ev('Table.PromoteHeaders(#table(2, {{true, #date(2015, 11, 20)}, {1, 2}}))').columns == [
+            "Column1", "Column2"]
+        assert ev('Table.PromoteHeaders(#table(3, {{true, #date(2015, 11, 20), #datetime(2015, 11, 20, 10, 59, 0)}, '
+                  '{1, 2, 3}}), [PromoteAllScalars=true])').columns == ["true", "11/20/2015", "11/20/2015 10:59:00 AM"]
 
 
 class TestFiles:
@@ -92,23 +103,39 @@ class TestCsv:
     def test_options_and_columns(self):
         t = self.csv(b"x;y\n1;2\n", ', [Delimiter=";", Columns=2, Encoding=65001, QuoteStyle=QuoteStyle.Csv]')
         assert t.rows == [["x", "y"], ["1", "2"]]
-        t = self.csv(b"x,y,z\n1,2,3\n", ', [Columns=2]')            # extra values are ignored by default
-        assert t.rows == [["x", "y"], ["1", "2"]]
-        with pytest.raises(MError, match="more values"):
-            self.csv(b"x,y,z\n", ', [Columns=2, ExtraValues=ExtraValues.Error]')
+        # Extra values are dropped, whatever ExtraValues says, as a Desktop refresh shows (pivot-studio #104).
+        for extra in ("", ", ExtraValues=ExtraValues.Error", ", ExtraValues=ExtraValues.List"):
+            t = self.csv(b"x,y,z\n1,2,3\n", f', [Columns=2{extra}]')
+            assert t.rows == [["x", "y"], ["1", "2"]]
 
     def test_encodings_and_byte_order_marks(self):
         assert self.csv("é,ü\n".encode("cp1252"), ', [Encoding=1252]').rows == [["é", "ü"]]
         assert self.csv(b"\xef\xbb\xbfa,b\n").rows == [["a", "b"]]
         assert self.csv(b"\xff\xfe" + "a,b\n".encode("utf-16-le"), ', [Encoding=TextEncoding.Utf16]').rows == [["a", "b"]]
+        # A byte order mark wins over the encoding given (pivot-studio #104).
+        assert self.csv(b"\xff\xfe" + "é,b\n".encode("utf-16-le"), ', [Encoding=65001]').rows == [["é", "b"]]
+        assert self.csv(b"\xef\xbb\xbf" + "é,b\n".encode("utf-8"), ', [Encoding=1252]').rows == [["é", "b"]]
 
-    def test_what_the_reference_leaves_open_is_refused(self):
-        with pytest.raises(MError, match="QuoteStyle.None"):
-            self.csv(b"a\n", ', [QuoteStyle=QuoteStyle.None]')
-        with pytest.raises(MError, match="fewer values"):
-            self.csv(b"a,b\n1\n", ', [Columns=2]')
-        with pytest.raises(MError, match="different lengths"):
-            self.csv(b"a,b\n1\n")
+    def test_rows_as_a_desktop_refresh_reads_them(self):
+        # pivot-studio #104's probes: short rows padded with "", the first row's width without Columns, a blank line
+        # a row of "", a final line break no row, CR, LF and CR LF all end a record.
+        assert self.csv(b"a,b,c\r\n1,2,3\r\n4,5\r\n6\r\n", ', [Columns=3]').rows == [
+            ["a", "b", "c"], ["1", "2", "3"], ["4", "5", ""], ["6", "", ""]]
+        assert self.csv(b"a,b\r\n1,2,3\r\n4,5\r\n").rows == [["a", "b"], ["1", "2"], ["4", "5"]]
+        assert self.csv(b"a,b\r\n1,2\r\n\r\n3,4\r\n\r\n").rows == [["a", "b"], ["1", "2"], ["", ""], ["3", "4"],
+                                                                     ["", ""]]
+        assert self.csv(b"a,b\r1,2\r3,4\r").rows == self.csv(b"a,b\n1,2\n3,4").rows == [["a", "b"], ["1", "2"],
+                                                                                         ["3", "4"]]
+
+    def test_quotes_as_a_desktop_refresh_reads_them(self):
+        assert self.csv(b'a,b\r\n"x"y,1\r\n').rows == [["a", "b"], ["xy", "1"]]
+        assert self.csv(b'a,b\r\n "x" ,1\r\n').rows == [["a", "b"], [' "x" ', "1"]]
+        assert self.csv(b'a,b\r\n"x,1\r\n2,3\r\n', ', [Columns=2]').rows == [["a", "b"], ["x,1\r\n2,3\r\n", ""]]
+        none = ', [Columns=3, QuoteStyle=QuoteStyle.None]'
+        assert self.csv(b'a,b,c\r\n1,"two\r\nlines","say ""hi"""\r\n2,"x,y",\r\n', none).rows == [
+            ["a", "b", "c"], ["1", "two", ""], ['lines"', 'say "hi"', ""], ["2", "x,y", ""]]
+        assert self.csv(b'a,b\r\n1,"x\r\n2,y"z"\r\n', ', [Columns=2, QuoteStyle=QuoteStyle.None]').rows == [
+            ["a", "b"], ["1", "x"], ["2", 'y"z"']]
 
 
 class TestExcel:
@@ -141,7 +168,8 @@ class TestExcel:
                                                           ("T", "Sheet", False), ("Keys", "Table", False)]
         sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Sales",Kind="Sheet"]}[Data]', files)
         assert sheet.columns == ["Column1", "Column2", "Column3", "Column4"]
-        assert sheet.rows == [["Region", "Amount", "When", "Flag"], ["East", 10.5, dt.datetime(2024, 1, 2), True],
+        # A date-formatted cell is its stored number, as a Desktop refresh reads it (pivot-studio #104).
+        assert sheet.rows == [["Region", "Amount", "When", "Flag"], ["East", 10.5, 45293, True],
                               ["West", 3, None, False]]
         table = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Keys",Kind="Table"]}[Data]', files)
         assert table.columns == ["Key", "Name"] and table.rows == [[1, "a"], [2, "b"]]
@@ -163,12 +191,14 @@ class TestExcel:
         assert force_table(t, errors_as_null=False) == [["East", 10.5, dt.datetime(2024, 1, 2), True],
                                                         ["West", 3, None, False]]
 
-    def test_what_the_reference_leaves_open_is_refused(self):
-        files = files_of(w=self.workbook())
-        with pytest.raises(MError, match="useHeaders"):
-            ev('Excel.Workbook(File.Contents("w"), true, true)', files)
+    def test_use_headers_promotes_the_first_row(self):
+        sheet = ev('Excel.Workbook(File.Contents("w"), true, true){[Item="Sales",Kind="Sheet"]}[Data]',
+                   files_of(w=self.workbook()))
+        assert sheet.columns == ["Region", "Amount", "When", "Flag"] and sheet.rows[0] == ["East", 10.5, 45293, True]
+
+    def test_what_no_refresh_settles_is_refused(self):
         with pytest.raises(MError, match="delayTypes"):
-            ev('Excel.Workbook(File.Contents("w"))', files)
+            ev('Excel.Workbook(File.Contents("w"))', files_of(w=self.workbook()))
 
 
 class TestParquet:
@@ -189,6 +219,20 @@ class TestParquet:
         assert [x.facet or x.kind for x in t.types] == ["Int64.Type", "number", "text", "logical", "date", "datetime"]
         assert t.rows == [[1, 1.5, "a", True, dt.date(2024, 1, 2), dt.datetime(2024, 1, 2, 3, 4)],
                           [None, 2.0, None, False, None, None]]
+
+    def test_types_as_a_desktop_refresh_reads_them(self):
+        # pivot-studio #104: a float32 widened, a zoned timestamp at UTC whatever its zone, time, binary, decimal.
+        pa = pytest.importorskip("pyarrow")
+        from decimal import Decimal
+        stamp = dt.datetime(2015, 11, 20, 10, 59, tzinfo=dt.timezone.utc)
+        data = self.parquet(f=pa.array([0.1], pa.float32()), z=pa.array([stamp], pa.timestamp("us", tz="Australia/Sydney")),
+                            t=pa.array([dt.time(10, 59, 30)], pa.time64("us")), b=pa.array([b"\x00\x01"], pa.binary()),
+                            d=pa.array([Decimal("12345678.91")], pa.decimal128(10, 2)))
+        t = ev('Parquet.Document(File.Contents("p"))', files_of(p=data))
+        assert [x.kind for x in t.types] == ["number", "datetimezone", "time", "binary", "number"]
+        row = t.rows[0]
+        assert row[0] == pytest.approx(0.10000000149011612, abs=0) and row[1] == stamp and row[1].utcoffset() == dt.timedelta(0)
+        assert row[2:] == [dt.time(10, 59, 30), b"\x00\x01", 12345678.91]
 
     def test_other_types_are_refused(self):
         pa = pytest.importorskip("pyarrow")
@@ -250,11 +294,13 @@ class TestReviewFindings:
                 ev(f"Table.RenameColumns({T}, {pairs})")
         assert ev(f'Table.RenameColumns({T}, {{{{"a", "a"}}}})').columns == ["a", "b"]
 
-    def test_csv_malformed_quoting_and_blank_lines_are_refused(self):
-        for data in (b'a,"b\n', b'a,"b"c,d\n', b"a\n\nb\n"):
-            with pytest.raises(MError):
-                ev('Csv.Document(File.Contents("f"))', files_of(f=data))
-        assert ev('Csv.Document(File.Contents("f"))', files_of(f=b'a,b"c\r1,2\r')).rows == [['a', 'b"c'], ["1", "2"]]
+    def test_csv_malformed_quoting_and_blank_lines(self):
+        # As a Desktop refresh reads them (pivot-studio #104).
+        read = lambda data: ev('Csv.Document(File.Contents("f"))', files_of(f=data)).rows  # noqa: E731
+        assert read(b'a,"b\n') == [["a", "b\n"]]
+        assert read(b'a,"b"c,d\n') == [["a", "bc", "d"]]
+        assert read(b"a\n\nb\n") == [["a"], [""], ["b"]]
+        assert read(b'a,b"c\r1,2\r') == [['a', 'b"c'], ["1", "2"]]
 
     def test_csv_options_record_with_positional_arguments_is_refused(self):
         with pytest.raises(MError, match="options record"):
@@ -277,14 +323,46 @@ class TestReviewFindings:
         sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]', files_of(w=data))
         assert sheet.rows == [["x", None, None], [None, None, None], [None, None, 3]]
 
-    def test_excel_formulas_without_a_cached_value_are_refused(self):
+    def test_excel_formulas_with_an_empty_cached_value_are_empty_text(self):
         def build(wb):
             ws = wb.active
             ws.title = "S"
-            ws["A1"], ws["A2"] = 1, "=A1+1"      # openpyxl writes no cached value
-        with pytest.raises(MError, match="no cached value"):    # Data is read when used
-            ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]',
-               files_of(w=self.xlsx(build))).rows
+            ws["A1"], ws["A2"] = 1, "=A1+1"      # openpyxl writes an empty cached value, <v />
+        sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]',
+                   files_of(w=self.xlsx(build)))
+        assert sheet.rows == [[1], [""]]            # as a Desktop refresh reads it (pivot-studio #104)
+
+    def test_excel_error_values_are_failed_cells(self):
+        def build(wb):
+            ws = wb.active
+            ws.title = "S"
+            ws["A1"], ws["B1"] = "#DIV/0!", 1
+        sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]',
+                   files_of(w=self.xlsx(build)))
+        cell = sheet.rows[0][0]
+        assert isinstance(cell, CellError) and cell.error.reason == "DataFormat.Error"
+        assert cell.error.message == "Invalid cell value '#DIV/0!'." and sheet.rows[0][1] == 1
+
+    def test_excel_trailing_empty_rows_of_the_dimension_are_dropped(self):
+        def build(wb):
+            ws = wb.active
+            ws.title = "S"
+            ws.append(["a", "b"])
+            ws.append([1, 2])
+        src = zipfile.ZipFile(io.BytesIO(self.xlsx(build)))
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w") as z:
+            for info in src.infolist():
+                body = src.read(info.filename)
+                if info.filename == "xl/worksheets/sheet1.xml":
+                    body = body.replace(b'<dimension ref="A1:B2"', b'<dimension ref="A1:D5"')
+                z.writestr(info, body)
+        files = files_of(w=out.getvalue())
+        sheet = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="S",Kind="Sheet"]}[Data]', files)
+        assert sheet.rows == [["a", "b", None, None], [1, 2, None, None]]
+        sheet = ev('Excel.Workbook(File.Contents("w"), [DelayTypes=true, InferSheetDimensions=true])'
+                   '{[Item="S",Kind="Sheet"]}[Data]', files)
+        assert sheet.rows == [["a", "b"], [1, 2]]
 
     def test_excel_a_table_with_a_totals_row_is_refused_and_a_table_named_like_a_sheet_is_kept_apart(self):
         from openpyxl.worksheet.table import Table as XTable
@@ -304,12 +382,14 @@ class TestReviewFindings:
             t.add_table(x)
         files = files_of(w=self.xlsx(build))
         nav = ev('Excel.Workbook(File.Contents("w"), null, true)', files)
-        assert [(r[2], r[3]) for r in nav.rows] == [("Keys", "Sheet"), ("Keys", "Table"), ("Tot", "Sheet"),
+        # Sheets first, then tables, as a Desktop refresh lists them (pivot-studio #104).
+        assert [(r[2], r[3]) for r in nav.rows] == [("Keys", "Sheet"), ("Tot", "Sheet"), ("Keys", "Table"),
                                                     ("Tot1", "Table")]
         table = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Keys",Kind="Table"]}[Data]', files)
         assert table.columns == ["K"] and table.rows == [[1]]
-        with pytest.raises(MError, match="totals row"):
-            ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Tot1",Kind="Table"]}[Data]', files).rows
+        # A totals row is read as a row of the table.
+        table = ev('Excel.Workbook(File.Contents("w"), null, true){[Item="Tot1",Kind="Table"]}[Data]', files)
+        assert table.rows == [[1], [1]]
 
     def test_parquet_out_of_range_values_are_refused(self):
         pa = pytest.importorskip("pyarrow")
@@ -319,8 +399,12 @@ class TestReviewFindings:
             buf = io.BytesIO()
             pq.write_table(pa.table(cols), buf)
             return buf.getvalue()
-        with pytest.raises(MError, match="not supported"):
-            ev('Parquet.Document(File.Contents("p"))', files_of(p=parquet(u=pa.array([2 ** 64 - 1], pa.uint64()))))
+        assert ev('Parquet.Document(File.Contents("p"))',
+                  files_of(p=parquet(u=pa.array([2 ** 64 - 1], pa.uint64())))).rows == [[2 ** 64 - 1]]
+        from decimal import Decimal
+        with pytest.raises(MError, match="more digits"):
+            ev('Parquet.Document(File.Contents("p"))',
+               files_of(p=parquet(d=pa.array([Decimal("1234567890123456789.123456")], pa.decimal128(28, 6)))))
         ns = pa.array([1_000_000_001], pa.timestamp("ns"))
         with pytest.raises(MError, match="can't be read"):
             ev('Parquet.Document(File.Contents("p"))', files_of(p=parquet(t=ns)))
