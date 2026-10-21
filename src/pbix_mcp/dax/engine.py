@@ -2101,9 +2101,12 @@ def _cache_weight(v, depth: int = 2) -> int:
     """About how many elements a cached value holds: its length, and its
     parts' when it is a small container of collections (a cross-table filter
     is [(keys, index)], a hop ({column: values}, blank)). Never walks a large
-    collection, so it costs little beside building the entry."""
+    collection, so it costs little beside building the entry. A value that
+    knows its own weight (_Weighed) says so."""
     if isinstance(v, (str, bytes)):
         return 1
+    if type(v) is _Weighed:
+        return v.weight
     try:
         n = len(v)
     except TypeError:
@@ -2112,6 +2115,25 @@ def _cache_weight(v, depth: int = 2) -> int:
         parts = v.values() if isinstance(v, dict) else v if isinstance(v, (list, tuple)) else ()
         n += sum(_cache_weight(x, depth - 1) for x in parts)
     return max(n, 1)
+
+
+class _Weighed(list):
+    """A cached list that carries its weight: the elements its parts hold."""
+    __slots__ = ('weight',)
+
+
+class _HopRows(frozenset):
+    """A cross-table filter already resolved to the target table's row
+    indices (_hop_row_set), not join keys."""
+
+
+# Faster, same-answer filtering (pivot-studio #150): a direct one -> many hop
+# resolved to row indices through per-row buckets (_hop_row_set) rather than
+# join keys, and an inequality on a number or date column answered from a
+# sorted index (_indices_for_column_predicate) rather than a scan. Off, every
+# filter goes as before; the differential tests compare the two.
+_FAST_FILTERS = True
+_INEQUALITIES = {"<": "lt", "<=": "le", "=<": "le", ">": "gt", ">=": "ge", "=>": "ge"}
 
 
 class _FilterIndexCache(dict):
@@ -3017,6 +3039,58 @@ class DAXContext:
             row[c] = None
         return row
 
+    def _hop_row_set(self, src_table: str, src_tbl: dict, col_filters, dim_idx: int,
+                  table_name: str, tbl: dict, fact_idx: int):
+        """The rows of table_name that src_table's filters select across a
+        direct one -> many relationship, as row indices: what _hop_keys and
+        then _indices_for_values give, as the union of one bucket per selected
+        row of src_table (_hop_buckets), built once per relationship. A union
+        of key sets is the union of their rows, so the answer is the same; a
+        running total by date spelled ~2,000 join keys per date to find them
+        (pivot-studio #150). None where it doesn't apply (a DatePartOnly join,
+        a hop that isn't one -> many): the caller then hops by keys."""
+        cur_col = src_tbl['columns'][dim_idx]
+        nxt_col = tbl['columns'][fact_idx]
+        if ((src_table, cur_col, table_name, nxt_col) in self._date_part_joins
+                or (table_name, src_table) not in self._one_side_of):
+            return None
+        keep, applied = self._row_indices_where(src_tbl, col_filters)
+        src_blank = (src_table in self.blank_row_tables()
+                     and self._filters_admit_blank(applied))
+        buckets = self._hop_buckets(src_tbl, dim_idx, tbl, fact_idx)
+        idxs = range(len(src_tbl['rows'])) if keep is None else keep
+        drop = self._non_owner_rows(src_table, dim_idx)
+        if drop and self._joins_one_row(src_table, table_name):
+            src_rows = src_tbl['rows']
+            idxs = [i for i in idxs if id(src_rows[i]) not in drop]
+        parts = [buckets[i] for i in idxs]
+        if src_blank:
+            parts.append(self._indices_for_values(
+                tbl, fact_idx, self._unmatched_key_strs(table_name, fact_idx, src_table, cur_col)))
+        return _HopRows(i for part in parts for i in part)
+
+    def _hop_buckets(self, src_tbl: dict, dim_idx: int, tbl: dict, fact_idx: int) -> list:
+        """For each row of src_tbl, the rows of tbl its key joins: the value
+        map's rows of every spelling of the key (_hop_keys's aliases, then
+        _indices_for_values's spellings). Memoized on the model-wide cache."""
+        key = (id(src_tbl), 'hop-buckets', dim_idx, id(tbl), fact_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            vmap = self._value_index_map(tbl, fact_idx)
+            hit = _Weighed()
+            held = 0
+            for r in src_tbl['rows']:
+                keys: set = set()
+                for a in _join_key_aliases(r[dim_idx] if dim_idx < len(r) else None):
+                    keys.update(_index_spellings(a))
+                found = [vmap[k] for k in keys if k in vmap]
+                rows = found[0] if len(found) == 1 else frozenset().union(*found)
+                held += len(rows) + 1
+                hit.append(rows)
+            hit.weight = held
+            self._filter_idx_cache[key] = hit
+        return hit
+
     def _hop_keys(self, cur_name: str, cur_rows: list, cur_blank: bool,
                   cur_idx: int, nxt_name: str, nxt_idx: int) -> AbstractSet[str]:
         """The keys of nxt_name[nxt_idx] that the filtered rows of cur_name
@@ -3503,11 +3577,13 @@ class DAXContext:
                 snap[k] = self._filter_sig_exact(v)
         return snap
 
-    def _get_cross_table_filters(self, table_name: str) -> list:
+    def _get_cross_table_filters(self, table_name: str, rows: bool = False) -> list:
         """
         Get ALL cross-table filters that apply to a target table.
         Uses model relationships to propagate dimension filters to fact tables.
-        Returns list of (allowed_values_set, fact_col_idx) tuples.
+        Returns list of (allowed_values_set, fact_col_idx) tuples; with
+        ``rows``, a direct one -> many hop's set is the target's row indices
+        already (_HopRows) where _hop_row_set applies.
 
         Memoized on the shared cache: this walks the relationship graph and reads
         intermediate tables, and every get_column_data / get_filtered_rows call
@@ -3547,7 +3623,7 @@ class DAXContext:
         try:
             if self._rels_sig is None:
                 raise TypeError
-            ck = (id(tbl), 'xtf', self._filters_sig(),
+            ck = (id(tbl), 'xtf-rows' if rows else 'xtf', self._filters_sig(),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
                 self._rels_sig)
         except TypeError:
@@ -3556,12 +3632,12 @@ class DAXContext:
             hit = self._filter_idx_cache.get(ck)
             if hit is not None:
                 return list(hit)
-            out = self._get_cross_table_filters_uncached(table_name, tbl)
+            out = self._get_cross_table_filters_uncached(table_name, tbl, rows)
             self._filter_idx_cache[ck] = out
             return out
-        return self._get_cross_table_filters_uncached(table_name, tbl)
+        return self._get_cross_table_filters_uncached(table_name, tbl, rows)
 
-    def _get_cross_table_filters_uncached(self, table_name: str, tbl: dict) -> list:
+    def _get_cross_table_filters_uncached(self, table_name: str, tbl: dict, rows: bool = False) -> list:
 
         result_filters = []
 
@@ -3600,58 +3676,89 @@ class DAXContext:
             src_tbl = self.tables.get(src_table)
             if not src_tbl:
                 continue
-
-            # Find relationship between source dim table and target table:
-            # one -> many, plus bidirectional. A column filter on the MANY side
-            # does not reach the one side -- DimStore[StoreType]="Catalog"
-            # leaves COUNTROWS(DimEmployee) at 293 in Desktop. A TABLE filter
-            # on it does, and so does the transition of its row, by filtering
-            # the one side's own columns (expansion_filters; FILTER(Employee,
-            # ...) restricts Date, [Actives] = 32,401).
-            rel = self._rel_dir.get((table_name, src_table))
-            if not rel:
-                # Try via date table special handling (for Year/Month filters on date dim)
-                if src_table == self.date_table:
-                    result_filters.extend(self._get_date_cross_filter(table_name, src_tbl, col_filters))
-                    continue
-                # No direct relationship: try a multi-hop (snowflake) path so a
-                # filter on a dimension 2+ hops from the fact is not silently
-                # dropped (e.g. Regions -> Customers -> Orders).
-                path = self._find_rel_path(src_table, table_name)
-                if path:
-                    res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
-                    # res is None only on a structural error; an (empty) set is a
-                    # real result and MUST be applied so the fact filters to zero
-                    # rows rather than falling back to the grand total.
-                    if res is not None:
-                        result_filters.append(res)
-                continue
-
-            # Direct relationship exists: filter source dim table, get join key values
-            fact_join_col = rel['from_col']  # Column in target (fact) table
-            dim_join_col = rel['to_col']     # Column in source (dim) table
-
-            fact_join_idx = self._find_col_idx(tbl['columns'], fact_join_col)
-            dim_join_idx = self._find_col_idx(src_tbl['columns'], dim_join_col)
-            if fact_join_idx < 0 or dim_join_idx < 0:
-                continue
-
-            # Filter dim table rows by all filters on that table
-            filtered_dim_rows, applied = self._rows_where(src_tbl, col_filters)
-            # The source's blank row survives when every filter on it keeps
-            # BLANK; it then selects the target rows no source row matches.
-            src_blank = (src_table in self.blank_row_tables()
-                         and self._filters_admit_blank(applied))
-
-            # Get allowed join key values. Append even an EMPTY set: an empty
-            # dimension selection must filter the fact to zero rows (BLANK), not
-            # be dropped (which would leave the fact unfiltered -> grand total).
-            # Mirrors the multi-hop path's empty-set handling.
-            allowed_keys = self._hop_keys(src_table, filtered_dim_rows, src_blank,
-                                          dim_join_idx, table_name, fact_join_idx)
-            result_filters.append((allowed_keys, fact_join_idx))
+            result_filters.extend(self._cross_filters_from(table_name, tbl, src_table, src_tbl, col_filters, rows))
 
         return result_filters
+
+    def _cross_filters_from(self, table_name: str, tbl: dict, src_table: str, src_tbl: dict,
+                            col_filters: list, rows: bool) -> list:
+        """The filters on src_table as they reach table_name: (allowed, index)
+        pairs, as _get_cross_table_filters lists them. They depend only on
+        src_table's own filters and the model, so they are memoized by those:
+        a query asks for the same source filters under every group (a running
+        total's date filter changes per date, its year filter never does;
+        pivot-studio #150)."""
+        try:
+            sk = (id(tbl), 'xtf-src', src_table, rows,
+                  frozenset((c, self._filter_sig_exact(v)) for c, v in col_filters),
+                  self._rels_sig, self.date_table, self.date_column)
+            hash(sk)
+        except TypeError:
+            sk = None
+        if sk is not None and self._rels_sig is not None:
+            hit = self._filter_idx_cache.get(sk)
+            if hit is not None:
+                return hit
+        out = self._cross_filters_from_uncached(table_name, tbl, src_table, src_tbl, col_filters, rows)
+        if sk is not None and self._rels_sig is not None:
+            self._filter_idx_cache[sk] = out
+        return out
+
+    def _cross_filters_from_uncached(self, table_name: str, tbl: dict, src_table: str, src_tbl: dict,
+                                     col_filters: list, rows: bool) -> list:
+        # Find relationship between source dim table and target table:
+        # one -> many, plus bidirectional. A column filter on the MANY side
+        # does not reach the one side -- DimStore[StoreType]="Catalog"
+        # leaves COUNTROWS(DimEmployee) at 293 in Desktop. A TABLE filter
+        # on it does, and so does the transition of its row, by filtering
+        # the one side's own columns (expansion_filters; FILTER(Employee,
+        # ...) restricts Date, [Actives] = 32,401).
+        rel = self._rel_dir.get((table_name, src_table))
+        if not rel:
+            # Try via date table special handling (for Year/Month filters on date dim)
+            if src_table == self.date_table:
+                return list(self._get_date_cross_filter(table_name, src_tbl, col_filters))
+            # No direct relationship: try a multi-hop (snowflake) path so a
+            # filter on a dimension 2+ hops from the fact is not silently
+            # dropped (e.g. Regions -> Customers -> Orders).
+            path = self._find_rel_path(src_table, table_name)
+            if path:
+                res = self._propagate_filter_path(src_tbl, col_filters, path, table_name)
+                # res is None only on a structural error; an (empty) set is a
+                # real result and MUST be applied so the fact filters to zero
+                # rows rather than falling back to the grand total.
+                if res is not None:
+                    return [res]
+            return []
+
+        # Direct relationship exists: filter source dim table, get join key values
+        fact_join_col = rel['from_col']  # Column in target (fact) table
+        dim_join_col = rel['to_col']     # Column in source (dim) table
+
+        fact_join_idx = self._find_col_idx(tbl['columns'], fact_join_col)
+        dim_join_idx = self._find_col_idx(src_tbl['columns'], dim_join_col)
+        if fact_join_idx < 0 or dim_join_idx < 0:
+            return []
+        if rows:
+            hop = self._hop_row_set(src_table, src_tbl, col_filters, dim_join_idx, table_name, tbl, fact_join_idx)
+            if hop is not None:
+                return [(hop, fact_join_idx)]
+
+        # Filter dim table rows by all filters on that table
+        filtered_dim_rows, applied = self._rows_where(src_tbl, col_filters)
+        # The source's blank row survives when every filter on it keeps
+        # BLANK; it then selects the target rows no source row matches.
+        src_blank = (src_table in self.blank_row_tables()
+                     and self._filters_admit_blank(applied))
+
+        # Get allowed join key values. Append even an EMPTY set: an empty
+        # dimension selection must filter the fact to zero rows (BLANK), not
+        # be dropped (which would leave the fact unfiltered -> grand total).
+        # Mirrors the multi-hop path's empty-set handling.
+        allowed_keys = self._hop_keys(src_table, filtered_dim_rows, src_blank,
+                                      dim_join_idx, table_name, fact_join_idx)
+        return [(allowed_keys, fact_join_idx)]
+
 
     def _find_rel_path(self, src_table: str, target_table: str) -> Optional[list]:
         """BFS the directed relationship graph for a filter-propagation path.
@@ -4123,6 +4230,67 @@ class DAXContext:
             acc |= f
         return frozenset(acc)
 
+    def _indices_for_column_predicate(self, tbl: dict, col_idx: int, spec):
+        """Row indices an inequality (<, <=, >, >=; several under "all") on a
+        column of numbers or dates selects, from the column sorted once by the
+        number _compare compares (_as_number): a binary search, not a scan of
+        every row per filter. None when that isn't the comparison
+        make_value_matcher would make (a BLANK, text or a NaN in the column, a
+        BLANK or non-numeric target, any other kind of predicate): the caller
+        then scans with the matcher. A running total's 'Calendar'[Date] <= v
+        scanned the calendar once per date (pivot-studio #150)."""
+        if not isinstance(spec, dict):
+            return None
+        if set(spec) == {"all"} and isinstance(spec["all"], list) and spec["all"]:
+            parts = [self._indices_for_column_predicate(tbl, col_idx, x) for x in spec["all"]]
+            if any(p is None for p in parts):
+                return None
+            parts.sort(key=len)
+            out = parts[0]
+            for p in parts[1:]:
+                out = out & p
+            return out
+        if set(spec) != {"op", "value"} or spec["op"] not in _INEQUALITIES:
+            return None
+        target = _as_number(spec["value"]) if spec["value"] is not None else None
+        if target is None or target != target:
+            return None
+        index = self._numeric_order(tbl, col_idx)
+        if index is None:
+            return None
+        keys, order = index
+        kind = _INEQUALITIES[spec["op"]]
+        if kind == "lt":
+            return frozenset(order[:bisect.bisect_left(keys, target)])
+        if kind == "le":
+            return frozenset(order[:bisect.bisect_right(keys, target)])
+        if kind == "gt":
+            return frozenset(order[bisect.bisect_right(keys, target):])
+        return frozenset(order[bisect.bisect_left(keys, target):])
+
+    def _numeric_order(self, tbl: dict, col_idx: int):
+        """(sorted numbers, their row indices) of a column whose every cell is
+        a number or a date (_as_number), memoized; None (also memoized) when a
+        cell is BLANK, text, a boolean or NaN."""
+        key = (id(tbl), 'numeric-order', col_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            nums = []
+            for i, r in enumerate(tbl['rows']):
+                v = r[col_idx] if col_idx < len(r) else None
+                n = None if v is None or isinstance(v, (bool, str)) else _as_number(v)
+                if n is None or n != n:
+                    nums = None
+                    break
+                nums.append((n, i))
+            if nums is None:
+                hit = (False,)
+            else:
+                nums.sort()
+                hit = ([n for n, _ in nums], [i for _, i in nums])
+            self._filter_idx_cache[key] = hit
+        return None if hit == (False,) else hit
+
     def _rows_where(self, tbl: dict, col_filters) -> tuple:
         """``(rows, applied)``: the rows of ``tbl`` that every ``(column,
         values)`` filter keeps, in row order, and the filters that applied.
@@ -4132,6 +4300,15 @@ class DAXContext:
         dimension side of a relationship used to be filtered row by row with
         the matcher, once per propagation: a TOPN over 1,850 products made
         3.4 million matcher calls."""
+        keep, applied = self._row_indices_where(tbl, col_filters)
+        rows = tbl['rows']
+        if keep is None:
+            return rows, applied
+        return [rows[i] for i in sorted(keep)], applied
+
+    def _row_indices_where(self, tbl: dict, col_filters) -> tuple:
+        """``(indices, applied)``: _rows_where's rows as their indices, None
+        when no filter applied (every row)."""
         rows = tbl['rows']
         keep = None
         applied = []
@@ -4140,6 +4317,8 @@ class DAXContext:
             if idx < 0:
                 continue
             hit = self._indices_for_column_filter(tbl, idx, values)
+            if hit is None and _FAST_FILTERS:
+                hit = self._indices_for_column_predicate(tbl, idx, values)
             if hit is None:
                 sig = self._filter_sig(values)
                 ck = (id(tbl), 'd', idx, sig) if sig is not None else None
@@ -4151,9 +4330,7 @@ class DAXContext:
                         self._filter_idx_cache[ck] = hit
             keep = hit if keep is None else keep & hit
             applied.append((col, values))
-        if keep is None:
-            return rows, applied
-        return [rows[i] for i in sorted(keep)], applied
+        return keep, applied
 
     def _tuple_column_getter(self, table_name: str, t: str, c: str):
         """``row of table_name -> its value of t[c]``, when t[c] is in
@@ -4274,6 +4451,8 @@ class DAXContext:
             if filt_idx < 0:
                 continue
             hit = self._indices_for_column_filter(tbl, filt_idx, allowed)
+            if hit is None and _FAST_FILTERS:
+                hit = self._indices_for_column_predicate(tbl, filt_idx, allowed)
             if hit is None:
                 sig = self._filter_sig(allowed)
                 key = (id(tbl), 'd', filt_idx, sig) if sig is not None else None
@@ -4285,8 +4464,8 @@ class DAXContext:
                     if key is not None:
                         cache[key] = hit
             sets.append(hit)
-        for allowed_vals, join_idx in self._get_cross_table_filters(table_name):
-            hit = self._indices_for_values(tbl, join_idx, allowed_vals)
+        for allowed_vals, join_idx in self._get_cross_table_filters(table_name, rows=_FAST_FILTERS):
+            hit = allowed_vals if type(allowed_vals) is _HopRows else self._indices_for_values(tbl, join_idx, allowed_vals)
             if hit is None:
                 sig = self._filter_sig(allowed_vals)
                 key = (id(tbl), 'x', join_idx, sig) if sig is not None else None
