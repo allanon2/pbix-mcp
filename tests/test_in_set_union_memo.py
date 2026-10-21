@@ -60,6 +60,9 @@ def test_values_that_spell_alike_are_not_confused():
 
 
 def test_year_to_date_by_country_and_day_matches_with_and_without_the_memo(monkeypatch):
+    # The memo serves a hop by keys; with the fast filters on, this direct hop goes
+    # through per-row buckets instead (_hop_row_set, test_fast_filters_differential.py).
+    monkeypatch.setattr(de, "_FAST_FILTERS", False)
     eng = de.DAXEngine()
     tables = fresh_tables()
     got = {}
