@@ -2114,6 +2114,53 @@ def _relative_date_bounds(spec: dict):
 
 _SHARED_FILTER_CACHES: dict = {}
 _SHARED_FILTER_CACHE_MAX = 4
+# The elements (keys, row indices, values) one model's filter-index cache may
+# hold, in all. Its entries are keyed by filter context, so a measure asked
+# under a new context per group -- a running total by date -- adds one per
+# date: 4,000 dates of a 1 MB model's cross-table key sets held 16 GB and the
+# process was never given it back. Past the bound the cache starts again.
+_FILTER_CACHE_MAX_WEIGHT = 4_000_000
+
+
+def _cache_weight(v, depth: int = 2) -> int:
+    """About how many elements a cached value holds: its length, and its
+    parts' when it is a small container of collections (a cross-table filter
+    is [(keys, index)], a hop ({column: values}, blank)). Never walks a large
+    collection, so it costs little beside building the entry."""
+    if isinstance(v, (str, bytes)):
+        return 1
+    try:
+        n = len(v)
+    except TypeError:
+        return 1
+    if depth and n <= 64:
+        parts = v.values() if isinstance(v, dict) else v if isinstance(v, (list, tuple)) else ()
+        n += sum(_cache_weight(x, depth - 1) for x in parts)
+    return max(n, 1)
+
+
+class _FilterIndexCache(dict):
+    """One model's filter-index cache (_shared_filter_cache). Every entry is a
+    pure function of its key, so once what it holds passes
+    _FILTER_CACHE_MAX_WEIGHT it is emptied, as the module's other caches are
+    past their count, keeping only the tables reference its keys' ids rely on.
+    Entries added by mutating a held container (the union and row-expansion
+    memos) carry bounds of their own."""
+
+    def __init__(self, tables):
+        super().__init__(__tables_ref__=tables)
+        self.weight = 0
+
+    def __setitem__(self, key, value):
+        w = _cache_weight(value)
+        with _CACHE_LOCK:
+            if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
+                tables = dict.get(self, '__tables_ref__')
+                dict.clear(self)
+                dict.__setitem__(self, '__tables_ref__', tables)
+                self.weight = 0
+            self.weight += w
+            dict.__setitem__(self, key, value)
 
 # Guards the insert / evict / id-assign steps of the module-level caches below,
 # which evaluations on different threads (see _PerThreadEngine) may run at
@@ -2337,7 +2384,7 @@ def _shared_filter_cache(tables) -> dict:
             if hit is None:
                 if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
                     _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
-                hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
+                hit = _SHARED_FILTER_CACHES[fp] = _FilterIndexCache(tables)
     return hit
 
 
