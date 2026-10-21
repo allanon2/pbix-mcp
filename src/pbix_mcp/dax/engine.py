@@ -1318,6 +1318,7 @@ def _strip_line_comments(expr):
     return ''.join(parts).strip()
 
 
+@lru_cache(maxsize=100_000)
 def _collapse_ws_outside_strings(expr: str) -> str:
     r"""Collapse runs of whitespace to one space, but NEVER inside a string
     literal. A blanket re.sub(r'\s+', ' ') flattened the newlines and
@@ -1550,6 +1551,9 @@ def _as_date(v):
     return None
 
 
+_ISO_STRICT = re.compile(r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?)?")
+
+
 @lru_cache(maxsize=100_000)
 def _as_date_str_strict(s: str):
     """Whole-string date parse: None unless the ENTIRE value is a date.
@@ -1560,6 +1564,15 @@ def _as_date_str_strict(s: str):
     prefix-parse to 2017-01-01, so the value-index aliasing merged every
     distinct key sharing a date prefix into ONE bucket and a filtered fact
     table came back UNFILTERED (issue #42)."""
+    if _ISO_STRICT.fullmatch(s):
+        # what the first five formats accept, without trying each with
+        # strptime: a running total parsed every date that way (pivot-studio
+        # #156). An impossible date (2025-02-30) goes on to the formats below,
+        # which give it None.
+        try:
+            return datetime.fromisoformat(s).date()
+        except ValueError:
+            pass
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
                 "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d",
                 "%d/%m/%Y", "%m/%d/%Y"):
@@ -2163,26 +2176,48 @@ _INEQUALITIES = {"<": "lt", "<=": "le", "=<": "le", ">": "gt", ">=": "ge", "=>":
 
 class _FilterIndexCache(dict):
     """One model's filter-index cache (_shared_filter_cache). Every entry is a
-    pure function of its key, so once what it holds passes
-    _FILTER_CACHE_MAX_WEIGHT it is emptied, as the module's other caches are
-    past their count, keeping only the tables reference its keys' ids rely on.
+    pure function of its key. Two kinds are held: STRUCTURAL ones, facts about
+    the model that no filter changes (value maps, sorted orders, hop buckets,
+    blank-row tables, the shield memo), and the rest, which a filter set or a
+    source filter names. Once the filter-named entries pass
+    _FILTER_CACHE_MAX_WEIGHT elements they are dropped, as the module's other
+    caches are past their count; the structural ones stay, unless they alone
+    pass twice the bound. Emptying both rebuilt the blank-row tables and every
+    hop bucket mid-query: 7 of a running total's 17 s (pivot-studio #151).
     Entries added by mutating a held container (the union and row-expansion
     memos) carry bounds of their own."""
 
     def __init__(self, tables):
         super().__init__(__tables_ref__=tables)
-        self.weight = 0
+        self.weight = 0       # the filter-named entries'
+        self.pinned = 0       # the structural entries'
 
     def __setitem__(self, key, value):
         w = _cache_weight(value)
+        structural = _cache_kind(key) in _STRUCTURAL_KINDS
         with _CACHE_LOCK:
-            if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
-                tables = dict.get(self, '__tables_ref__')
-                dict.clear(self)
-                dict.__setitem__(self, '__tables_ref__', tables)
-                self.weight = 0
-            self.weight += w
+            if structural:
+                if self.pinned + w > 2 * _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=True)
+                self.pinned += w
+            else:
+                if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=False)
+                self.weight += w
             dict.__setitem__(self, key, value)
+
+    def _drop(self, everything: bool) -> None:
+        tables = dict.get(self, '__tables_ref__')
+        if everything:
+            dict.clear(self)
+            self.pinned = 0
+        else:
+            for k in [k for k in dict.keys(self) if _cache_kind(k) not in _STRUCTURAL_KINDS]:
+                dict.__delitem__(self, k)
+        dict.__setitem__(self, '__tables_ref__', tables)
+        self.weight = 0
+
+
 
 # Guards the insert / evict / id-assign steps of the module-level caches below,
 # which evaluations on different threads (see _PerThreadEngine) may run at
@@ -2190,6 +2225,27 @@ class _FilterIndexCache(dict):
 # it two relationship sets interned together could get the SAME id, and the
 # cross-filter memo keyed by it would serve one set's answer for the other.
 _CACHE_LOCK = threading.Lock()
+
+
+# Entries that are facts about the model, not about a filter set: kept when the
+# filter-named entries are dropped (_FilterIndexCache).
+_STRUCTURAL_KINDS = frozenset({
+    '__tables_ref__', '__shield__', 'blank-row-tables', 'every-cell-valued', 'vmap', 'tmap', 'dpmap',
+    'numeric-order', 'non-owners', 'key-aliases', 'dp-keys', 'hop-buckets', 'unmatched', 'is-datetime',
+})
+
+
+def _cache_kind(key) -> str | None:
+    """An entry's kind: a key's leading string, or the string after a table's
+    id ((id(tbl), 'vmap', ...))."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple) and key:
+        if isinstance(key[0], str):
+            return key[0]
+        if len(key) > 1 and isinstance(key[1], str):
+            return key[1]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -8676,12 +8732,19 @@ class DAXEngine:
     @staticmethod
     def _column_is_datetime(ctx: DAXContext, table, column) -> bool:
         tbl = (ctx.tables or {}).get(table) or {}
+        key = (id(tbl), 'is-datetime', column)
+        hit = ctx._filter_idx_cache.get(key)
+        if hit is not None:
+            return hit
         cols = tbl.get('columns') or []
         if column not in cols:
-            return False
-        i = cols.index(column)
-        v = next((r[i] for r in (tbl.get('rows') or []) if r[i] is not None), None)
-        return isinstance(v, (datetime, date))
+            out = False
+        else:
+            i = cols.index(column)
+            v = next((r[i] for r in (tbl.get('rows') or []) if r[i] is not None), None)
+            out = isinstance(v, (datetime, date))
+        ctx._filter_idx_cache[key] = out
+        return out
 
     def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
                                         keep_keys: set | frozenset = frozenset()) -> DAXContext:
@@ -16415,7 +16478,17 @@ def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     name the memo inside ``cache``, so one dict can serve several queries
     and never hands a value across models. The query's ALLSELECTED state is
     keyed per measure (DAXEngine._selection_token)."""
-    name = (id(ctx.tables),) + _memo_name(ctx)
+    # A query's contexts come from one model: the same objects every time, so
+    # the name, which serialises every measure, is worked out once per cache
+    # (a batch of thousands named it per context, pivot-studio #156).
+    ident = getattr(ctx, '_memo_ident', None)
+    named = cache.get('__named__') if ident is not None else None
+    if named is not None and named[0] == ident:
+        name = named[1]
+    else:
+        name = (id(ctx.tables),) + _memo_name(ctx)
+        if ident is not None:
+            cache['__named__'] = (ident, name)
     entry = cache.get(name)
     if entry is None or entry[0] is not ctx.tables:
         # the tables are held, so their id cannot name another model
@@ -16814,6 +16887,10 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     ctx.model_columns = model_columns or {}
     ctx.culture = culture
     if cache is not None:
+        # The arguments are the model's own objects, the same for every context
+        # of a query; the context's are built per call (model_columns or {}).
+        ctx._memo_ident = (id(tables), id(measures), id(relationships), id(date_tables), id(measure_tables),
+                           id(model_columns), date_table, date_column, culture)
         _attach_query_memo(ctx, cache)
     elif _FAST_FILTERS:
         ctx._shield_cache = _model_shield_cache(ctx)
