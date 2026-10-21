@@ -2174,6 +2174,28 @@ _FAST_FILTERS = True
 _INEQUALITIES = {"<": "lt", "<=": "le", "=<": "le", ">": "gt", ">=": "ge", "=>": "ge"}
 
 
+def _range_parts(spec) -> list | None:
+    """An inequality, or several under "all", with numeric targets, as
+    [(lt | le | gt | ge, number)]; None for any other filter (as
+    _indices_for_column_predicate takes them)."""
+    if not isinstance(spec, dict):
+        return None
+    if set(spec) == {"all"} and isinstance(spec["all"], list) and spec["all"]:
+        out = []
+        for x in spec["all"]:
+            got = _range_parts(x)
+            if got is None:
+                return None
+            out += got
+        return out
+    if set(spec) != {"op", "value"} or spec["op"] not in _INEQUALITIES or spec["value"] is None:
+        return None
+    target = _as_number(spec["value"])
+    if target is None or target != target:
+        return None
+    return [(_INEQUALITIES[spec["op"]], target)]
+
+
 class _FilterIndexCache(dict):
     """One model's filter-index cache (_shared_filter_cache). Every entry is a
     pure function of its key. Two kinds are held: STRUCTURAL ones, facts about
@@ -7566,9 +7588,145 @@ class DAXEngine:
             return compute(actx.get_column_data(*col))
         if hit is not self._NO_MEMO:
             return hit
-        out = compute(actx.get_column_data(*col))
+        out = self._range_aggregate(actx, kind, col) if kind in ('sum', 'count') else self._NO_MEMO
+        if out is self._NO_MEMO:
+            out = compute(actx.get_column_data(*col))
         actx._filter_idx_cache[key] = out
         return out
+
+    def _range_aggregate(self, ctx: DAXContext, kind: str, col: tuple) -> Any:
+        """SUM or COUNT of T[c] under a filter set whose one inequality is on a
+        column of a table D directly on T's one side (a running total's
+        'Calendar'[Date] <= v), from per-D-row partials of T's rows that the
+        OTHER filters keep, ordered by D's column, with running totals: a
+        binary search and a lookup per evaluation, not a sum over the rows.
+        Desktop answers a running total so: one scan of SUM by date, then the
+        cached sums at or before each date (pivot-studio #155). For a
+        many-to-one join, the rows a D filter set keeps are the rows each of
+        its filters keeps, so the inequality's rows can be taken apart from
+        the others; non-owner rows and the blank row as the hop treats them.
+        Floats are added in another order than row by row: equal within
+        rounding, as Desktop's are. _NO_MEMO where the shape doesn't hold."""
+        NO = self._NO_MEMO
+        t_name, c_name = col
+        tbl = ctx.tables.get(t_name)
+        if (tbl is None or ctx._no_prop_keys or ctx._no_propagate or ctx._rels_sig is None
+                or ctx.has_tuple_filters()):
+            return NO
+        ranges = [(k, v) for k, v in ctx.filter_context.items()
+                  if isinstance(v, dict) and _range_parts(v) is not None]
+        if len(ranges) != 1:
+            return NO
+        key, spec = ranges[0]
+        d_name, d_col = key.split('.', 1) if '.' in key else (None, None)
+        src = ctx.tables.get(d_name) if d_name else None
+        rel = ctx._rel_dir.get((t_name, d_name)) if d_name else None
+        if src is None or d_name == t_name or not rel or (t_name, d_name) not in ctx._one_side_of:
+            return NO
+        dim_idx = ctx._find_col_idx(src['columns'], rel['to_col'])
+        fact_idx = ctx._find_col_idx(tbl['columns'], rel['from_col'])
+        r_idx = ctx._find_col_idx(src['columns'], d_col)
+        v_idx = ctx._find_col_idx(tbl['columns'], c_name)
+        if min(dim_idx, fact_idx, r_idx, v_idx) < 0:
+            return NO
+        if (d_name, src['columns'][dim_idx], t_name, tbl['columns'][fact_idx]) in ctx._date_part_joins:
+            return NO
+        order = ctx._numeric_order(src, r_idx)
+        if order is None:
+            return NO
+        base = ctx.without_filters([key])
+        try:
+            ck = (id(tbl), 'range', kind, v_idx, key, base._filters_sig(), ctx._rels_sig,
+                  ctx.date_table, ctx.date_column)
+            entry = ctx._filter_idx_cache.get(ck)
+        except TypeError:
+            return NO
+        if entry is None:
+            entry = self._range_partials(ctx, base, kind, t_name, tbl, d_name, src, dim_idx, fact_idx, v_idx, order)
+            ctx._filter_idx_cache[ck] = entry
+        if entry == (False,):
+            return NO
+        keys, sums, counts, pre_s, pre_n, suf_s, suf_n, blank_s, blank_n = entry
+        lo, hi = 0, len(keys)
+        for op, target in _range_parts(spec):
+            if op == 'lt':
+                hi = min(hi, bisect.bisect_left(keys, target))
+            elif op == 'le':
+                hi = min(hi, bisect.bisect_right(keys, target))
+            elif op == 'gt':
+                lo = max(lo, bisect.bisect_right(keys, target))
+            else:
+                lo = max(lo, bisect.bisect_left(keys, target))
+        if hi <= lo:
+            total, n = (0, 0)
+        elif lo == 0:
+            total, n = pre_s[hi], pre_n[hi]
+        elif hi == len(keys):
+            total, n = suf_s[lo], suf_n[lo]
+        else:
+            total, n = 0, 0
+            for i in range(lo, hi):
+                total += sums[i]
+                n += counts[i]
+        if blank_n and ctx._filters_admit_blank([(d_col, spec)]):
+            total += blank_s
+            n += blank_n
+        if kind == 'count':
+            return n or None
+        return total if n else None
+
+    def _range_partials(self, ctx, base, kind, t_name, tbl, d_name, src, dim_idx, fact_idx, v_idx, order):
+        """_range_aggregate's per-D-row partials (sum, count) in the column's
+        order with their running totals from each end, and the blank row's;
+        (False,) when a NaN or infinity would make running totals wrong."""
+        keys, d_rows = order
+        keep = base._surviving_indices(t_name, tbl)
+        rows = tbl['rows']
+        buckets = ctx._hop_buckets(src, dim_idx, tbl, fact_idx)
+        drop = ctx._non_owner_rows(d_name, dim_idx)
+        if drop and not ctx._joins_one_row(d_name, t_name):
+            drop = frozenset()
+        src_rows = src['rows']
+
+        def part(idx):
+            total, n = 0, 0
+            for i in idx:
+                if keep is not None and i not in keep:
+                    continue
+                v = rows[i][v_idx]
+                if kind == 'count':
+                    n += v is not None
+                elif isinstance(v, (int, float)):
+                    total += v
+                    n += 1
+            return total, n
+        sums, counts = [], []
+        for d in d_rows:
+            total, n = (0, 0) if id(src_rows[d]) in drop else part(buckets[d])
+            sums.append(total)
+            counts.append(n)
+        blank_s, blank_n = 0, 0
+        if d_name in ctx.blank_row_tables():
+            unmatched = ctx._indices_for_values(
+                tbl, fact_idx, ctx._unmatched_key_strs(t_name, fact_idx, d_name, src['columns'][dim_idx]))
+            blank_s, blank_n = part(unmatched)
+        if any(isinstance(x, float) and not math.isfinite(x) for x in sums + [blank_s]):
+            return (False,)
+        pre_s, pre_n, total, n = [0], [0], 0, 0
+        for x, c in zip(sums, counts):
+            total += x
+            n += c
+            pre_s.append(total)
+            pre_n.append(n)
+        suf_s, suf_n, total, n = [0], [0], 0, 0
+        for x, c in zip(reversed(sums), reversed(counts)):
+            total += x
+            n += c
+            suf_s.append(total)
+            suf_n.append(n)
+        suf_s.reverse()
+        suf_n.reverse()
+        return (keys, sums, counts, pre_s, pre_n, suf_s, suf_n, blank_s, blank_n)
 
     def _fn_sum(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)

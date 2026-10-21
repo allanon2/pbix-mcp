@@ -106,9 +106,20 @@ def answers(tables: dict, fcs: list, fast: bool, monkeypatch) -> list:
                 v = eng.evaluate_measure(name, ctx)
             except Exception as e:   # the same error both ways is the same answer
                 v = ("error", type(e).__name__)
-            row.append(repr(v))   # repr: NaN equals NaN, 1 and 1.0 differ
+            row.append(v)
         got.append(row)
     return got
+
+
+def same(a, b) -> bool:
+    """Equal answers: exactly, or numbers within 1e-6 absolute or 1e-9 relative -- a running total from
+    per-date subtotals adds floats in another order than row by row (#155), as Desktop's own engine does;
+    the Desktop suites compare so. NaN equals NaN; a type change is a difference."""
+    if isinstance(a, float) and isinstance(b, float):
+        if math.isnan(a) or math.isnan(b):
+            return math.isnan(a) and math.isnan(b)
+        return abs(a - b) <= 1e-6 or math.isclose(a, b, rel_tol=1e-9)
+    return type(a) is type(b) and a == b
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -118,7 +129,7 @@ def test_fast_filters_answer_as_the_plain_route(seed, monkeypatch):
     plain = answers(copy(base), fcs, False, monkeypatch)
     fast = answers(copy(base), fcs, True, monkeypatch)
     for fc, p, f in zip(fcs, plain, fast):
-        assert f == p, (fc, list(zip(MEASURES, p, f)))
+        assert all(same(x, y) for x, y in zip(p, f)), (fc, [(m, x, y) for m, x, y in zip(MEASURES, p, f) if not same(x, y)])
 
 
 def test_the_fuzz_reaches_the_fast_paths(monkeypatch):
