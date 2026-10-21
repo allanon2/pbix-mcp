@@ -76,3 +76,19 @@ def test_an_entry_larger_than_the_bound_is_still_kept(monkeypatch):
     cache["large"] = [(frozenset(range(50)), 1)]
     assert "small" not in cache and cache["large"] == [(frozenset(range(50)), 1)]
     assert cache.weight == de._cache_weight([(frozenset(range(50)), 1)]) and cache["__tables_ref__"] is tables
+
+
+def test_facts_about_the_model_outlive_a_reset(monkeypatch):
+    """Value maps and blank-row tables don't depend on a filter: dropped with the filter-named
+    entries, they were rebuilt in the middle of a query, whose filter-named entries then filled
+    the cache again."""
+    monkeypatch.setattr(de, "_FILTER_CACHE_MAX_WEIGHT", 10)
+    tables = fresh_tables()
+    cache = de._shared_filter_cache(tables)
+    cache[("blank-row-tables", 1)] = frozenset({"dim"})
+    cache[(id(tables["fact"]), "vmap", 0)] = {"a": frozenset(range(5))}
+    cache[(id(tables["fact"]), "xtf", 1)] = [(frozenset(range(8)), 0)]
+    cache[(id(tables["fact"]), "x", 2)] = frozenset(range(7))       # past the bound: the filter-named go
+    assert (id(tables["fact"]), "xtf", 1) not in cache
+    assert cache[("blank-row-tables", 1)] == frozenset({"dim"}) and (id(tables["fact"]), "vmap", 0) in cache
+    assert (id(tables["fact"]), "x", 2) in cache and cache["__tables_ref__"] is tables

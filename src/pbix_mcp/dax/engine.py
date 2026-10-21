@@ -2116,26 +2116,47 @@ def _cache_weight(v, depth: int = 2) -> int:
 
 class _FilterIndexCache(dict):
     """One model's filter-index cache (_shared_filter_cache). Every entry is a
-    pure function of its key, so once what it holds passes
-    _FILTER_CACHE_MAX_WEIGHT it is emptied, as the module's other caches are
-    past their count, keeping only the tables reference its keys' ids rely on.
-    Entries added by mutating a held container (the union and row-expansion
-    memos) carry bounds of their own."""
+    pure function of its key. Two kinds are held: STRUCTURAL ones, facts about
+    the model that no filter changes (value maps, blank-row tables, key
+    ownership), and the rest, which a filter set names. Once the filter-named
+    entries pass _FILTER_CACHE_MAX_WEIGHT elements they are dropped, as the
+    module's other caches are past their count; the structural ones stay,
+    unless they alone pass twice the bound: emptying both would rebuild the
+    model's indexes in the middle of a query, which then fills the cache with
+    filter-named entries again. Entries added by mutating a held container (the
+    union and row-expansion memos) carry bounds of their own."""
 
     def __init__(self, tables):
         super().__init__(__tables_ref__=tables)
-        self.weight = 0
+        self.weight = 0       # the filter-named entries'
+        self.pinned = 0       # the structural entries'
 
     def __setitem__(self, key, value):
         w = _cache_weight(value)
+        structural = _cache_kind(key) in _STRUCTURAL_KINDS
         with _CACHE_LOCK:
-            if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
-                tables = dict.get(self, '__tables_ref__')
-                dict.clear(self)
-                dict.__setitem__(self, '__tables_ref__', tables)
-                self.weight = 0
-            self.weight += w
+            if structural:
+                if self.pinned + w > 2 * _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=True)
+                self.pinned += w
+            else:
+                if self.weight + w > _FILTER_CACHE_MAX_WEIGHT:
+                    self._drop(everything=False)
+                self.weight += w
             dict.__setitem__(self, key, value)
+
+    def _drop(self, everything: bool) -> None:
+        tables = dict.get(self, '__tables_ref__')
+        if everything:
+            dict.clear(self)
+            self.pinned = 0
+        else:
+            for k in [k for k in dict.keys(self) if _cache_kind(k) not in _STRUCTURAL_KINDS]:
+                dict.__delitem__(self, k)
+        dict.__setitem__(self, '__tables_ref__', tables)
+        self.weight = 0
+
+
 
 # Guards the insert / evict / id-assign steps of the module-level caches below,
 # which evaluations on different threads (see _PerThreadEngine) may run at
@@ -2143,6 +2164,27 @@ class _FilterIndexCache(dict):
 # it two relationship sets interned together could get the SAME id, and the
 # cross-filter memo keyed by it would serve one set's answer for the other.
 _CACHE_LOCK = threading.Lock()
+
+
+# Entries that are facts about the model, not about a filter set: kept when the
+# filter-named entries are dropped (_FilterIndexCache).
+_STRUCTURAL_KINDS = frozenset({
+    '__tables_ref__', 'blank-row-tables', 'every-cell-valued', 'vmap', 'tmap', 'dpmap',
+    'non-owners', 'key-aliases', 'dp-keys', 'unmatched',
+})
+
+
+def _cache_kind(key) -> str | None:
+    """An entry's kind: a key's leading string, or the string after a table's
+    id ((id(tbl), 'vmap', ...))."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, tuple) and key:
+        if isinstance(key[0], str):
+            return key[0]
+        if len(key) > 1 and isinstance(key[1], str):
+            return key[1]
+    return None
 
 
 # ---------------------------------------------------------------------------
