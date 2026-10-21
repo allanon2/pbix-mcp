@@ -3700,6 +3700,19 @@ class DAXContext:
             if hit is not None:
                 return hit
         out = self._cross_filters_from_uncached(table_name, tbl, src_table, src_tbl, col_filters, rows)
+        if rows:
+            # Resolved to the target's rows here, once per source filter, with the
+            # same _indices_for_values the caller would apply on every call: a
+            # multi-hop year filter's ~2,000 date keys were spelled again for each
+            # of a running total's dates (pivot-studio #150).
+            resolved = []
+            for allowed, idx in out:
+                if type(allowed) is not _HopRows:
+                    hit = self._indices_for_values(tbl, idx, allowed)
+                    if hit is not None:
+                        allowed = _HopRows(hit)
+                resolved.append((allowed, idx))
+            out = resolved
         if sk is not None and self._rels_sig is not None:
             self._filter_idx_cache[sk] = out
         return out
@@ -7458,6 +7471,33 @@ class DAXEngine:
         outer = getattr(ctx, '_outer_ctx', None)
         return outer if outer is not None else ctx
 
+    _NO_MEMO = object()
+
+    def _agg_memo(self, ctx: DAXContext, kind: str, col: tuple, compute) -> Any:
+        """``compute`` over the column's visible values, memoized on the
+        model-wide cache by what decides those values -- the whole filter set,
+        the table's ALL() snapshot, the relationships and the date table, as
+        the cross-table filter memo is keyed -- outside a row context. A
+        CALCULATE(MAX(T[d]), REMOVEFILTERS()) inside a measure asked once per
+        group read every row each time (pivot-studio #150, #153); the answer
+        is a pure function of that key."""
+        actx = self._agg_ctx(ctx)
+        if not _FAST_FILTERS or actx._outer_ctx is not None or actx._rels_sig is None:
+            return compute(actx.get_column_data(*col))
+        tbl = actx.tables.get(col[0])
+        try:
+            key = (id(tbl), 'agg', kind, col[1], actx._filters_sig(),
+                   tuple(sorted((actx._no_prop_keys.get(col[0]) or {}).items())),
+                   actx._rels_sig, actx.date_table, actx.date_column)
+            hit = actx._filter_idx_cache.get(key, self._NO_MEMO)
+        except TypeError:
+            return compute(actx.get_column_data(*col))
+        if hit is not self._NO_MEMO:
+            return hit
+        out = compute(actx.get_column_data(*col))
+        actx._filter_idx_cache[key] = out
+        return out
+
     def _fn_sum(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
         if col is not None:
@@ -7468,10 +7508,11 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = self._agg_ctx(ctx).get_column_data(*col)
-        nums = [v for v in values if isinstance(v, (int, float))]
-        # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0.
-        return sum(nums) if nums else None
+        def total(values):
+            nums = [v for v in values if isinstance(v, (int, float))]
+            # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0.
+            return sum(nums) if nums else None
+        return self._agg_memo(ctx, 'sum', col, total)
 
     def _fn_average(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -7483,15 +7524,16 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = [v for v in self._agg_ctx(ctx).get_column_data(*col)
-                  if isinstance(v, (int, float))]
+        def mean(data):
+            values = [v for v in data if isinstance(v, (int, float))]
+            return sum(values) / len(values) if values else None
+        return self._agg_memo(ctx, 'average', col, mean)
         # Every aggregate is BLANK over an empty set, never 0. Verified on
         # Desktop with CALCULATE(<agg>, FILTER(ALL(T), FALSE())): COUNT,
         # COUNTA, COUNTROWS, COUNTBLANK, DISTINCTCOUNT, MIN, COUNTX,
         # AVERAGEX, SUMX, MINX and MEDIANX all came back BLANK. A 0 is the
         # worst kind of wrong here: it reads as a measured zero, and it is
         # what ISBLANK() is testing for.
-        return sum(values) / len(values) if values else None
 
     def _fn_count(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
@@ -7503,9 +7545,7 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        n = len([v for v in self._agg_ctx(ctx).get_column_data(*col)
-                 if v is not None])
-        return n or None
+        return self._agg_memo(ctx, 'count', col, lambda data: len([v for v in data if v is not None]) or None)
 
     def _fn_countrows(self, args_str: str, ctx: DAXContext) -> Any:
         # Try evaluating as an expression first (handles TOPN, FILTER, etc.)
@@ -7549,14 +7589,15 @@ class DAXEngine:
             col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
         if not col:
             return None
-        values = self._comparable_values(
-            self._agg_ctx(ctx).get_column_data(*col))
-        # MIN/MAX over no rows is BLANK, like every other aggregate
-        # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
-        if not values:
-            return None
-        # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
-        return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
+        def extreme(data):
+            values = self._comparable_values(data)
+            # MIN/MAX over no rows is BLANK, like every other aggregate
+            # (Desktop: CALCULATE(MIN(T[c]), FILTER(ALL(T), FALSE())) is BLANK).
+            if not values:
+                return None
+            # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
+            return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
+        return self._agg_memo(ctx, pick.__name__, col, extreme)
 
     @staticmethod
     def _minmax_pair(a, b, pick):
@@ -7602,15 +7643,15 @@ class DAXEngine:
             if not (isinstance(ref, tuple) and len(ref) == 2):
                 return None
             col = ref
-        values = self._agg_ctx(ctx).get_column_data(*col)
         # DAX COUNTS THE BLANK as one distinct value -- that is exactly what
         # DISTINCTCOUNTNOBLANK exists to avoid. MS_Blog_2020_Sep's
         # DISTINCTCOUNT('Online Sales'[Customer]) is 119387 in Desktop over a
         # column with 119386 distinct customers and 8 blank rows; we reported
         # 119386 by dropping the blank.
-        distinct = {str(v) for v in values if v is not None}
-        n = len(distinct) + (1 if any(v is None for v in values) else 0)
-        return n or None
+        def distinct(values):
+            n = len({str(v) for v in values if v is not None}) + (1 if any(v is None for v in values) else 0)
+            return n or None
+        return self._agg_memo(ctx, 'distinctcount', col, distinct)
 
     def _fn_distinctcountnoblank(self, args_str: str, ctx: DAXContext) -> Any:
         """DISTINCTCOUNTNOBLANK(column) — distinct values, blank NOT counted."""
@@ -16303,6 +16344,32 @@ def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, default=_default)
 
 
+def _memo_name(ctx: 'DAXContext') -> tuple:
+    """What a memo of measure analysis or values is valid for, besides the
+    model's data: the measures, calculation groups and formats, relationships,
+    marked date tables, culture, measure home tables and model columns."""
+    groups, formats = _calc_registry(ctx.measures)
+    return (_canonical(ctx.measures),
+            _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
+            _canonical(formats), _canonical(ctx.relationships),
+            ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
+            ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+
+
+def _model_shield_cache(ctx: 'DAXContext') -> dict:
+    """The shield analysis's memo (_shielded_tables, _reads_shadow) kept on
+    the model-wide cache, so a caller asking one filter context per call
+    doesn't read every measure's text again each time: the per-filter route
+    gave each call an empty one, three milliseconds a call (pivot-studio
+    #150). Named as _attach_query_memo names a query's memo; the model's data
+    is the model-wide cache's own."""
+    key = ('__shield__',) + _memo_name(ctx)
+    hit = ctx._filter_idx_cache.get(key)
+    if hit is None:
+        hit = ctx._filter_idx_cache[key] = {}
+    return hit
+
+
 def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     """Give ``ctx`` the measure memo kept in a caller's ``cache`` (issue #186).
 
@@ -16312,12 +16379,7 @@ def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     name the memo inside ``cache``, so one dict can serve several queries
     and never hands a value across models. The query's ALLSELECTED state is
     keyed per measure (DAXEngine._selection_token)."""
-    groups, formats = _calc_registry(ctx.measures)
-    name = (id(ctx.tables), _canonical(ctx.measures),
-            _canonical([(g.table, g.column, g.precedence, g.items) for g in groups]),
-            _canonical(formats), _canonical(ctx.relationships),
-            ctx.date_table, ctx.date_column, _canonical(ctx.date_tables),
-            ctx.culture, _canonical(ctx.measure_tables), _canonical(ctx.model_columns))
+    name = (id(ctx.tables),) + _memo_name(ctx)
     entry = cache.get(name)
     if entry is None or entry[0] is not ctx.tables:
         # the tables are held, so their id cannot name another model
@@ -16717,6 +16779,8 @@ def evaluate_measures_smart(measure_names: list, tables: dict, measures: dict,
     ctx.culture = culture
     if cache is not None:
         _attach_query_memo(ctx, cache)
+    elif _FAST_FILTERS:
+        ctx._shield_cache = _model_shield_cache(ctx)
     results = {}
 
     for name in measure_names:
