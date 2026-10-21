@@ -1538,9 +1538,8 @@ def _as_date_str_strict(s: str):
     table came back UNFILTERED (issue #42)."""
     if _ISO_STRICT.fullmatch(s):
         # what the first five formats accept, without trying each with
-        # strptime: a running total parsed every date that way (pivot-studio
-        # #156). An impossible date (2025-02-30) goes on to the formats below,
-        # which give it None.
+        # strptime: a running total parsed every date that way. An impossible
+        # date (2025-02-30) goes on to the formats below, which give it None.
         try:
             return datetime.fromisoformat(s).date()
         except ValueError:
@@ -2140,7 +2139,7 @@ class _HopRows(frozenset):
     indices (_hop_row_set), not join keys."""
 
 
-# Faster, same-answer filtering (pivot-studio #150): a direct one -> many hop
+# Faster, same-answer filtering: a direct one -> many hop
 # resolved to row indices through per-row buckets (_hop_row_set) rather than
 # join keys, and an inequality on a number or date column answered from a
 # sorted index (_indices_for_column_predicate) rather than a scan. Off, every
@@ -3082,8 +3081,8 @@ class DAXContext:
         then _indices_for_values give, as the union of one bucket per selected
         row of src_table (_hop_buckets), built once per relationship. A union
         of key sets is the union of their rows, so the answer is the same; a
-        running total by date spelled ~2,000 join keys per date to find them
-        (pivot-studio #150). None where it doesn't apply (a DatePartOnly join,
+        running total by date spelled ~2,000 join keys per date to find them.
+        None where it doesn't apply (a DatePartOnly join,
         a hop that isn't one -> many): the caller then hops by keys."""
         cur_col = src_tbl['columns'][dim_idx]
         nxt_col = tbl['columns'][fact_idx]
@@ -3722,8 +3721,7 @@ class DAXContext:
         pairs, as _get_cross_table_filters lists them. They depend only on
         src_table's own filters and the model, so they are memoized by those:
         a query asks for the same source filters under every group (a running
-        total's date filter changes per date, its year filter never does;
-        pivot-studio #150)."""
+        total's date filter changes per date, its year filter never does)."""
         try:
             sk = (id(tbl), 'xtf-src', src_table, rows,
                   frozenset((c, self._filter_sig_exact(v)) for c, v in col_filters),
@@ -3740,7 +3738,7 @@ class DAXContext:
             # Resolved to the target's rows here, once per source filter, with the
             # same _indices_for_values the caller would apply on every call: a
             # multi-hop year filter's ~2,000 date keys were spelled again for each
-            # of a running total's dates (pivot-studio #150).
+            # of a running total's dates.
             resolved = []
             for allowed, idx in out:
                 if type(allowed) is not _HopRows:
@@ -4287,7 +4285,7 @@ class DAXContext:
         make_value_matcher would make (a BLANK, text or a NaN in the column, a
         BLANK or non-numeric target, any other kind of predicate): the caller
         then scans with the matcher. A running total's 'Calendar'[Date] <= v
-        scanned the calendar once per date (pivot-studio #150)."""
+        scanned the calendar once per date."""
         if not isinstance(spec, dict):
             return None
         if set(spec) == {"all"} and isinstance(spec["all"], list) and spec["all"]:
@@ -7515,7 +7513,7 @@ class DAXEngine:
         the table's ALL() snapshot, the relationships and the date table, as
         the cross-table filter memo is keyed -- outside a row context. A
         CALCULATE(MAX(T[d]), REMOVEFILTERS()) inside a measure asked once per
-        group read every row each time (pivot-studio #150, #153); the answer
+        group read every row each time; the answer
         is a pure function of that key."""
         actx = self._agg_ctx(ctx)
         if not _FAST_FILTERS or actx._outer_ctx is not None or actx._rels_sig is None:
@@ -7543,7 +7541,7 @@ class DAXEngine:
         OTHER filters keep, ordered by D's column, with running totals: a
         binary search and a lookup per evaluation, not a sum over the rows.
         Desktop answers a running total so: one scan of SUM by date, then the
-        cached sums at or before each date (pivot-studio #155). For a
+        cached sums at or before each date. For a
         many-to-one join, the rows a D filter set keeps are the rows each of
         its filters keeps, so the inequality's rows can be taken apart from
         the others; non-owner rows and the blank row as the hop treats them.
@@ -16539,9 +16537,9 @@ def _model_shield_cache(ctx: 'DAXContext') -> dict:
     """The shield analysis's memo (_shielded_tables, _reads_shadow) kept on
     the model-wide cache, so a caller asking one filter context per call
     doesn't read every measure's text again each time: the per-filter route
-    gave each call an empty one, three milliseconds a call (pivot-studio
-    #150). Named as _attach_query_memo names a query's memo; the model's data
-    is the model-wide cache's own."""
+    gave each call an empty one, three milliseconds a call. Named as
+    _attach_query_memo names a query's memo; the model's data is the
+    model-wide cache's own."""
     key = ('__shield__',) + _memo_name(ctx)
     hit = ctx._filter_idx_cache.get(key)
     if hit is None:
@@ -16560,7 +16558,7 @@ def _attach_query_memo(ctx: 'DAXContext', cache: dict) -> None:
     keyed per measure (DAXEngine._selection_token)."""
     # A query's contexts come from one model: the same objects every time, so
     # the name, which serialises every measure, is worked out once per cache
-    # (a batch of thousands named it per context, pivot-studio #156).
+    # (a batch of thousands named it per context).
     ident = getattr(ctx, '_memo_ident', None)
     named = cache.get('__named__') if ident is not None else None
     if named is not None and named[0] == ident:

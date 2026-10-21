@@ -6,7 +6,7 @@ exactly what the plain route gives, over random models built to hit the edges
 cells, text and NaN among numbers, dates with times, a two-hop date table.
 
 A semantic rewrite is proven by a differential run, not by hand cases alone
-(pivot-studio's lesson from #200, whose fuzz found three wrong answers).
+(a downstream fuzz of #200's pushdown found three wrong answers its hand cases missed).
 """
 from __future__ import annotations
 

@@ -2,7 +2,7 @@
 does -- values, statuses, error messages and warnings -- though its contexts share
 one measure memo. A caller asking one context per row of a visual (thousands for
 a running total by date) paid the per-call lookups, parsing and an empty memo for
-each (pivot-studio #156)."""
+each."""
 from __future__ import annotations
 
 import json
