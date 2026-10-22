@@ -13531,7 +13531,22 @@ class DAXEngine:
     def _fn_customdata(self, args_str: str, ctx: DAXContext):
         return None
 
+    # SAMPLE's order direction tokens: ASC and 1 ascend, DESC and 0 descend, and
+    # with none given the order descends (as Desktop answers). TRUE and FALSE
+    # are read as 1 and 0, as TOPN reads them (not measured for SAMPLE).
+    _SAMPLE_DIRECTIONS = {"ASC": False, "1": False, "TRUE": False, "TRUE()": False,
+                          "DESC": True, "0": True, "FALSE": True, "FALSE()": True}
+
     def _fn_sample(self, args_str: str, ctx: DAXContext):
+        """SAMPLE(n, table, order [, direction] [, order [, direction]]...).
+
+        Rows are ordered by every order expression in turn, then n of them are
+        taken by position, evenly spaced with both ends included: index
+        floor(i * (N - 1) / (n - 1) + 1/2) for i = 0 .. n - 1 (halves round up).
+        n = 0 takes none (negative n likewise, unmeasured), n = 1 the first,
+        n >= N all of them. Rows tied under every order expression keep the
+        table's order; Desktop's order among them is unspecified.
+        """
         parts = self._split_args(args_str)
         if len(parts) < 3:
             return None
@@ -13539,26 +13554,35 @@ class DAXEngine:
         rows = self._table_rows(parts[1], ctx)
         if n is None or rows is None:
             return None
-        order_expr = parts[2].strip()
-        desc = True
-        if len(parts) >= 4 and parts[3].strip().upper() in ("ASC", "DESC"):
-            desc = parts[3].strip().upper() == "DESC"
+        orders: list = []          # [(expression, descending)]
+        for p in parts[2:]:
+            token = re.sub(r"\s+", "", p).upper()
+            if orders and token in self._SAMPLE_DIRECTIONS and orders[-1][1] is None:
+                orders[-1] = (orders[-1][0], self._SAMPLE_DIRECTIONS[token])
+            else:
+                orders.append((p.strip(), None))
+        orders = [(e, True if d is None else d) for e, d in orders]
         keyed = []
         for r in rows:
             row_ctx = self._make_row_context(r, ctx, shadow=rows)
-            k = self._eval_expr(order_expr, row_ctx)
-            k = self._resolve_row_result(k, r, row_ctx)
-            keyed.append((_order_key(_scalarize(k)), r))     # any value, as TOPN (#158)
-        keyed.sort(key=lambda t2: t2[0], reverse=desc)
+            keys = []
+            for e, _ in orders:
+                k = self._eval_expr(e, row_ctx)
+                k = self._resolve_row_result(k, r, row_ctx)
+                keys.append(_order_key(_scalarize(k)))     # any value, as TOPN (#158)
+            keyed.append((keys, r))
+        for j in range(len(orders) - 1, -1, -1):           # stable: last key first
+            keyed.sort(key=lambda t2: t2[0][j], reverse=orders[j][1])
         n = int(n)
-        if n >= len(keyed):
+        total = len(keyed)
+        if n <= 0:
+            return []
+        if n >= total:
             return [r for _, r in keyed]
-        if n <= 1:
-            return [keyed[0][1]] if keyed else []
-        # evenly spaced across the ordered set, endpoints included
-        step = (len(keyed) - 1) / (n - 1)
-        picked = [keyed[round(i * step)][1] for i in range(n)]
-        return picked
+        if n == 1:
+            return [keyed[0][1]]
+        # floor(i * (N - 1) / (n - 1) + 1/2), in integers
+        return [keyed[(2 * i * (total - 1) + (n - 1)) // (2 * (n - 1))][1] for i in range(n)]
 
     def _fn_tocsv(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
