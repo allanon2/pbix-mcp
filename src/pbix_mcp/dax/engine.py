@@ -45,6 +45,7 @@ import struct
 import threading
 import time
 from calendar import monthrange
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from typing import AbstractSet, Any, Optional
@@ -2284,6 +2285,26 @@ def _relationship_indexes(relationships: list) -> tuple:
     return out
 
 
+# A transient tables mapping (one bucket's copy in evaluate_per_dimension) gets
+# a cache of its own for as long as it is evaluated, held here per thread,
+# never in _SHARED_FILTER_CACHES: registering each copy there evicted the
+# model's own cache once a query had more buckets than it holds.
+_PRIVATE_FILTER_CACHES = threading.local()
+
+
+@contextmanager
+def _private_filter_cache(tables):
+    """Evaluations over ``tables`` inside the block share one private cache."""
+    held = getattr(_PRIVATE_FILTER_CACHES, 'by_id', None)
+    if held is None:
+        held = _PRIVATE_FILTER_CACHES.by_id = {}
+    held[id(tables)] = {'__tables_ref__': tables}
+    try:
+        yield
+    finally:
+        held.pop(id(tables), None)
+
+
 def _shared_filter_cache(tables) -> dict:
     """One filter-index cache per model, shared by EVERY context over it.
 
@@ -2299,6 +2320,11 @@ def _shared_filter_cache(tables) -> dict:
     is edited and the DAX context is rebuilt) gets a fresh identity anyway. A
     handful of models are retained, FIFO, to bound memory.
     """
+    private = getattr(_PRIVATE_FILTER_CACHES, 'by_id', None)
+    if private:
+        hit = private.get(id(tables))
+        if hit is not None and hit['__tables_ref__'] is tables:
+            return hit
     try:
         fp = (id(tables), tuple(sorted(
             (k, len(v.get('rows') or ())) for k, v in tables.items()
@@ -16356,8 +16382,9 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
             brows = buckets.get(bkey, [])
             tables_copy = dict(tables)
             tables_copy[ftbl_name] = {**ftbl, "rows": brows}
-            res = evaluate_measures_batch(list(ms), tables_copy, measures, {},
-                                          date_table, date_column, relationships)
+            with _private_filter_cache(tables_copy):
+                res = evaluate_measures_batch(list(ms), tables_copy, measures, {},
+                                              date_table, date_column, relationships)
             for name in ms:
                 fast.setdefault(name, {})[val] = res.get(name)
 
