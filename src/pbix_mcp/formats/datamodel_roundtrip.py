@@ -16,6 +16,8 @@ import struct
 
 from xpress9 import Xpress9
 
+from pbix_mcp.errors import DataModelCompressionError
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -34,6 +36,22 @@ STREAM_STORAGE_SIGNATURE = (
 
 # Chunk size used when compressing (2 MiB, same as Power BI)
 COMPRESS_CHUNK_SIZE = 2 * 1024 * 1024
+
+# What a stream's own header may declare before anything is decoded. The
+# header's counts and sizes are the file's word: 8-byte thread counts and
+# 4-byte chunk sizes let a few bytes ask for 2^40 chunk groups or a 4 GiB
+# buffer per chunk. A chunk is at most MAX_CHUNK_UNCOMPRESSED (eight times
+# the 2 MiB chunks Power BI and this module write), the chunks together at
+# most MAX_DECOMPRESSED_BYTES and at most MAX_RATIO times the stream's own
+# length once past RATIO_FLOOR (XPress9 packs 16 MiB of zeros into about a
+# kilobyte, so declared sizes alone let a 1 MB stream decode to 16 GiB; real
+# models measured here came to 23:1 at most), and a declared chunk count must
+# fit in the bytes that follow (each chunk carries an 8-byte size header).
+MAX_CHUNK_UNCOMPRESSED = 16 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 16 * 1024 * 1024 * 1024
+MAX_RATIO = 200
+RATIO_FLOOR = 64 * 1024 * 1024
+_CHUNK_HEADER = 8
 
 
 # ---------------------------------------------------------------------------
@@ -57,10 +75,36 @@ def _detect_format(dm_bytes: bytes) -> str:
     )
 
 
+def _check_chunk(uncompressed_size: int, declared_so_far: int, stream_len: int) -> int:
+    """The running total of declared sizes, or DataModelCompressionError past
+    the bounds above."""
+    if uncompressed_size > MAX_CHUNK_UNCOMPRESSED:
+        raise DataModelCompressionError(
+            f"DataModel chunk declares {uncompressed_size:,} bytes uncompressed; "
+            f"at most {MAX_CHUNK_UNCOMPRESSED:,} are read")
+    declared_so_far += uncompressed_size
+    if declared_so_far > MAX_DECOMPRESSED_BYTES:
+        raise DataModelCompressionError(
+            f"DataModel chunks declare over {MAX_DECOMPRESSED_BYTES:,} bytes uncompressed")
+    if declared_so_far > max(RATIO_FLOOR, MAX_RATIO * stream_len):
+        raise DataModelCompressionError(
+            f"DataModel chunks declare {declared_so_far:,} bytes uncompressed from a "
+            f"{stream_len:,}-byte stream: over {MAX_RATIO}:1")
+    return declared_so_far
+
+
+def _check_chunk_count(count: int, data: bytes, off: int) -> None:
+    room = (len(data) - off) // _CHUNK_HEADER
+    if count > room:
+        raise DataModelCompressionError(
+            f"DataModel header declares {count:,} chunks; the stream has room for {room:,}")
+
+
 def _decompress_chunks_sequential(data: bytes, offset: int) -> bytearray:
     """Read (uncompressed_size, compressed_size, payload) pairs and decompress."""
     result = bytearray()
     total = len(data)
+    declared = 0
     xp = Xpress9()
     try:
         while offset < total:
@@ -71,6 +115,7 @@ def _decompress_chunks_sequential(data: bytes, offset: int) -> bytearray:
             offset += 8
             if compressed_size == 0 or offset + compressed_size > total:
                 break
+            declared = _check_chunk(uncompressed_size, declared, total)
             chunk = xp.decompress(data[offset : offset + compressed_size], uncompressed_size)
             result.extend(chunk)
             offset += compressed_size
@@ -94,6 +139,8 @@ def _decompress_chunk_group(group: list[tuple[int, bytes]]) -> bytearray:
 def _decompress_multi_threaded(data: bytes) -> bytearray:
     """Handle the multi-threaded XPress9 format."""
     off = 102
+    if len(data) < off + 40:
+        raise DataModelCompressionError("multi-threaded DataModel stream is shorter than its header")
 
     main_chunks_per_thread = struct.unpack_from("<Q", data, off)[0];   off += 8
     prefix_chunks_per_thread = struct.unpack_from("<Q", data, off)[0]; off += 8
@@ -102,13 +149,20 @@ def _decompress_multi_threaded(data: bytes) -> bytearray:
     _chunk_uncompressed_size = struct.unpack_from("<Q", data, off)[0]; off += 8
 
     result = bytearray()
+    declared = 0
 
     def _read_chunks(count):
-        nonlocal off
+        nonlocal off, declared
+        _check_chunk_count(count, data, off)
         chunks = []
         for _ in range(count):
+            if off + _CHUNK_HEADER > len(data):
+                raise DataModelCompressionError("DataModel stream ends inside its chunk table")
             us = struct.unpack_from("<I", data, off)[0]; off += 4
             cs = struct.unpack_from("<I", data, off)[0]; off += 4
+            if off + cs > len(data):
+                raise DataModelCompressionError("DataModel chunk runs past the end of the stream")
+            declared = _check_chunk(us, declared, len(data))
             cd = data[off : off + cs]; off += cs
             chunks.append((us, cd))
         return chunks
@@ -132,6 +186,9 @@ def _decompress_multi_threaded(data: bytes) -> bytearray:
             if part:
                 out.extend(part)
         return out
+
+    _check_chunk_count(prefix_thread_count * prefix_chunks_per_thread
+                       + main_thread_count * main_chunks_per_thread, data, off)
 
     # Prefix chunks
     if prefix_thread_count > 0 and prefix_chunks_per_thread > 0:
@@ -246,26 +303,38 @@ def _parse_session_groups(dm_bytes: bytes) -> list[list[tuple[int, bytes]]]:
         raise ValueError(f"no session groups in format {fmt!r}")
 
     off = 102
+    if len(dm_bytes) < off + 40:
+        raise DataModelCompressionError("multi-threaded DataModel stream is shorter than its header")
     main_cpt = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
     prefix_cpt = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
     prefix_tc = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
     main_tc = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
     off += 8  # chunk uncompressed size
+    declared = 0
 
     def _read(count):
-        nonlocal off
+        nonlocal off, declared
+        _check_chunk_count(count, dm_bytes, off)
         out = []
         for _ in range(count):
+            if off + _CHUNK_HEADER > len(dm_bytes):
+                raise DataModelCompressionError("DataModel stream ends inside its chunk table")
             us = struct.unpack_from("<I", dm_bytes, off)[0]; off += 4
             cs = struct.unpack_from("<I", dm_bytes, off)[0]; off += 4
+            if off + cs > len(dm_bytes):
+                raise DataModelCompressionError("DataModel chunk runs past the end of the stream")
+            declared = _check_chunk(us, declared, len(dm_bytes))
             out.append((us, dm_bytes[off : off + cs]))
             off += cs
         return out
 
+    _check_chunk_count(prefix_tc * prefix_cpt + main_tc * main_cpt, dm_bytes, off)
     groups: list[list[tuple[int, bytes]]] = []
-    for _ in range(prefix_tc):
+    # A thread group of no chunks holds nothing: its count isn't looped over
+    # (2^40 empty groups would loop for good).
+    for _ in range(prefix_tc if prefix_cpt else 0):
         groups.append(_read(prefix_cpt))
-    for _ in range(main_tc):
+    for _ in range(main_tc if main_cpt else 0):
         groups.append(_read(main_cpt))
     return [g for g in groups if g]
 
@@ -404,6 +473,9 @@ def compress_datamodel(abf_bytes: bytes, chunk_size: int = COMPRESS_CHUNK_SIZE,
     bytes
         DataModel bytes ready to be stored in a PBIX ZIP.
     """
+    if not 0 < chunk_size <= MAX_CHUNK_UNCOMPRESSED:
+        # a larger chunk would be refused by decompress_datamodel
+        raise ValueError(f"chunk_size must be 1 to {MAX_CHUNK_UNCOMPRESSED:,} bytes, got {chunk_size:,}")
     try:
         return _compress_single_threaded(abf_bytes, chunk_size)
     except ValueError as primary_err:
