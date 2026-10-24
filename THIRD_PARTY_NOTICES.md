@@ -52,6 +52,31 @@ in the `pbix-mcp` distribution.
   [powerbi-desktop-samples](https://github.com/microsoft/powerbi-desktop-samples)
   (MIT). Neither source is redistributed in this package.
 
+## Ported source
+
+### dotnet/runtime `DateTimeParse` — MIT License
+- Project: <https://github.com/dotnet/runtime> (tag `v8.0.0`,
+  `src/libraries/System.Private.CoreLib/src/System/Globalization/DateTimeParse.cs`
+  and `DateTimeFormatInfo.cs`).
+- Used for: `src/pbix_mcp/m/dtparse.py` is a Python translation of the lenient
+  `DateTime.TryParse` (token table, lexer, state table, terminal states), the
+  parse M's text-to-date conversions fall back to.
+- Notice: Copyright (c) .NET Foundation and Contributors. Permission is hereby
+  granted, free of charge, to any person obtaining a copy of this software and
+  associated documentation files (the "Software"), to deal in the Software
+  without restriction, including without limitation the rights to use, copy,
+  modify, merge, publish, distribute, sublicense, and/or sell copies of the
+  Software, and to permit persons to whom the Software is furnished to do so,
+  subject to the following conditions: The above copyright notice and this
+  permission notice shall be included in all copies or substantial portions of
+  the Software. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+  EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR
+  OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+  FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+  THE SOFTWARE.
+
 ## Bundled asset provenance
 
 - `src/pbix_mcp/assets/pbix_html_visual/` — the "PBIX HTML" Power BI custom

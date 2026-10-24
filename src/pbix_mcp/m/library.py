@@ -8,8 +8,8 @@ Desktop's own saved refreshes show, and each such rule says so.
 ``LIBRARY_NAMES`` is what a caller may count on: any other library name raises
 ``Expression.Error`` when evaluated.
 
-Text to number, date and time conversions know the en-US culture (and the
-invariant ISO forms) only; another culture is an error, not a guess.
+Text to number, date and time conversions know the en-US and en-AU cultures
+(and the invariant ISO forms) only; another culture is an error, not a guess.
 """
 from __future__ import annotations
 
@@ -24,9 +24,13 @@ import zlib
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any, Callable, Optional, TypeVar
 
+from . import dtparse
 from .values import ANY, CellError, Function, MError, MType, Record, Table, force, kind_of
 
-CULTURES = frozenset({"en-US"})
+# The cultures conversions know (#104's probes for en-US; en-AU's from the same probes with an explicit "en-AU"
+# culture, #189). en-AU's numbers read as en-US's do; its dates are day first.
+CULTURES = frozenset(dtparse.CULTURE_DATA)
+_DAY_FIRST = {name: c.short_date.startswith("d") for name, c in dtparse.CULTURE_DATA.items()}
 
 INT64_TYPE = MType("number", facet="Int64.Type")
 CURRENCY_TYPE = MType("number", facet="Currency.Type")
@@ -53,7 +57,7 @@ def _culture(culture: Any, default: str) -> str:
     return name
 
 
-# --- text to number and date (en-US) ------------------------------------------
+# --- text to number and date (en-US, en-AU) ------------------------------------
 
 _NUMBER = re.compile(r"""^(?P<open>\()?
                          (?P<sign>[+-])?\$?(?P<sign2>[+-])?
@@ -66,7 +70,7 @@ _EXACT_DIGITS = 28            # a whole number up to this many digits stays exac
 
 
 def number_from_text(text: str, culture: str) -> int | float | None:
-    """en-US number text, as a Desktop refresh reads it (#104's probes): ASCII digits with "," between any of
+    """en-US (and en-AU) number text, as a Desktop refresh reads it (#104's probes): ASCII digits with "," between any of
     them ("1,23" is 123), ".", an exponent, a sign before or after a leading "$" ("-$5", "$-5"), a trailing "%"
     (a hundredth), and an accounting negative in parentheses ("(1,000)", "($5)", "(1e3)"; not "(5%)"). Empty text
     is null. A whole number keeps its digits ("9007199254740993"); a number beyond a double's range is infinite
@@ -102,43 +106,43 @@ def number_from_text(text: str, culture: str) -> int | float | None:
         return float("-inf") if negative else float("inf")
 
 
-_DATETIME_FORMATS = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S.%f",
-                     "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
-                     "%m/%d/%Y %I:%M:%S %p", "%m/%d/%Y %I:%M %p", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
-                     "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y")
-_TWO_DIGIT_YEAR = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{2})$")
+# M's own ISO forms, read before the culture's (#104's probes).
+_ISO_FORMATS = ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S.%f",
+                "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d")
 
 
-def _parse_datetime(text: str) -> tuple[dt.datetime, bool]:
-    """(the value, whether the text gave a time of day)."""
+def _parse_datetime(text: str, culture: str) -> tuple[dt.datetime, bool]:
+    """(the value, whether the text gives a time of day): an ISO form, else as .NET's DateTime.TryParse reads the
+    text in the culture (``dtparse``; #189's probes). A date with a time is one whose hour or minute isn't 0, or
+    whose text holds the culture's time separator, AM or PM, as a Desktop refresh's Date.From tells them."""
     s = " ".join(text.split())
     if len(s) > 26 and "." in s:   # Python keeps 6 fractional digits; M keeps 7
         head, _, frac = s.rpartition(".")
         s = head + "." + frac[:6]
-    for fmt in _DATETIME_FORMATS:
+    for fmt in _ISO_FORMATS:
         try:
-            return dt.datetime.strptime(s, fmt), "%H" in fmt or "%I" in fmt
+            return dt.datetime.strptime(s, fmt), "%H" in fmt
         except ValueError:
             continue
-    m = _TWO_DIGIT_YEAR.match(s)
-    if m:
-        # A two-digit year falls in 1950-2049, as a Desktop refresh reads them ("11/20/49" is 2049, "11/20/50"
-        # 1950; #104).
-        yy = int(m.group(3))
-        try:
-            return dt.datetime(2000 + yy if yy <= 49 else 1900 + yy, int(m.group(1)), int(m.group(2))), False
-        except ValueError:
-            pass
-    raise _error("We couldn't parse the input provided as a DateTime value.", "DataFormat.Error")
+    try:
+        value = dtparse.try_parse(text, culture)
+    except dtparse.Unsupported as e:
+        raise _error(str(e)) from None
+    if value is None:
+        raise _error("We couldn't parse the input provided as a DateTime value.", "DataFormat.Error")
+    c, low = dtparse.CULTURE_DATA[culture], text.lower()
+    timed = bool(value.hour or value.minute) or c.time_sep in low or c.am.lower() in low or c.pm.lower() in low
+    return value, timed
 
 
 def datetime_from_text(text: str, culture: str) -> dt.datetime | None:
-    """ISO 8601 forms, en-US month/day/year with an optional 12- or 24-hour time, a two-digit year, or
-    "Nov 20, 2015", "November 20, 2015" or "20 Nov 2015", month names in any case (#104's probes). Empty text is
+    """ISO 8601 forms, else the culture's: en-US month/day/year, en-AU day/month/year, with "/", "-" or "." between,
+    month and day names, two-digit years (1950-2049), a 12- or 24-hour time with fractional seconds; a missing day
+    is the 1st, a missing year this year and a time alone is today's (#104's and #189's probes). Empty text is
     null."""
     if text == "":
         return None
-    return _parse_datetime(text)[0]
+    return _parse_datetime(text, culture)[0]
 
 
 _OLE_EPOCH = dt.datetime(1899, 12, 30)
@@ -226,10 +230,11 @@ def to_currency(v: Any, culture: str) -> Any:
 
 
 def to_text(v: Any, culture: str) -> Any:
-    """Text.From, en-US, as a Desktop refresh writes it (#104's D1 probes): a whole number in full digits
+    """Text.From, as a Desktop refresh writes it (#104's D1 probes): a whole number in full digits
     (1e21 is "1000000000000000000000"), any other number in 15 significant digits, or 17 when 15 don't give the
     number back ("0.33333333333333331"), with an exponent below 1e-4 ("1E-05"); "true"/"false"; a date as
-    "11/20/2015" and a datetime as "11/20/2015 10:59:00 AM", the year in four digits."""
+    "11/20/2015" and a datetime as "11/20/2015 10:59:00 AM", the year in four digits. en-AU writes numbers alike
+    and dates day first with a two-digit month: "5/01/2015", "5/01/2015 1:05:09 PM" (#189)."""
     if v is None or isinstance(v, str):
         return v
     if isinstance(v, bool):
@@ -244,13 +249,23 @@ def to_text(v: Any, culture: str) -> Any:
             return str(int(v))
         text = "%.15G" % v
         return text if float(text) == v else "%.17G" % v
+    if isinstance(v, dt.datetime) and culture == "":
+        raise _error("Converting a datetime value to text in the invariant culture isn't supported yet.")
     if isinstance(v, dt.datetime) and not v.tzinfo and not v.microsecond:
         hour = v.hour % 12 or 12
-        return f"{v.month}/{v.day}/{v.year:04d} {hour}:{v.minute:02d}:{v.second:02d} {'AM' if v.hour < 12 else 'PM'}"
+        return f"{_date_text(v, culture)} {hour}:{v.minute:02d}:{v.second:02d} {'AM' if v.hour < 12 else 'PM'}"
     if isinstance(v, dt.date) and not isinstance(v, dt.datetime):
-        return f"{v.month}/{v.day}/{v.year:04d}"           # #date(5, 1, 1) is "1/1/0005"
+        return _date_text(v, culture)                       # #date(5, 1, 1) is "1/1/0005" (en-AU "1/01/0005")
     # Infinities, fractional seconds, zones, times and durations aren't settled by a Desktop refresh yet.
     raise _error(f"Converting a {kind_of(v)} value to text isn't supported yet.")
+
+
+def _date_text(v: dt.date, culture: str) -> str:
+    if culture == "":
+        return f"{v.month:02d}/{v.day:02d}/{v.year:04d}"   # the invariant culture: "01/05/2015" (#189)
+    if _DAY_FIRST[culture]:
+        return f"{v.day}/{v.month:02d}/{v.year:04d}"
+    return f"{v.month}/{v.day}/{v.year:04d}"
 
 
 def to_datetime(v: Any, culture: str) -> Any:
@@ -270,7 +285,12 @@ def to_date(v: Any, culture: str) -> Any:
     if isinstance(v, str):
         if v == "":
             return None
-        d, timed = _parse_datetime(v)
+        try:
+            d, timed = _parse_datetime(v, culture)
+        except MError as e:
+            if e.reason != "DataFormat.Error":
+                raise                     # a refusal keeps its reason
+            timed = True                  # Desktop's message names the Date type
         if timed:
             raise _error("We couldn't parse the input provided as a Date value.", "DataFormat.Error")
         return d.date()

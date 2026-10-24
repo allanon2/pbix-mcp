@@ -138,6 +138,72 @@ class TestConversions:
         with pytest.raises(MError, match="de-DE"):
             self.transform(['"1,5"'], "type number", '"de-DE"')
 
+    def test_en_au_reads_day_first(self):
+        # As a Desktop refresh reads them with an explicit "en-AU" culture.
+        assert self.transform(['"20/11/2015 10:59:30 pm"', '"5/1/2015"', '"20/11/15"', '"20-11-2015 10:59"',
+                               '"20.11.2015"', '"2015/11/20"', '"Friday, 20 November 2015 10:59:30 AM"'],
+                              "type datetime", '"en-AU"') == [
+            dt.datetime(2015, 11, 20, 22, 59, 30), dt.datetime(2015, 1, 5), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 10, 59), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 10, 59, 30)]
+        assert self.transform(['"20/11/49"', '"20/11/50"'], "type date", '[Culture="en-AU"]') == [
+            dt.date(2049, 11, 20), dt.date(1950, 11, 20)]
+
+    @pytest.mark.parametrize("text, culture", [("11/20/2015", "en-AU"), ("20/11/2015", "en-US"),
+                                               ("Saturday, 20 November 2015", "en-AU"), ("20/11/2015 24:00", "en-AU")])
+    def test_a_date_in_the_other_order_or_a_wrong_day_name_is_an_error(self, text, culture):
+        [cell] = self.transform([f'"{text}"'], "type datetime", f'"{culture}"')
+        assert isinstance(cell, CellError) and cell.error.reason == "DataFormat.Error"
+
+    def test_en_us_reads_dashes_dots_and_its_long_date(self):
+        assert self.transform(['"11-20-2015"', '"11.20.2015"', '"2015/11/20"', '"Friday, November 20, 2015"'],
+                              "type datetime") == [dt.datetime(2015, 11, 20)] * 4
+
+    def test_en_au_writes_day_first_with_a_two_digit_month(self):
+        cells = ['#datetime(2015, 1, 5, 13, 5, 9)', '#date(5, 1, 1)', '1234.5']
+        assert self.transform(cells, "type text", '"en-AU"') == ["5/01/2015 1:05:09 PM", "1/01/0005", "1234.5"]
+        assert self.transform(cells, "type text") == ["1/5/2015 1:05:09 PM", "1/1/0005", "1234.5"]
+
+    def test_en_au_reads_numbers_as_en_us(self):
+        assert self.transform(['"$1,000"', '"(1,000)"', '"12.5%"'], "type number", '"en-AU"') == [1000, -1000, 0.125]
+
+    def test_the_lenient_forms_a_refresh_reads(self, monkeypatch):
+        # Each as a Desktop refresh read it on 2026-10-24 (pivot-studio #189): a time alone is today's, a day and
+        # month this year's, a month and year the 1st.
+        from pbix_mcp.m import dtparse
+        monkeypatch.setattr(dtparse, "_now", lambda: dt.datetime(2026, 10, 24, 17, 0))
+        texts = ["20-11-15", "20.11.15", "20/11/15 10:59", "Fri, 20 Nov 2015", "Friday 20 November 2015",
+                 "2015.11.20", "2015-11-20 10:59 PM", "20/11/2015 10:59:30.5", "10:59", "Nov 2015", "20 Nov"]
+        assert self.transform([f'"{t}"' for t in texts], "type datetime", '"en-AU"') == [
+            dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20, 10, 59),
+            dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 22, 59), dt.datetime(2015, 11, 20, 10, 59, 30, 500000),
+            dt.datetime(2026, 10, 24, 10, 59), dt.datetime(2015, 11, 1), dt.datetime(2026, 11, 20)]
+        assert self.transform(['"11-20-15"', '"Fri, Nov 20, 2015"'], "type datetime") == [dt.datetime(2015, 11, 20)] * 2
+        assert self.transform(['"20 Nov"', '"20.11.15"'], "type date", '"en-AU"') == [dt.date(2026, 11, 20),
+                                                                                      dt.date(2015, 11, 20)]
+
+    def test_a_time_after_a_month_name_and_a_short_year(self):
+        # .NET's DateTime.TryParse (not a Desktop refresh): the date's numbers are spent once it is read, and a
+        # second AM/PM after a number is skipped with that number ("10 PM,5 PM" is 22:00); a second AM/PM on its
+        # own ("10:59 PM PM") fails.
+        cells = self.transform(['"20/Nov/15 5 PM"', '"20 Nov 15 10:59"', '"20/11/2015 10 PM,5 PM"',
+                                '"20/11/2015 10:59 PM PM"'], "type datetime", '"en-AU"')
+        assert cells[:3] == [dt.datetime(2015, 11, 20, 17), dt.datetime(2015, 11, 20, 10, 59),
+                             dt.datetime(2015, 11, 20, 22)]
+        assert isinstance(cells[3], CellError)
+
+    @pytest.mark.parametrize("text", ["2015-11-20 10:59 GMT", "20/11/2015 10:59 +10:00", "2015-11-20T10:59:00Z"])
+    def test_a_time_zone_is_refused(self, text):
+        [cell] = self.transform([f'"{text}"'], "type datetime", '"en-AU"')
+        assert isinstance(cell, CellError) and "time zone" in cell.error.message
+
+    def test_the_invariant_culture(self):
+        m = 'Table.PromoteHeaders(#table(2, {{2.5, #date(2015, 1, 5)}, {1, 2}}), [PromoteAllScalars=true, Culture=""])'
+        assert evaluate(m).columns == ["2.5", "01/05/2015"]           # a Desktop refresh's names (#189)
+        [cell] = self.transform(['"01/05/15"'], "type date", '""')
+        assert isinstance(cell, CellError) and "two-digit year" in cell.error.message
+
     def test_a_missing_column_is_an_error(self):
         with pytest.raises(MError, match="column 'x'"):
             evaluate('Table.TransformColumnTypes(#table({"c"}, {}), {{"x", type text}})')
@@ -148,6 +214,15 @@ class TestConversions:
 
 
 class TestTables:
+    def test_promote_all_scalars_writes_in_the_query_culture(self):
+        m = 'Table.PromoteHeaders(#table(2, {{#date(2015, 1, 5), 2.5}, {1, 2}}), [PromoteAllScalars=true])'
+        assert evaluate(m, culture="en-AU").columns == ["5/01/2015", "2.5"]
+        assert evaluate(m).columns == ["1/5/2015", "2.5"]
+        assert evaluate(m.replace("=true]", '=true, Culture="en-US"]'), culture="en-AU").columns == ["1/5/2015", "2.5"]
+        # Without PromoteAllScalars a date isn't promoted, so another default culture changes nothing.
+        assert evaluate('Table.PromoteHeaders(#table(2, {{#date(2015, 1, 5), 2.5}}))', culture="en-GB").columns == [
+            "Column1", "2.5"]
+
     def test_from_rows_columns_forms(self):
         assert evaluate('Table.FromRows({{1, 2}})').columns == ["Column1", "Column2"]
         assert evaluate('Table.FromRows({{1, 2}}, {"a", "b"})').columns == ["a", "b"]

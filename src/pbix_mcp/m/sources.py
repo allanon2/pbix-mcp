@@ -488,9 +488,8 @@ def _sheet(workbook: bytes, part: str, infer: bool, headers: bool) -> Table:
     width = len(rows[0]) if rows else 0
     table = Table([f"Column{i + 1}" for i in range(width)], rows, [ANY] * width)
     if headers:
-        from .tables import TABLES
-        promoted: Table = TABLES["Table.PromoteHeaders"].invoke([table])
-        return promoted
+        from .tables import _promote_headers
+        return _promote_headers(table)
     return table
 
 

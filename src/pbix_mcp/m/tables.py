@@ -149,24 +149,27 @@ def _add_column(table: Any, name: Any, generator: Any, column_type: Any = None) 
     return Table([*t.columns, name], rows, [*t.types, column_type or ANY])
 
 
-def _promote_headers(table: Any, options: Any = None) -> Table:
+def _promote_headers(table: Any, options: Any = None, default_culture: str = "en-US") -> Table:
     """The first row's values become the column names: text and numbers by default (Microsoft's reference), any
     scalar with PromoteAllScalars, written as Text.From writes it; a null, or a value not promoted, keeps its
     ColumnN name. As a Desktop refresh shows (#104's probes): an empty name stays empty, and a name already taken
     gets "_<n>" with one counter across the table, counting on until the name is free ("a", "a", "a_1" become
-    a, a_1, a_1_2; "a", "a_1", "a" become a, a_1, a_2; "a", "a", "b", "a" become a, a_1, b, a_2)."""
+    a, a_1, a_1_2; "a", "a_1", "a" become a, a_1, a_2; "a", "a", "b", "a" become a, a_1, b, a_2).
+
+    The culture is the Culture option's, else the query's default with PromoteAllScalars, else the invariant
+    culture, whose numbers are written as en-US's are (without PromoteAllScalars only numbers are written)."""
+    from .library import CULTURES, to_text
     t = _need_table(table, "Table.PromoteHeaders")
-    all_scalars = False
+    all_scalars, culture = False, "en-US"
     if options is not None:
         if not isinstance(options, Record) or any(k not in ("PromoteAllScalars", "Culture") for k in options.fields):
             raise _error("Table.PromoteHeaders: only the PromoteAllScalars and Culture options are known.")
         all_scalars = bool(options["PromoteAllScalars"]) if "PromoteAllScalars" in options else False
-        culture = options["Culture"] if "Culture" in options else None
-        if culture not in (None, "en-US"):
+        culture = options["Culture"] if "Culture" in options else default_culture if all_scalars else culture
+        if culture not in CULTURES:
             raise _error(f"Table.PromoteHeaders: the culture {culture!r} isn't supported yet.")
     if not t.rows:
         return Table(list(t.columns), [], list(t.types))
-    from .library import to_text
     first = []
     for i, cell in enumerate(t.rows[0]):
         v = force(cell)
@@ -174,7 +177,7 @@ def _promote_headers(table: Any, options: Any = None) -> Table:
             first.append(v)
         elif v is not None and (all_scalars and kind_of(v) in _SCALARS or
                                 isinstance(v, (int, float)) and not isinstance(v, bool)):
-            first.append(to_text(v, "en-US"))
+            first.append(to_text(v, culture))
         else:
             first.append(t.columns[i])
     names: list[str] = []
@@ -231,7 +234,8 @@ TABLES: dict[str, Any] = {
     "Table.RemoveColumns": _fn("Table.RemoveColumns", _remove_columns, 2, 3),
     "Table.SelectColumns": _fn("Table.SelectColumns", _select_columns, 2, 3),
     "Table.AddColumn": _fn("Table.AddColumn", _add_column, 3, 4),
-    "Table.PromoteHeaders": _fn("Table.PromoteHeaders", _promote_headers, 1, 2),
+    "Table.PromoteHeaders": lambda evaluator: _fn(
+        "Table.PromoteHeaders", lambda t, o=None: _promote_headers(t, o, evaluator.culture), 1, 2),
     "Text.BeforeDelimiter": _fn("Text.BeforeDelimiter", _before_delimiter, 2, 3),
     "MissingField.Error": MISSING_ERROR,
     "MissingField.Ignore": MISSING_IGNORE,
