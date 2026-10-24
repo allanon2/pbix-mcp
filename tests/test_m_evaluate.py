@@ -167,6 +167,33 @@ class TestConversions:
     def test_en_au_reads_numbers_as_en_us(self):
         assert self.transform(['"$1,000"', '"(1,000)"', '"12.5%"'], "type number", '"en-AU"') == [1000, -1000, 0.125]
 
+    def test_the_lenient_forms_a_refresh_reads(self, monkeypatch):
+        # Each as a Desktop refresh read it on 2026-10-24 (pivot-studio #189): a time alone is today's, a day and
+        # month this year's, a month and year the 1st.
+        from pbix_mcp.m import dtparse
+        monkeypatch.setattr(dtparse, "_now", lambda: dt.datetime(2026, 10, 24, 17, 0))
+        texts = ["20-11-15", "20.11.15", "20/11/15 10:59", "Fri, 20 Nov 2015", "Friday 20 November 2015",
+                 "2015.11.20", "2015-11-20 10:59 PM", "20/11/2015 10:59:30.5", "10:59", "Nov 2015", "20 Nov"]
+        assert self.transform([f'"{t}"' for t in texts], "type datetime", '"en-AU"') == [
+            dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20, 10, 59),
+            dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 22, 59), dt.datetime(2015, 11, 20, 10, 59, 30, 500000),
+            dt.datetime(2026, 10, 24, 10, 59), dt.datetime(2015, 11, 1), dt.datetime(2026, 11, 20)]
+        assert self.transform(['"11-20-15"', '"Fri, Nov 20, 2015"'], "type datetime") == [dt.datetime(2015, 11, 20)] * 2
+        assert self.transform(['"20 Nov"', '"20.11.15"'], "type date", '"en-AU"') == [dt.date(2026, 11, 20),
+                                                                                      dt.date(2015, 11, 20)]
+
+    @pytest.mark.parametrize("text", ["2015-11-20 10:59 GMT", "20/11/2015 10:59 +10:00", "2015-11-20T10:59:00Z"])
+    def test_a_time_zone_is_refused(self, text):
+        [cell] = self.transform([f'"{text}"'], "type datetime", '"en-AU"')
+        assert isinstance(cell, CellError) and "time zone" in cell.error.message
+
+    def test_the_invariant_culture(self):
+        m = 'Table.PromoteHeaders(#table(2, {{2.5, #date(2015, 1, 5)}, {1, 2}}), [PromoteAllScalars=true, Culture=""])'
+        assert evaluate(m).columns == ["2.5", "01/05/2015"]           # a Desktop refresh's names (#189)
+        [cell] = self.transform(['"01/05/15"'], "type date", '""')
+        assert isinstance(cell, CellError) and "two-digit year" in cell.error.message
+
     def test_a_missing_column_is_an_error(self):
         with pytest.raises(MError, match="column 'x'"):
             evaluate('Table.TransformColumnTypes(#table({"c"}, {}), {{"x", type text}})')
@@ -177,6 +204,15 @@ class TestConversions:
 
 
 class TestTables:
+    def test_promote_all_scalars_writes_in_the_query_culture(self):
+        m = 'Table.PromoteHeaders(#table(2, {{#date(2015, 1, 5), 2.5}, {1, 2}}), [PromoteAllScalars=true])'
+        assert evaluate(m, culture="en-AU").columns == ["5/01/2015", "2.5"]
+        assert evaluate(m).columns == ["1/5/2015", "2.5"]
+        assert evaluate(m.replace("=true]", '=true, Culture="en-US"]'), culture="en-AU").columns == ["1/5/2015", "2.5"]
+        # Without PromoteAllScalars a date isn't promoted, so another default culture changes nothing.
+        assert evaluate('Table.PromoteHeaders(#table(2, {{#date(2015, 1, 5), 2.5}}))', culture="en-GB").columns == [
+            "Column1", "2.5"]
+
     def test_from_rows_columns_forms(self):
         assert evaluate('Table.FromRows({{1, 2}})').columns == ["Column1", "Column2"]
         assert evaluate('Table.FromRows({{1, 2}}, {"a", "b"})').columns == ["a", "b"]
