@@ -37,6 +37,7 @@ import decimal
 import hashlib
 import json
 import math
+import operator
 import os
 import random
 import re
@@ -1409,8 +1410,15 @@ def _analyze_expr(raw):
     # every reference to a column like [People using ... (% of population)],
     # which then fell through to the bare-table tail and read as BLANK: a
     # silently wrong value on real Microsoft sample files.
+    # An unquoted table name may hold spaces here, so `NOT T[B]` and `NOT [B]`
+    # also have the shape of a reference to a table "NOT T" / "NOT". NOT is a
+    # keyword, never the start of an unquoted name: those go to the NOT
+    # branch below. Read as a reference, the condition was an unresolved
+    # marker, always true. Power BI Desktop 2.152 (build_b210.py, issue
+    # #224): COUNTROWS(FILTER(TBool, NOT TBool[B])) is 1, as with NOT(...).
     col_match = _TCOL_RE.match(expr)
-    if col_match and col_match.end() == len(expr):
+    if (col_match and col_match.end() == len(expr)
+            and not (col_match.group(2) and _NOT_PREFIX_RE.match(expr))):
         return ((_P_TCOL, ((col_match.group(1) or col_match.group(2)).strip(),
                            col_match.group(3).strip())),)
 
@@ -1616,9 +1624,10 @@ def _midnight_date(v):
     return None
 
 
-def _index_spellings_uncached(v) -> tuple:
+def _index_spellings_uncached(v, numeric: bool = True) -> tuple:
     """The value-index-map keys an In-set filter value can match
-    (DAXContext._indices_for_values)."""
+    (DAXContext._indices_for_values). Without ``numeric`` (a key reaching a
+    TEXT column) no numeric spellings: see below."""
     # the values are join spellings already (_jstr): 'None' is the
     # blank key's sentinel and must not fold
     keys = [str(v)]
@@ -1630,8 +1639,12 @@ def _index_spellings_uncached(v) -> tuple:
     # str(2024) != str(2024.0), so an int literal missed every Double
     # cell (and vice versa) -- CALCULATE(expr, T[Year]=2024) selected
     # zero rows and went BLANK. Add both spellings; bools excluded so
-    # True never aliases 1.
-    if not isinstance(v, bool):
+    # True never aliases 1. Never into a text column: there the float()
+    # of the text key '01' is spelled '1' and took the fact rows of the
+    # other key '1' (Power BI Desktop 2.152: CALCULATE(SUM(TK[v]),
+    # DK[code] = "01") is 10, not 15; build_b210.py, issue #222). A number
+    # key brings its int and float spellings itself (_join_key_aliases).
+    if numeric and not isinstance(v, bool):
         fv = None
         if isinstance(v, (int, float)):
             fv = float(v)
@@ -1657,16 +1670,19 @@ _INDEX_SPELLINGS: dict = {}
 _INDEX_SPELLINGS_MAX = 200_000
 
 
-def _index_spellings(v) -> tuple:
-    key = (float, repr(v)) if type(v) is float else (type(v), v)
+def _index_spellings(v, numeric: bool = True) -> tuple:
+    key: tuple = (float, repr(v)) if type(v) is float else (type(v), v)
+    if not numeric:
+        key = ('text-column',) + key
     try:
         hit = _INDEX_SPELLINGS.get(key)
     except TypeError:            # an unhashable value
-        return _index_spellings_uncached(v)
+        return _index_spellings_uncached(v) if numeric else _index_spellings_uncached(v, False)
     if hit is None:
         if len(_INDEX_SPELLINGS) >= _INDEX_SPELLINGS_MAX:
             _INDEX_SPELLINGS.clear()
-        hit = _INDEX_SPELLINGS[key] = _index_spellings_uncached(v)
+        hit = _INDEX_SPELLINGS[key] = (_index_spellings_uncached(v) if numeric
+                                       else _index_spellings_uncached(v, False))
     return hit
 
 
@@ -1743,8 +1759,18 @@ def _join_key_aliases(v) -> set:
             out.add(dt.isoformat())
             if _midnight_date(dt) is not None:
                 out.add(dt.date().isoformat())
-        if isinstance(v, float) and v == int(v):
-            out.add(str(int(v)))
+        if isinstance(v, float):
+            # A NaN or infinite key is spelled as itself ('nan', 'inf'): int()
+            # raised on it, from blank_row_tables, which walks every
+            # relationship of the model and caches nothing it failed on, so
+            # ONE such key on the one side of any relationship made every
+            # cross-filtered measure of the model BLANK (issue #219). So
+            # spelled, a fact row's NaN (_jstr) joins this row, as inf joins
+            # inf. RELATED looks the key up by value (_rel_key) and finds a
+            # NaN only when both sides hold the same NaN object; where
+            # Desktop lands a NaN key is unprobed.
+            if math.isfinite(v) and v == int(v):
+                out.add(str(int(v)))
         elif isinstance(v, int):
             out.add(str(float(v)))
     return out
@@ -1846,6 +1872,11 @@ def _as_moment_str(s: str):
     try:
         return datetime.fromisoformat(s).replace(tzinfo=None)
     except ValueError:
+        # Each strict format starts with four digits and '-' (%Y-) or has a
+        # '/': a code like '100000-A' fails all seven strptime calls (about
+        # 120 us), which a scan of a column's distinct texts pays per value.
+        if s[4:5] != '-' and '/' not in s:
+            return None
         d = _as_date_str_strict(s)
         return datetime(d.year, d.month, d.day) if d is not None else None
 
@@ -1954,6 +1985,22 @@ def _filter_value_keys_uncached(v) -> frozenset:
     return frozenset(keys)
 
 
+def _text_filter_value_keys(v) -> frozenset:
+    """The cell keys one filter value selects in a TEXT column (every cell
+    text or BLANK, DAXContext._text_column): a text value is that text and
+    nothing else. Its other readings (_filter_value_keys) are for a column of
+    another type: 'None' for BLANK, an ISO or d/m/Y spelling for a moment, a
+    numeric string for its number. In a text column they matched other
+    cells -- TA[S] = "None" took the BLANK row too, TB[S] = "2020-01-01" the
+    cell "2020-01-01T00:00:00", TB[S] = "1/2/2020" "01/02/2020" and
+    "2020-02-01" -- where Power BI Desktop 2.152 compares the text alone
+    (build_b210.py, issue #221). A value of another type is read as before:
+    BLANK is BLANK, a number also its text spelling."""
+    if isinstance(v, str):
+        return frozenset({('text', _column_text_key(v))})
+    return _filter_value_keys(v)
+
+
 # ---- Filters on column COMBINATIONS (TREATAS onto several columns) ----------
 _TUPLE_FILTER_PREFIX = '__tuples__#'
 
@@ -1968,6 +2015,66 @@ def _tuple_filter_key(cols) -> str:
 def _tuple_key(row) -> tuple:
     """One combination as DAX compares it (see _value_keys)."""
     return tuple(_value_keys(v, dateish=False)[0] for v in row)
+
+
+def _inset_aliasing(rows, idx: int) -> tuple:
+    """``(in_set, in_tuples)`` for column ``idx`` of ``rows``: would a filter
+    listing some of the column's own values select a cell whose value is
+    another -- one DAX tells apart -- as an In-set (_filter_value_keys
+    against _value_keys), and as one column of a combination (_tuple_key)?
+
+    An In-set reads the text "None" as BLANK too, a text that is wholly a
+    date or date-time as its moment, and a number as its float and its text
+    spelling. Each reading matters only where it meets another cell: "None"
+    a BLANK cell; a moment another text with that moment ("2020-01-01" and
+    "2020-01-01T00:00:00", " 2020-01-01" or "20200101", two offsets of one
+    time); a float another number with that float (integers past 2**53); a
+    text spelling, or a moment, a cell that is no text. A combination keys a
+    number by its float and a date by its moment, text as text. Text that
+    differs in ASCII case only is one value to both (_column_text_key), and
+    to a condition the pushdown accepts. NaN matches no other value."""
+    kinds: set = set()
+    seen: set = set()
+    texts: dict = {}           # moment -> the one text spelling it
+    moments: dict = {}         # moment -> the one date / date-time value
+    floats: dict = {}          # float -> the one number
+    blank = none_text = moment_text = in_tuples = False
+    for r in rows:
+        v = r[idx] if idx < len(r) else None
+        if v is None:
+            blank = True
+            continue
+        try:
+            if v in seen:
+                continue
+            seen.add(v)
+        except TypeError:       # an unhashable cell: no promise
+            return True, True
+        if isinstance(v, str):
+            kinds.add(str)
+            none_text = none_text or v == 'None'
+            s = v.strip()
+            m = _as_moment_str(s) if s[:1].isdigit() else None
+            if m is not None and texts.setdefault(m, _column_text_key(v)) != _column_text_key(v):
+                moment_text = True
+        elif isinstance(v, bool):
+            kinds.add(bool)
+        elif isinstance(v, (int, float, decimal.Decimal)):
+            kinds.add(float)
+            try:
+                f = float(v)
+            except (ValueError, OverflowError):
+                return True, True
+            if f == f and floats.setdefault(f, v) != v:
+                in_tuples = True
+        elif isinstance(v, (datetime, date)):
+            kinds.add(date)
+            if moments.setdefault(_as_moment(v), v) != v:
+                in_tuples = True
+        else:
+            kinds.add(type(v))
+    in_set = in_tuples or moment_text or (none_text and blank) or (str in kinds and len(kinds) > 1)
+    return in_set, in_tuples
 
 
 def _project_tuple_filter(spec: dict, keep: list) -> dict:
@@ -2018,6 +2125,66 @@ def _order_key(v) -> tuple:
 
 
 _EMPTY_TEXT_KEY = _collation.sort_key("")
+
+_ASC_ORDER_WORDS = frozenset({'ASC', '1', 'TRUE', 'TRUE()'})
+_DESC_ORDER_WORDS = frozenset({'DESC', '0', 'FALSE', 'FALSE()'})
+
+
+def _row_count_arg(n, total: int) -> int:
+    """TOPN / SAMPLE's n as a count of rows: rounded half up, at most
+    ``total``, and 0 for what is not a positive number. Power BI Desktop 2.152
+    (issues #211, #212; docs/reverse-engineering/experiments/
+    2026-10-24-sample.md): SAMPLE(0.4, ...) has no rows, SAMPLE(0.5, ...) one,
+    SAMPLE(2.5, ...) and TOPN(2.5, ...) three, SAMPLE(3000000000, ...) the
+    whole table; int() truncated 2.5 to 2."""
+    if n >= total:
+        return total
+    return _round_half_away(n) if n > 0 else 0
+
+
+def _evenly_spaced(n: int, total: int) -> list:
+    """The positions SAMPLE picks n rows at out of ``total`` ordered rows: the
+    first and the last, and between them floor(i * step + 1/2) with step =
+    (total - 1) / (n - 1) worked out first in double precision.
+
+    Power BI Desktop 2.152 (issue #211; docs/reverse-engineering/experiments/
+    2026-10-24-sample.md): 3 of 10 are 1, 6, 10 and 5 of 10 1, 3, 6, 8, 10 --
+    a half rounds up, where round() rounded 4.5 to 4 (1, 5, 10). The step is
+    a double before it is multiplied: 29 of 35 leave out row 27 and 99 of 100
+    row 51, where exact fractions leave out rows 26 and 50; 13 of 14 and 23
+    of 24 leave out rows 7 and 12, which a running sum of the step would
+    not."""
+    if n <= 0:
+        return []
+    if n >= total:
+        return list(range(total))
+    if n == 1:
+        return [0]
+    step = (total - 1) / (n - 1)
+    return [math.floor(i * step + 0.5) for i in range(n)]
+
+
+def _distinct_cells(values) -> list:
+    """A column's cells, each value once, in the order they first appear:
+    what VALUES(T[C]) and DISTINCT(T[C]) list (issue #223). Cells are told
+    apart as the column holds them -- BLANK is not the text "None", 1 is
+    1.0 -- not by their text. NaN, which equals nothing, not even itself,
+    is one value however many NaN cells there are, as DISTINCT counted it
+    when it compared texts (not measured on Desktop). The NaN test runs in
+    C (map over operator.ne): VALUES, HASONEVALUE and SELECTEDVALUE all
+    come through here."""
+    out = list(dict.fromkeys(values))
+    if any(map(operator.ne, out, out)):
+        seen_nan = False
+        kept = []
+        for v in out:
+            if v != v:
+                if seen_nan:
+                    continue
+                seen_nan = True
+            kept.append(v)
+        out = kept
+    return out
 
 
 def _dax_equal(a, b) -> bool:
@@ -2087,6 +2254,141 @@ def _relative_date_bounds(spec: dict):
     return anchor - span, anchor
 
 
+def _floating_relative_date(spec: dict) -> bool:
+    """Does predicate ``spec`` hold a relative_date window without an anchor,
+    one that ends today (_relative_date_bounds) and so selects other rows
+    tomorrow?"""
+    rd = spec.get("relative_date")
+    if isinstance(rd, dict) and _as_date(rd.get("anchor")) is None:
+        return True
+    subs = spec.get("all")
+    return isinstance(subs, (list, tuple)) and any(
+        isinstance(s, dict) and _floating_relative_date(s) for s in subs)
+
+
+# ---- Filter signatures ------------------------------------------------------
+# A memo keyed by a filter's values (the cross-filter memo, a predicate's rows,
+# the measure memo of a query cache) must tell two values apart whenever they
+# can select different rows. str() did not: the float 1.0 and the text "1.0"
+# both print '1.0', BLANK and the text "None" both 'None', yet on a text column
+# 1.0 selects "1" (its numeric spelling, _filter_value_keys) and "None" selects
+# BLANK as well as "None". Whichever of the two filters a model met first
+# answered both: with D[Code] holding '1' and '1.0', SUM(F[Amt]) under
+# D[Code] = 1.0 is 10 and under "1.0" 100 on fresh models, but 10 for both
+# one after the other on 0.9.145 (issue #217). A value is now spelled within
+# its type, and two filters share a signature only when they hold the same
+# values of the same types.
+_SIG_TYPE_TAGS: dict = {str: 's', int: 'i', float: 'f', bool: 'b', type(None): 'n',
+                        datetime: 't', date: 'd', decimal.Decimal: 'm'}
+# type -> (tag, spelling), each type entered the first time a signature meets it
+_SIG_KINDS: dict = {t: (tag, str) for t, tag in _SIG_TYPE_TAGS.items()}
+
+
+def _serial_spelling(v) -> str:
+    """A decoded date-time (vertipaq_decoder.DAXDateTime) as the serial it
+    was decoded from. Its str() rounds the serial to the microsecond, while
+    the serial alone fixes the date-time (_oa_date_to_python builds the one
+    from the other): it tells two of them apart exactly, and a float's repr()
+    costs less than a datetime's str(). A copy that lost the serial is
+    spelled by its repr()."""
+    oa = getattr(v, 'oa_serial', None)
+    return repr(v) if oa is None else repr(oa)
+
+
+def _sig_kind(t: type) -> tuple:
+    """``(tag, spelling)`` for the values of type ``t``: a built-in type by
+    its str(), a decoded date-time by its serial, a subclass of a built-in
+    type by its str() under a tag of its own, anything else by its repr(),
+    since its str() need not tell its values apart."""
+    kind = _SIG_KINDS.get(t)
+    if kind is None:
+        tag = f"{t.__module__}.{t.__qualname__}"
+        if hasattr(t, 'oa_serial'):
+            kind = (tag, _serial_spelling)
+        elif issubclass(t, (str, int, float, date, decimal.Decimal)):
+            kind = (tag, str)
+        else:
+            kind = (tag, repr)
+        _SIG_KINDS[t] = kind
+    return kind
+
+
+def _typed_groups(values) -> list:
+    """An In-set's values as ``[(type tag, sorted spellings), ...]``, one
+    group per type, in tag order. A set of one type -- the usual case --
+    costs one spelling per value, a str() for a built-in type as the untyped
+    spelling did."""
+    t0: Optional[type] = None
+    for v in values:
+        t = type(v)
+        if t0 is None:
+            t0 = t
+        elif t is not t0:
+            break
+    else:
+        if t0 is None:
+            return []
+        tag, spell = _SIG_KINDS.get(t0) or _sig_kind(t0)
+        return [(tag, tuple(sorted(map(spell, values))))]
+    groups: dict = {}
+    for v in values:
+        groups.setdefault(type(v), []).append(v)
+    out = []
+    for t, vs in groups.items():
+        tag, spell = _sig_kind(t)
+        out.append((tag, tuple(sorted(map(spell, vs)))))
+    out.sort()
+    return out
+
+
+def _typed_spellings(values) -> tuple:
+    """An In-set's values as one hashable tuple: the same for the same values
+    in any order, a different one whenever the values differ in type or in
+    value. A single value is ``(tag, spelling)``, values of one type ``(tag,
+    sorted spellings)``, values of several types the ``(tag, spellings)``
+    groups -- told apart by what they hold, a text, a tuple of texts or a
+    tuple of groups. Kept that flat because a row transition signs one value
+    for every column of the row, and the filter-set signature (_filters_sig)
+    hashes every filter's signature again for every row: each level of
+    nesting is one more tuple hash, which Python does not cache."""
+    if len(values) == 1:
+        for v in values:
+            tag, spell = _SIG_KINDS.get(type(v)) or _sig_kind(type(v))
+            return (tag, spell(v))
+    groups = _typed_groups(values)
+    return groups[0] if len(groups) == 1 else tuple(groups)
+
+
+def _typed_digest(values) -> bytes:
+    """A digest of an In-set's typed spellings (_typed_groups), for a filter
+    too large to key by its values (issue #149). Every part goes in with its
+    length: joined by a separator, a text holding that separator could make
+    two sets one."""
+    h = hashlib.blake2b(digest_size=20)
+    for tag, spells in _typed_groups(values):
+        enc = [s.encode('utf-8', 'surrogatepass') for s in spells]
+        tb = tag.encode('utf-8', 'surrogatepass')
+        h.update(struct.pack('<QQ', len(tb), len(enc)))
+        h.update(tb)
+        h.update(struct.pack(f'<{len(enc)}Q', *map(len, enc)))
+        h.update(b''.join(enc))
+    return h.digest()
+
+
+def _sig_json_default(o):
+    """json.dumps' fallback in a predicate's signature: a value JSON has no
+    type for (a date, a Decimal, a set) as a short list of a marker, its
+    type and its spelling, never as the bare text it prints as. A filter on
+    column combinations compares a date and its ISO text as two values
+    (_tuple_key), and str() gave the two one signature. It runs once per
+    date of such a filter, hence a list: json writes one for less than a
+    dict."""
+    if isinstance(o, (set, frozenset)):
+        return ['\x00', 'set', [list(g) for g in _typed_groups(o)]]
+    tag, spell = _SIG_KINDS.get(type(o)) or _sig_kind(type(o))
+    return ['\x00', tag, spell(o)]
+
+
 _SHARED_FILTER_CACHES: dict = {}
 _SHARED_FILTER_CACHE_MAX = 4
 
@@ -2096,6 +2398,37 @@ _SHARED_FILTER_CACHE_MAX = 4
 # it two relationship sets interned together could get the SAME id, and the
 # cross-filter memo keyed by it would serve one set's answer for the other.
 _CACHE_LOCK = threading.Lock()
+
+
+class _TransientTables(dict):
+    """A tables mapping built for ONE evaluation -- a bucket of
+    evaluate_per_dimension, a calculated table regenerated from the tables
+    its expression reads -- that carries its own filter-index cache
+    (issue #214; reported in PR #207, by @allanon2).
+
+    Registered in _SHARED_FILTER_CACHES like a model, every such mapping took
+    one of its four slots: from the fourth bucket on the model's own cache was
+    evicted, so the per-value query the server runs right after the bucketed
+    one rebuilt every index (1M fact rows: 2.93 s instead of 0.026 s on
+    0.9.145), and so did the second fact table of the same call. The cache now
+    lives and dies with the mapping: it never pushes a model out, and no other
+    mapping can reach it through a reused id. It holds no reference back to the
+    mapping, so reference counting frees the two together.
+
+    Contract: fill it before its first evaluation and do not edit it after --
+    unlike the registry, nothing here notices a change of shape.
+    """
+    __slots__ = ('filter_cache',)
+
+    def __init__(self, base=()):
+        super().__init__(base)
+        self.filter_cache: dict = {}
+
+
+def transient_tables(base: dict | None = None) -> _TransientTables:
+    """A shallow copy of ``base`` (or an empty mapping) that evaluates with a
+    filter-index cache of its own; see _TransientTables."""
+    return _TransientTables(base or ())
 
 
 # ---------------------------------------------------------------------------
@@ -2298,11 +2631,29 @@ def _shared_filter_cache(tables) -> dict:
     stale indices; a fresh tables mapping (which is what happens when the model
     is edited and the DAX context is rebuilt) gets a fresh identity anyway. A
     handful of models are retained, FIFO, to bound memory.
+
+    The COLUMN counts are part of it too (issue #215). The load-time
+    calculated-column pass (calc_tables._evaluate_calculated_columns) appends
+    each column to the model's own table dicts in place, row counts unchanged,
+    so an entry made while a column did not exist yet -- a filter on it
+    ignored -- was still served after it did: SUM(A[V]) under B[Y] = 40
+    answered 36.0, every row, instead of 12.0. A new shape is a new key, and
+    the entries of the mapping's earlier shapes are dropped rather than left
+    to FIFO: nothing asks for them again, and keeping them evicted the other
+    open models' caches -- the calculated tables a load adds to one mapping
+    (each a new row-count shape) took all four slots on 0.9.145.
+
+    A transient mapping (issue #214) carries its own cache and is never
+    registered.
     """
+    if type(tables) is _TransientTables:
+        return tables.filter_cache
     try:
-        fp = (id(tables), tuple(sorted(
-            (k, len(v.get('rows') or ())) for k, v in tables.items()
-            if isinstance(v, dict))))
+        tid = id(tables)
+        # In the mapping's own order, unsorted: a reordering is only a new
+        # shape, and this runs for every context built (one per iterated row).
+        fp = (tid, tuple([(k, len(v.get('rows') or ()), len(v.get('columns') or ()))
+                          for k, v in tables.items() if isinstance(v, dict)]))
     except (AttributeError, TypeError):
         return {}
     hit = _SHARED_FILTER_CACHES.get(fp)
@@ -2310,6 +2661,10 @@ def _shared_filter_cache(tables) -> dict:
         with _CACHE_LOCK:
             hit = _SHARED_FILTER_CACHES.get(fp)
             if hit is None:
+                # Every entry holds its mapping, so an entry with this id IS
+                # this mapping, in an earlier shape.
+                for old in [k for k in _SHARED_FILTER_CACHES if k[0] == tid]:
+                    del _SHARED_FILTER_CACHES[old]
                 if len(_SHARED_FILTER_CACHES) >= _SHARED_FILTER_CACHE_MAX:
                     _SHARED_FILTER_CACHES.pop(next(iter(_SHARED_FILTER_CACHES)), None)
                 hit = _SHARED_FILTER_CACHES[fp] = {'__tables_ref__': tables}
@@ -2345,10 +2700,12 @@ def _extremum(cur, cand, want_max: bool):
         return cur
 
 
-def make_value_matcher(spec):
+def make_value_matcher(spec, text: bool = False):
     """Build a predicate ``f(cell) -> bool`` for one filter_context entry.
 
     A LIST is an In-set: membership as DAX compares values (_value_keys).
+    ``text`` says the column is a TEXT column (DAXContext._text_column): a
+    text value then matches as text alone (_text_filter_value_keys, #221).
     A DICT is a structured predicate, so a caller no longer has to enumerate a
     column's matching values before evaluating:
 
@@ -2373,6 +2730,12 @@ def make_value_matcher(spec):
         # also made '01' select '1', 09:00 select 17:00 of the same day, and
         # "north" select nothing, where Desktop 2.152 answers 1, 1 and 5.
         allowed: set = set()
+        if text:
+            # a text column's cells are text: no moment and no BLANK reading
+            # of a text value (#221)
+            for v in values:
+                allowed |= _text_filter_value_keys(v)
+            return lambda cell: any(k in allowed for k in _value_keys(cell, False))
         for v in values:
             allowed |= _filter_value_keys(v)
         dateish = any(k[0] == 'moment' for k in allowed)
@@ -2392,9 +2755,9 @@ def make_value_matcher(spec):
     if "in" in spec:
         # T[C] IN {...}: the same membership as a list filter (Desktop 2.152:
         # F2[Region] IN {"NORTH", "east"} selects North and East).
-        tests.append(make_value_matcher(list(spec["in"])))
+        tests.append(make_value_matcher(list(spec["in"]), text))
     if "not_in" in spec:
-        _denied = make_value_matcher(list(spec["not_in"]))
+        _denied = make_value_matcher(list(spec["not_in"]), text)
         tests.append(lambda c: not _denied(c))
     if "contains" in spec:
         needle = str(spec["contains"]).lower()
@@ -2423,7 +2786,7 @@ def make_value_matcher(spec):
         # comparisons on one column ({"op": ">"} AND {"op": "<"}) would collide
         # on the "op" key. CALCULATE builds this when it is given several
         # predicates for the same column, since DAX intersects them.
-        subs = [make_value_matcher(s) for s in spec["all"]]
+        subs = [make_value_matcher(s, text) for s in spec["all"]]
         tests.append(lambda c: all(m(c) for m in subs))
     if not tests:
         raise ValueError(f"filter predicate {spec!r} has no recognized keys")
@@ -2876,12 +3239,18 @@ class DAXContext:
                 {k for k in out if k not in keys} | {'None'})
         return hit
 
-    def _filters_admit_blank(self, col_filters) -> bool:
+    def _filters_admit_blank(self, col_filters, tbl: Optional[dict] = None) -> bool:
         """Do ALL these (column, values) filters keep a row whose every value
-        is BLANK? That is whether they keep the table's blank row."""
-        for _col, values in col_filters:
+        is BLANK? That is whether they keep the table's blank row. ``tbl`` is
+        the filters' table: the text "None" keeps no blank row of a text
+        column (#221)."""
+        for col, values in col_filters:
+            text = False
+            if tbl is not None:
+                idx = self._find_col_idx(tbl['columns'], col)
+                text = idx >= 0 and self._text_column(tbl, idx)
             try:
-                if not make_value_matcher(values)(None):
+                if not make_value_matcher(values, text)(None):
                     return False
             except (ValueError, TypeError):
                 return False
@@ -2907,7 +3276,7 @@ class DAXContext:
             t, _, c = fk.partition('.')
             if t == table_name and self._find_col_idx(tbl['columns'], c) >= 0:
                 direct.append((c, values))
-        if not self._filters_admit_blank(direct):
+        if not self._filters_admit_blank(direct, tbl):
             return False
         for fk, spec in self.filter_context.items():
             # A filter on column combinations keeps the blank row only through
@@ -2945,6 +3314,16 @@ class DAXContext:
         Power BI Desktop 2.152 (build_b165.py, issue #163): with D's k3 in
         rows C and D, D[name] = "C" reaches no fact row, RELATEDTABLE of C is
         empty, and FILTER(F, F[k] = "k3") keeps both C and D.
+
+        A one-to-one hop is both at once: each end is a one side of the other
+        and each has a blank row for the other's unmatched keys, so a visible
+        blank row selects the next table's unmatched rows AND a surviving row
+        whose key matches nothing selects the next table's blank row. Taking
+        it as one -> many only dropped that blank row, and the cross filter
+        back then dropped the row itself (issue #227). Power BI Desktop 2.152
+        (build_b210.py), FC(K, N, A) = (1, "xa", 10), (2, "ya", 20) one-to-one
+        EC(K, Z) = (1, "p"), (3, "q"): CALCULATE(SUM(FC[A]), FILTER(FC, 1 = 1))
+        is 30, not 10, and CALCULATE(COUNTROWS(EC), FILTER(EC, 1 = 1)) 2, not 1.
         """
         cur_tbl = self.tables.get(cur_name) or {}
         nxt_tbl = self.tables.get(nxt_name) or {}
@@ -2952,6 +3331,9 @@ class DAXContext:
         nxt_col = (nxt_tbl.get('columns') or [None])[nxt_idx] if nxt_tbl else None
         date_part = (cur_name, cur_col, nxt_name, nxt_col) in self._date_part_joins
         one_to_many = (nxt_name, cur_name) in self._one_side_of
+        # the next table is a one side of this one: every hop that is not one
+        # -> many, and both ways across a one-to-one
+        many_to_one = not one_to_many or (cur_name, nxt_name) in self._one_side_of
         if one_to_many and not date_part:
             drop = self._non_owner_rows(cur_name, cur_idx)
             if drop and self._joins_one_row(cur_name, nxt_name):
@@ -2965,10 +3347,9 @@ class DAXContext:
                 allowed.add((_date_part_key(v) or _jstr(v)) if v is not None else 'None')
             else:
                 allowed |= _join_key_aliases(r[cur_idx])
-        if one_to_many:
-            if cur_blank and cur_col is not None:
-                allowed |= self._unmatched_key_strs(nxt_name, nxt_idx, cur_name, cur_col)
-        elif nxt_col is not None and nxt_name in self.blank_row_tables():
+        if one_to_many and cur_blank and cur_col is not None:
+            allowed |= self._unmatched_key_strs(nxt_name, nxt_idx, cur_name, cur_col)
+        if many_to_one and 'None' not in allowed and nxt_col is not None and nxt_name in self.blank_row_tables():
             if date_part:
                 dp_keys = _DatePartKeys(self._date_part_key_set(nxt_name, nxt_col))
                 missing = any(not _key_in(r[cur_idx], dp_keys) for r in cur_rows)
@@ -3069,6 +3450,28 @@ class DAXContext:
             return name
         low = name.lower()
         return next((t for t in self.tables if t.lower() == low), name)
+
+    def model_column(self, table: str, column: str) -> tuple:
+        """``(table, column)`` as the model spells them, each left as written
+        when the model has no such name. A filter is keyed by this spelling:
+        keyed by f3[s] as written, CALCULATE(SUM(F3[A]), f3[s] = "a") filtered
+        nothing, and DAX names are case-insensitive -- it is F3[S]'s filter
+        (issue #226)."""
+        table = self.model_table(table)
+        tbl = self.tables.get(table)
+        if tbl is not None:
+            cols = tbl['columns']
+            if column not in cols:
+                i = self._find_col_idx(cols, column)
+                if i >= 0:
+                    column = cols[i]
+        return table, column
+
+    def model_key(self, table: str, column: str) -> str:
+        """The filter key ``Table.Column`` of ``table[column]``, as the model
+        spells them (model_column)."""
+        table, column = self.model_column(table, column)
+        return f"{table}.{column}"
 
     def expanded_tables(self, table: str) -> frozenset:
         """``table`` and the tables of its EXPANDED table.
@@ -3346,9 +3749,11 @@ class DAXContext:
         if not tbl:
             return False
         for k, v in self.filter_context.items():
-            if (k.startswith(_TUPLE_FILTER_PREFIX)
-                    and self._tuple_filter_indices(table, tbl, v) is not None):
-                return True
+            if k.startswith(_TUPLE_FILTER_PREFIX):
+                part = self._filters_sigd().get(k)
+                if self._tuple_filter_indices(table, tbl, v, part[0] if part is not None
+                                              else None) is not None:
+                    return True
         return bool(self._get_cross_table_filters(table))
 
     def without_columns(self, drop, keep_keys=()) -> 'DAXContext':
@@ -3458,9 +3863,16 @@ class DAXContext:
         try:
             if self._rels_sig is None:
                 raise TypeError
+            # The date table and its date column are part of the key: a
+            # filter on the date table reaches a table with no relationship
+            # through them (_get_date_cross_filter), and contexts over one
+            # model can name different ones -- calc_tables builds its own with
+            # an auto-detected date table. COUNTROWS(G) under Cal[Year] = 2024
+            # is 7 with date table Cal and 14 with Y; on 0.9.145 whichever
+            # ran first answered both (issue #218).
             ck = (id(tbl), 'xtf', self._filters_sig(),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
-                self._rels_sig)
+                self._rels_sig, self.date_table, self.date_column)
         except TypeError:
             ck = None
         if ck is not None:
@@ -3552,7 +3964,7 @@ class DAXContext:
             # The source's blank row survives when every filter on it keeps
             # BLANK; it then selects the target rows no source row matches.
             src_blank = (src_table in self.blank_row_tables()
-                         and self._filters_admit_blank(applied))
+                         and self._filters_admit_blank(applied, src_tbl))
 
             # Get allowed join key values. Append even an EMPTY set: an empty
             # dimension selection must filter the fact to zero rows (BLANK), not
@@ -3605,7 +4017,7 @@ class DAXContext:
         # the blank row of every table above it (issue #82).
         cur_name = path[0][0] if path else ''
         cur_blank = (cur_name in self.blank_row_tables()
-                     and self._filters_admit_blank(applied))
+                     and self._filters_admit_blank(applied, src_tbl))
         frontier_tbl = src_tbl
         for (cur_name, nxt_name, col_cur, col_nxt) in path:
             cur_idx = self._find_col_idx(frontier_tbl['columns'], col_cur)
@@ -3803,12 +4215,21 @@ class DAXContext:
     @staticmethod
     def _filter_sig(allowed):
         """A hashable signature for one filter's value set, or None when it is
-        too large to be worth hashing (the scan is then done uncached)."""
+        too large to be worth hashing (the scan is then done uncached).
+
+        Values are spelled with their types (_typed_spellings; a predicate's
+        through _sig_json_default), so two filters that select different
+        rows never share one (issue #217). A relative_date window without an
+        anchor also carries today's date: its memo entries live as long as the
+        model, and after midnight it selects other rows (issue #220)."""
         if isinstance(allowed, dict):
             try:
-                return ('d', json.dumps(allowed, sort_keys=True, default=str))
+                text = json.dumps(allowed, sort_keys=True, default=_sig_json_default)
             except (TypeError, ValueError):
                 return None
+            if _floating_relative_date(allowed):
+                return ('d', text, date.today().isoformat())
+            return ('d', text)
         if isinstance(allowed, (list, tuple, set, frozenset)):
             # A row transition's value is built once and read for every
             # memo key below it, so it keeps its signature.
@@ -3820,13 +4241,13 @@ class DAXContext:
             if len(allowed) > 4096:
                 return None
             try:
-                sig = ('l', tuple(sorted(str(v) for v in allowed)))
+                sig = ('l', _typed_spellings(allowed))
             except TypeError:
                 return None
             if tagged:
                 allowed._sig = sig  # type: ignore[attr-defined]
             return sig
-        return ('s', str(allowed))
+        return ('s', _typed_spellings((allowed,)))
 
     @classmethod
     def _filter_sig_exact(cls, allowed):
@@ -3846,15 +4267,43 @@ class DAXContext:
                 cached = allowed.__dict__.get('_xsig')
                 if cached is not None:
                     return cached
-            h = hashlib.blake2b(digest_size=20)
-            for s in sorted(str(v) for v in allowed):
-                h.update(s.encode('utf-8', 'surrogatepass'))
-                h.update(b'\x1f')
-            sig = ('L', len(allowed), h.digest())
+            # the values with their types, as _filter_sig spells them (#217)
+            sig = ('L', len(allowed), _typed_digest(allowed))
             if tagged:
                 allowed._xsig = sig  # type: ignore[attr-defined]
             return sig
+        if isinstance(allowed, dict) and _floating_relative_date(allowed):
+            return ('x', repr(allowed), date.today().isoformat())
         return ('x', repr(allowed))
+
+    def _text_column(self, tbl: dict, col_idx: int) -> bool:
+        """Is tbl's column col_idx a TEXT column -- every cell text or BLANK,
+        and one at least text that is no date? A model's Text column loads as
+        str cells, its numbers and dates as numbers and datetimes, so the
+        cells tell the column's type. A text value filtering it is then that
+        text alone (_text_filter_value_keys, #221), and a relationship key
+        reaching it has no numeric spellings (_indices_for_values, #222).
+
+        A column whose every cell is a date or date-time spelled as text (a
+        hand-built table, a calculated one) is not: it keeps its dates as
+        text, and a filter '2009-12-01' finds its '2009-12-01 00:00:00' as
+        before (#42). Memoized on the model-wide cache: one pass per column
+        and model over the cells' types, and a date parse that stops at the
+        first text that is no date."""
+        key = (id(tbl), 'text-col', col_idx)
+        hit = self._filter_idx_cache.get(key)
+        if hit is None:
+            rows = tbl['rows']
+            try:
+                types = {type(r[col_idx]) for r in rows}
+            except IndexError:          # a short row reads BLANK
+                types = {type(r[col_idx]) if col_idx < len(r) else type(None) for r in rows}
+            hit = self._filter_idx_cache[key] = (
+                str in types and types <= {str, type(None)}
+                and any(v is not None and _as_moment_str(v.strip()) is None
+                        for v in (r[col_idx] if col_idx < len(r) else None for r in rows)))
+        out: bool = hit
+        return out
 
     def _value_index_map(self, tbl: dict, col_idx: int) -> dict:
         """``{value-key: frozenset(row indices)}`` for one column, built once.
@@ -3942,9 +4391,11 @@ class DAXContext:
         values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
             else [allowed]
         vmap = self._value_index_map(tbl, col_idx)
+        # a text key compares as text: no numeric spellings into a text column (#222)
+        numeric = not self._text_column(tbl, col_idx)
         keys: set = set()
         for v in values:
-            keys.update(_index_spellings(v))
+            keys.update(_index_spellings(v, numeric))
         return self._index_union(vmap, [k for k in keys if k in vmap], (id(tbl), 'v', col_idx))
 
     # The row indices the union memo may hold per model in all; past it the
@@ -3994,16 +4445,20 @@ class DAXContext:
         tmap = self._filter_idx_cache.get(key)
         if tmap is None:
             rows = tbl['rows']
-            # A text column's cells are dates only when the column keeps dates
-            # as text; sampling saves a date parse per cell of a code column.
+            # A column that keeps dates as text (every cell one, see
+            # _text_column) or mixes text with other values may hold date
+            # spellings; sampling saves a date parse per cell of a code
+            # column. A TEXT column's cells are text alone (#221):
+            # "2020-01-01" and "2020-01-01T00:00:00" are two values.
             dateish = False
-            for row in rows[:64]:
-                v = row[col_idx]
-                if v is None:
-                    continue
-                dateish = isinstance(v, (datetime, date)) or (
-                    isinstance(v, str) and _as_moment_str(v.strip()) is not None)
-                break
+            if not self._text_column(tbl, col_idx):
+                for row in rows[:64]:
+                    v = row[col_idx]
+                    if v is None:
+                        continue
+                    dateish = isinstance(v, (datetime, date)) or (
+                        isinstance(v, str) and _as_moment_str(v.strip()) is not None)
+                    break
             acc: dict = {}
             for i, row in enumerate(rows):
                 for k in _value_keys(row[col_idx], dateish):
@@ -4011,6 +4466,17 @@ class DAXContext:
             tmap = {k: frozenset(v) for k, v in acc.items()}
             self._filter_idx_cache[key] = tmap
         return tmap
+
+    def _column_filter_keys(self, tbl: dict, col_idx: int, values) -> set:
+        """The cell keys (_value_keys) the filter values select in tbl's
+        column col_idx: a text value in a text column is that text alone
+        (_text_filter_value_keys, #221), any other as _filter_value_keys
+        reads it."""
+        keys_of = _text_filter_value_keys if self._text_column(tbl, col_idx) else _filter_value_keys
+        keys: set = set()
+        for v in values:
+            keys |= keys_of(v)
+        return keys
 
     def _indices_for_column_filter(self, tbl: dict, col_idx: int, allowed):
         """Row indices an In-SET filter on the column itself selects, as DAX
@@ -4021,9 +4487,7 @@ class DAXContext:
         values = allowed if isinstance(allowed, (list, tuple, set, frozenset)) \
             else [allowed]
         tmap = self._typed_index_map(tbl, col_idx)
-        keys: set = set()
-        for v in values:
-            keys |= _filter_value_keys(v)
+        keys = self._column_filter_keys(tbl, col_idx, values)
         found = [tmap[k] for k in keys if k in tmap]
         if not found:
             return frozenset()
@@ -4056,7 +4520,7 @@ class DAXContext:
                 ck = (id(tbl), 'd', idx, sig) if sig is not None else None
                 hit = self._filter_idx_cache.get(ck) if ck is not None else None
                 if hit is None:
-                    _m = make_value_matcher(values)
+                    _m = make_value_matcher(values, self._text_column(tbl, idx))
                     hit = frozenset(i for i, r in enumerate(rows) if _m(r[idx]))
                     if ck is not None:
                         self._filter_idx_cache[ck] = hit
@@ -4123,7 +4587,7 @@ class DAXContext:
             return row[cidx]
         return _get
 
-    def _tuple_filter_indices(self, table_name: str, tbl: dict, spec: dict):
+    def _tuple_filter_indices(self, table_name: str, tbl: dict, spec: dict, sig=None):
         """Rows of ``tbl`` a filter on column combinations keeps, or None when
         it does not reach this table.
 
@@ -4131,9 +4595,18 @@ class DAXContext:
         and keeps a row when those values match some combination's values for
         the same columns -- the projection. Desktop 2.152, TREATAS({("N", "A"),
         ("W", "B")}, Region[Region], Prod[Cat]): Sales keeps the N-A and W-B
-        rows (9), COUNTROWS(Region) is 2 and COUNTROWS(Prod) is 2."""
+        rows (9), COUNTROWS(Region) is 2 and COUNTROWS(Prod) is 2.
+
+        ``sig`` is the filter's signature as the context holds it
+        (_filters_sigd, signed once per filter set and handed down to derived
+        contexts). Signing the spec here, on every read of every table, was
+        most of the time of an iteration under a filter of many combinations:
+        SUMX over 1,000 decoded dates under 2,000 (date, category)
+        combinations of a 20,000-row fact took 3.9 s on 0.9.145, 8 s once a
+        date was spelled with its type (#217), and 0.5 s signed once."""
         cols = [tuple(c) for c in spec.get('tuple_columns') or []]
-        sig = self._filter_sig(spec)
+        if sig is None:
+            sig = self._filter_sig(spec)
         ck = ((id(tbl), 'tuple', table_name, self._rels_sig, sig)
               if sig is not None and self._rels_sig is not None else None)
         if ck is not None:
@@ -4172,9 +4645,14 @@ class DAXContext:
         rows = tbl['rows']
         cache = self._filter_idx_cache
         sets = []
+        sigd = None
         for fk, allowed in self.filter_context.items():
             if fk.startswith(_TUPLE_FILTER_PREFIX):
-                hit = self._tuple_filter_indices(table_name, tbl, allowed)
+                if sigd is None:
+                    sigd = self._filters_sigd()
+                part = sigd.get(fk)
+                hit = self._tuple_filter_indices(table_name, tbl, allowed,
+                                                 part[0] if part is not None else None)
                 if hit is not None:
                     sets.append(hit)
                 continue
@@ -4190,7 +4668,7 @@ class DAXContext:
                 key = (id(tbl), 'd', filt_idx, sig) if sig is not None else None
                 hit = cache.get(key) if key is not None else None
                 if hit is None:
-                    _m = make_value_matcher(allowed)
+                    _m = make_value_matcher(allowed, self._text_column(tbl, filt_idx))
                     hit = frozenset(i for i, row in enumerate(rows)
                                     if _m(row[filt_idx]))
                     if key is not None:
@@ -4220,6 +4698,11 @@ class DAXContext:
 
     def _get_column_data_uncached(self, table_name: str, column_name: str) -> list:
         tbl = self.tables.get(table_name)
+        if tbl is None:
+            # A table name in another case (issue #226): read on a miss only,
+            # so the model's own spelling pays nothing for it.
+            table_name = self.model_table(table_name)
+            tbl = self.tables.get(table_name)
         if not tbl:
             return []
         cols = tbl['columns']
@@ -4240,6 +4723,9 @@ class DAXContext:
         if self._outer_ctx is not None:
             return self._row_root().get_filtered_rows(table_name)
         tbl = self.tables.get(table_name)
+        if tbl is None:
+            table_name = self.model_table(table_name)    # another case (#226)
+            tbl = self.tables.get(table_name)
         if not tbl:
             return []
         rows = tbl['rows']
@@ -4380,10 +4866,6 @@ class DAXEngine:
         self._shadow_cache: dict = {}
         self._shadow_tokens: dict = {}       # shadow fingerprint -> number
         self._shadow_next = 0
-        # Bare `[Column]` -> owning table, memoized per model (see
-        # _resolve_bare_column): the lookup scans every table's column list and
-        # runs inside per-row iteration.
-        self._bare_col_cache: dict = {}
         # `T[C].[Part]` -> `'LocalDateTable_x'[Part]`, memoized per expression.
         self._variation_cache: dict = {}
         # Filter context of the OUTERMOST measure -- the query/slicer selection
@@ -4890,23 +5372,20 @@ class DAXEngine:
             _sel_on = self._reads_shadow(measure_name, ctx)
             _shadow_on = bool(ctx.filter_context) and _sel_on
 
-            def _fc_part(k, v):
-                tag = type(v).__name__ if type(v) not in (list, dict) else ''
-                if isinstance(v, list):
-                    if tag:
-                        # A row transition's value is signed once (_filter_sig):
-                        # a fact-row iteration keys every row's measure on its
-                        # dimension filters too (issue #150).
-                        vals = (DAXContext._sig_of(v)[0] if isinstance(v, RowContextValues)
-                                else tuple(v))
-                        shadow = self._shadow_token(k, v, ctx) if _shadow_on else None
-                        return (tag, vals) if shadow is None else (tag, vals, shadow)
-                    return tuple(v)
-                if isinstance(v, dict):
-                    return ("__pred__" + tag, json.dumps(v, sort_keys=True,
-                                                         default=str),
-                            self._shadow_token(k, v, ctx) if _shadow_on else None)
-                return v
+            def _fc_part(k, v, sigd):
+                # The filter as the context's own signature spells it
+                # (_sig_of): its values with their types and its tag. The
+                # values themselves compared True == 1 == 1.0, and a
+                # predicate's dates as their text (issue #217). A row
+                # transition's value is signed once (_filter_sig): a fact-row
+                # iteration keys every row's measure on its dimension filters
+                # too (issue #150).
+                part = sigd.get(k)
+                if part is None:
+                    part = DAXContext._sig_of(v)
+                shadow = (self._shadow_token(k, v, ctx)
+                          if _shadow_on and isinstance(v, (list, dict)) else None)
+                return part if shadow is None else part + (shadow,)
             # Filters the measure provably cannot see are keyed by what it
             # does see of them (_shielded_keys): "the last week with sales"
             # called once per date row is then evaluated once.
@@ -4919,8 +5398,9 @@ class DAXEngine:
                 # derived from its parent's (_filters_sigd; issue #150)
                 fc_key = ctx._filters_sig()
             else:
+                _sigd = ctx._filters_sigd()
                 fc_key = frozenset(
-                    (k, _repl[k] if k in _repl else _fc_part(k, v))
+                    (k, _repl[k] if k in _repl else _fc_part(k, v, _sigd))
                     for k, v in ctx.filter_context.items())
             # Under the same filters, a reference whose item applies and one
             # whose item is already applied (inside the item, or nested in the
@@ -5905,12 +6385,21 @@ class DAXEngine:
                     if _cur.get('__column__') == col_name:
                         return _cur.get('__value__')
                     # The row is keyed by the model's spelling, which may keep a
-                    # space the parsed reference lost (' Sales', issue #132).
+                    # space the parsed reference lost (' Sales', issue #132) or
+                    # spell the name in another case (issue #226).
                     _tt = ctx.tables.get(table_name)
                     if _tt is not None:
                         _ci = ctx._find_col_idx(_tt['columns'], col_name)
-                        if _ci >= 0 and _tt['columns'][_ci] in _cur:
-                            return _cur[_tt['columns'][_ci]]
+                        if _ci >= 0:
+                            _mc = _tt['columns'][_ci]
+                            if _mc in _cur:
+                                return _cur[_mc]
+                            # A row of one column (VALUES, DISTINCT, ALL of a
+                            # column) names it under __column__: Desktop's
+                            # COUNTROWS(FILTER(VALUES(F3[S]), F3[s] = "a")) is
+                            # 1, where F3[s] stayed unresolved and kept no row.
+                            if _cur.get('__column__') == _mc:
+                                return _cur.get('__value__')
                 # Not the current row's: the innermost enclosing row context
                 # over that table (issue #116). Power BI Desktop 2.152:
                 # SUMX(Dim, COUNTROWS(FILTER(Orders, Orders[Region] =
@@ -5929,6 +6418,17 @@ class DAXEngine:
                 # measures returned confident numbers (19,260,876.5611 and
                 # friends) where Desktop shows nothing.
                 _t = ctx.tables.get(table_name)
+                if _t is None:
+                    # The table named in another case: DAX names are
+                    # case-insensitive, and Desktop's CALCULATE(SUM(F3[A]),
+                    # FILTER(F3, f3[S] = "a")) is 30 (issue #226; build_b210.py)
+                    # where f3[S] matched no row and kept none. Resolved again
+                    # in the model's spelling -- only once the reference has
+                    # failed, so a name spelled as the model spells it costs
+                    # nothing more.
+                    _mt = ctx.model_table(table_name)
+                    if _mt != table_name:
+                        return self._exec_plan(((_P_TCOL, (_mt, col_name)),), ctx, var_scope)
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
                     # `Table[Name]` where Name is not a column is DAX's
                     # fully-qualified MEASURE reference. Agents_Performance reads
@@ -5961,6 +6461,10 @@ class DAXEngine:
                         and data in ctx._current_row):
                     return ctx._current_row[data]
                 if not self._measure_exists(data, ctx):
+                    # An enclosing row context's own column (issue #225).
+                    found, val = self._outer_row_value(data, ctx)
+                    if found:
+                        return val
                     # Not a measure: DAX resolves a bare [Column] against the
                     # model. Hand back the same (table, column) marker a
                     # qualified reference produces, so the plain aggregates
@@ -6036,6 +6540,9 @@ class DAXEngine:
                         and data in ctx._current_row):
                     return ctx._current_row[data]
                 if not self._measure_exists(data, ctx):
+                    found, val = self._outer_row_value(data, ctx)
+                    if found:
+                        return val
                     col = self._resolve_bare_column(data, ctx)
                     if col is not None:
                         return col
@@ -6056,9 +6563,21 @@ class DAXEngine:
 
     def _eval_tail(self, expr: str, ctx: DAXContext):
         """The old chain's final branch: a bare table name resolves to its
-        filtered rows for iteration; anything else is BLANK."""
+        filtered rows for iteration; anything else is BLANK.
+
+        The name may be in another case: DAX names are case-insensitive, so
+        COUNTROWS(f3) counts F3's rows (issue #226; Desktop reads f3[A] as
+        F3[A], build_b210.py). The model's spelling is tried first, and only a
+        name that can be a table -- an identifier, or quoted whole -- is looked
+        up again, so a comparison that falls through to here in an iterator
+        does not scan the table names on every row."""
         bare_name = expr.strip().strip("'")
         tbl = ctx.tables.get(bare_name)
+        if tbl is None:
+            s = expr.strip()
+            if _IDENT_RE.match(s) or (len(s) > 1 and s[0] == s[-1] == "'"):
+                bare_name = ctx.model_table(bare_name)
+                tbl = ctx.tables.get(bare_name)
         if tbl and tbl.get('rows'):
             cols = tbl['columns']
             filtered_rows = ctx.get_filtered_rows(bare_name)
@@ -7104,13 +7623,21 @@ class DAXEngine:
                                                       name) >= 0:
                 return (rt, name)
         # Memoized per model: this runs inside per-row iteration, and scanning
-        # every table's column list on each row was measurable.
-        key = (id(ctx.tables), name)
-        owners = self._bare_col_cache.get(key, _MISSING)
-        if owners is _MISSING:
-            owners = [tn for tn, t in ctx.tables.items()
-                      if ctx._find_col_idx(t.get('columns') or [], name) >= 0]
-            self._bare_col_cache[key] = owners
+        # every table's column list on each row was measurable. The memo is
+        # kept in the model's filter-index cache (issue #216). On the engine,
+        # which lives as long as its thread, it was keyed by id(tables) without
+        # holding the mapping, so a model built at a freed model's id resolved
+        # [X] against the dead model's tables: SUM([X]) answered BLANK instead
+        # of 300 in every trial where CPython reused the id. That cache holds
+        # its mapping, starts again when a column is appended (#215), goes
+        # with the model when it is evicted, and a transient mapping has its own.
+        memo = ctx._filter_idx_cache.get('__bare_columns__')
+        if memo is None:
+            memo = ctx._filter_idx_cache.setdefault('__bare_columns__', {})
+        owners = memo.get(name)
+        if owners is None:
+            owners = memo[name] = [tn for tn, t in ctx.tables.items()
+                                   if ctx._find_col_idx(t.get('columns') or [], name) >= 0]
         if len(owners) == 1:
             return (owners[0], name)
         # Several tables own the name. DAX does NOT refuse -- it resolves the
@@ -7123,6 +7650,71 @@ class DAXEngine:
         if home and home in owners:
             return (home, name)
         return None
+
+    @staticmethod
+    def _row_column_owner(row, name: str, ctx: DAXContext) -> tuple:
+        """Whether one iterated row has a column ``name``: ``('own', value)``
+        when the row holds it as a column no model table gives it -- one a
+        virtual table made (SELECTCOLUMNS, ADDCOLUMNS, GENERATESERIES, { }) --
+        ``('model', None)`` when it is a column of the row's model table,
+        ``(None, None)`` when the row has no such column.
+
+        A SELECTCOLUMNS row (_ColumnsRow) carries its source's single-column
+        ``__column__`` as lineage only: SELECTCOLUMNS(GENERATESERIES(1, 2),
+        "w", [Value]) has no column Value, so an enclosing row's [Value] is
+        the one meant. ADDCOLUMNS over a CROSSJOIN puts its columns on the
+        joined row, not on a part; the joined row's other keys are copies of
+        the parts' (the right part's prefixed ``_2_``, _fn_crossjoin)."""
+        if not isinstance(row, dict):
+            return None, None
+        parts = row.get('__parts__')
+        for part in parts or (row,):    # a CROSSJOIN row (#108)
+            tbl = ctx.tables.get(part.get('__table__') or '')
+            in_model = tbl is not None and ctx._find_col_idx(tbl.get('columns') or [], name) >= 0
+            if name in part and not name.startswith('__'):
+                return ('model', None) if in_model else ('own', part[name])
+            if in_model or (part.get('__column__') == name and not isinstance(part, _ColumnsRow)):
+                return 'model', None
+        if parts and name in row and not name.startswith(('__', '_2_')):
+            return 'own', row[name]
+        return None, None
+
+    def _outer_row_value(self, name: str, ctx: DAXContext) -> tuple:
+        """``(True, value)`` when a bare ``[name]`` the current row does not
+        hold is a virtual table's column of an ENCLOSING row context's row;
+        ``(False, None)`` otherwise.
+
+        DAX resolves an unqualified column against the row contexts from the
+        innermost out. Only the current row was read, and the model-wide
+        lookup (_resolve_bare_column) knows no virtual table's columns, so the
+        reference raised and the measure was BLANK. Power BI Desktop 2.152
+        (the SAMPLE battery, probes x-rowctx-sumx-bare and
+        x-expr-countrows-asc; issue #225): SUMX(SELECTCOLUMNS(GENERATESERIES(
+        1, 20), "v", [Value]), COUNTROWS(FILTER(SELECTCOLUMNS(GENERATESERIES(
+        1, 20), "w", [Value]), [w] > [v]))) is 190, as with VAR x = [v].
+
+        The innermost row that has the column decides. When that row is the
+        current one, or the column is its model table's, the reference stays
+        what it was: a (table, column) marker the iterators and the row's
+        transition filters read (issue #116).
+
+        Only the row contexts still open count: the contexts bound along
+        _outer_ctx whose own _outer_ctx is set, as transition_filters walks
+        them. The walk ends at the context a measure reference, CALCULATE or
+        the query opened (_outer_ctx None). A measure's body keeps its
+        caller's row as _current_row, but that row is not a row context of
+        the body: with MV = SUMX(VALUES(Dim[Region]), SUM([Value])),
+        SUMX({1, 2, 3}, [MV]) sums Fact[Value] three times. Read as the
+        constructor's own Value column, it was a silent BLANK."""
+        if ctx._outer_ctx is None or self._row_column_owner(ctx._current_row, name, ctx)[0] is not None:
+            return False, None
+        c = ctx._outer_ctx
+        while c._outer_ctx is not None:
+            owner, val = self._row_column_owner(c._current_row, name, ctx)
+            if owner is not None:
+                return owner == 'own', val
+            c = c._outer_ctx
+        return False, None
 
     def _require_real_column(self, col, ctx: DAXContext) -> None:
         """Refuse a (table, column) reference whose column does not exist.
@@ -7142,6 +7734,10 @@ class DAXEngine:
         if not col:
             return
         tbl = ctx.tables.get(col[0])
+        if tbl is None:
+            # f3[A] names F3: DAX names are case-insensitive (issue #226)
+            col = (ctx.model_table(col[0]), col[1])
+            tbl = ctx.tables.get(col[0])
         if tbl is None:
             return
         if ctx._find_col_idx(tbl.get('columns') or [], col[1]) >= 0:
@@ -7705,8 +8301,8 @@ class DAXEngine:
                                 r"^\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*$",
                                 _p.strip())
                             if _km:
-                                _kept.add(f"{_km.group(1).strip()}."
-                                          f"{_km.group(2).strip()}")
+                                _kept.add(new_ctx.model_key(_km.group(1).strip(),
+                                                            _km.group(2).strip()))
                         _exp = new_ctx.expanded_tables(_tbl)
                         new_ctx = new_ctx.without_columns(
                             lambda t, c: t in _exp and f"{t}.{c}" not in _kept)
@@ -7740,8 +8336,10 @@ class DAXEngine:
                         new_ctx = self._allselected_ctx(new_ctx, lambda k: k.lower() == key)
                         keep_keys |= self._written_keys(_as_before, new_ctx)
                     elif col:
+                        # ALL(f3[s]) clears F3[S]'s filter (issue #226)
+                        _at, _ac = new_ctx.model_column(table, col)
                         new_ctx = new_ctx.without_columns(
-                            lambda t, c: t == table and c == col)
+                            lambda t, c: t == _at and c == _ac)
                     elif selected:
                         # ALLSELECTED(Table) RESTORES the query/slicer context
                         # on the table's EXPANDED table; it does not clear it.
@@ -8173,7 +8771,7 @@ class DAXEngine:
                 col_name = eq_match.group(2).strip()
                 val = self._eval_expr(eq_match.group(3).strip(), ctx)
                 if val is not None:
-                    new_ctx = new_ctx.with_filters({f"{tbl_name}.{col_name}": [val]})
+                    new_ctx = new_ctx.with_filters({ctx.model_key(tbl_name, col_name): [val]})
                 continue
 
         if _kf_before is not None:
@@ -8407,19 +9005,60 @@ class DAXEngine:
         column's index. Both keep the same rows of T: FILTER's are T's visible
         rows that satisfy the condition, and KEEPFILTERS keeps the outer
         context and adds the condition. VALUES / SUMMARIZE, not ALL: the
-        condition sees only the values FILTER's rows have, so one that fails
-        on a hidden value fails in both or neither. They differ only in what
-        else is filtered (T's expanded table against its columns), so the
-        rewrite is made only where nothing else is seen:
+        condition sees the values FILTER's rows have, so one that fails on a
+        hidden value fails in both or neither -- but VALUES also hands it the
+        blank row's BLANK, which FILTER(T, ...) never iterates (see below).
+        They differ in what else is filtered (T's expanded table against its
+        columns), so the rewrite is made only where nothing else is seen:
 
         - the expression is a plain aggregate of T's own columns, which reads
           T's rows and no filter state;
         - FILTER is the only filter argument;
         - there is no row context (a transitioned row's filters on T would be
           replaced by the table filter, not by the column filter);
-        - T is a model table named in the model's spelling, and the condition
-          reads T's columns and constants, or pure functions of them, never
-          case-sensitive ones (the kept values filter ignoring case)."""
+        - the condition reads T's columns and constants, or pure functions of
+          them, never case-sensitive ones (the kept values filter ignoring
+          case).
+
+        And only where the kept values select exactly FILTER's rows (issue
+        #210; Power BI Desktop 2.152, build_b210.py, answers the table
+        filter's way in each case):
+
+        - T and every column, in the aggregate and in the condition, are
+          spelled as the model spells them. DAX names ignore case, but a row
+          of VALUES(T[c]) answers only its own spelling: F3[s] read nothing,
+          so CALCULATE(SUM(F3[A]), FILTER(F3, F3[s] = "a")) was BLANK (Desktop
+          30), and a bare TBool[b] stayed true for every value, 15 where
+          Desktop's FILTER(TBool, TBool[b]) keeps 10.
+        - T has no blank row, or the condition is no error for it (BLANK in
+          every column; _pushdown_errs_on_blank_row). VALUES lists the blank
+          row's BLANK and a FILTER over it evaluates the condition there:
+          KEEPFILTERS(FILTER(VALUES(D3[N]), SEARCH("a", D3[N]) > 0)) is an
+          error on Desktop, which FILTER(D3, SEARCH("a", D3[N]) > 0) is not (3
+          rows). TRUE or FALSE there keeps FILTER's rows: the condition reads
+          only the columns filtered, so a kept BLANK selects T's rows that are
+          BLANK in them, which FILTER keeps too, and the blank row, which no
+          aggregate the rewrite accepts counts (COUNTROWS(T), a table
+          reference, DISTINCTCOUNT, COUNTA and MIN / MAX do not see it, #82).
+          Refusing TRUE too would be wrong, not only slow: both sides of a 1:1
+          have a blank row, and there the table filter drops the side's
+          unmatched row (#227). FILTER(FC, FC[A] >= 0) keeps FC's two rows, as
+          FILTER(FC, 1 = 1) does: Desktop 30 (c11_filter_true) and COUNTROWS
+          2 (c11_rows), the table filter 10 and 1.
+        - no two cells of a column filtered are told apart by the condition
+          but not by the kept values (_inset_aliases). One column's values are
+          applied as an In-set (make_value_matcher), which reads the text
+          "None" as BLANK too, a date-like text as its moment and a number as
+          its float, while Desktop matches a Text column's cells as text: over
+          "None", BLANK and "x", FILTER(TA, TA[S] = "None") keeps 1 (the
+          rewrite 3); over "2020-01-01", "2020-01-01T00:00:00", "01/02/2020",
+          "2020-02-01", ... FILTER(TB, LEN(TB[S]) = 10) keeps 49 (the rewrite
+          59), and two offsets of one time, 1 (the rewrite 3). Such a reading
+          matters only where it meets another cell: "None" with no BLANK cell,
+          or dates spelled one way, keep the rewrite. SUMMARIZE's
+          combinations are matched by _tuple_key, text as text, so there only
+          numbers that share a float (integers past 2**53) or two spellings
+          of one moment refuse it."""
         if len(args) != 2 or ctx._outer_ctx is not None or getattr(ctx, '_current_row', None) is not None:
             return None
         wrapper, inner = self._peel_call(re.sub(r"(?is)^\s*FILTER\s+\(", "FILTER(", args[1]), ('FILTER',))
@@ -8447,21 +9086,64 @@ class DAXEngine:
                 continue
             ref = ref.strip()
             name = ref[1:-1].replace("''", "'") if ref.startswith("'") else ref
-            if ctx.model_table(name) != table:
+            if name != table:
                 return None
+        columns = ctx.tables[table]['columns']
         for col in (m.group(g) for g in ('c1', 'c3')):
-            if col is not None and (col.strip() in ctx.measures
-                                    or ctx._find_col_idx(ctx.tables[table]['columns'], col.strip()) < 0):
+            if col is not None and (col.strip() in ctx.measures or col.strip() not in columns):
                 return None
         cond = parts[1].strip()
-        cols = self._condition_columns(cond, table, {c: None for c in ctx.tables[table]['columns']},
-                                       self._PUSHDOWN_WORDS)
+        cols = self._condition_columns(cond, table, dict.fromkeys(columns), self._PUSHDOWN_WORDS, exact=True)
         if not cols:
+            return None
+        if table in ctx.blank_row_tables() and self._pushdown_errs_on_blank_row(table, cond, ctx):
+            return None
+        # (In-set, tuple) aliasing: one column is an In-set, several a tuple filter
+        if any(self._inset_aliases(table, c, ctx)[len(cols) > 1] for c in cols):
             return None
         quoted = "'" + table.replace("'", "''") + "'"
         rows = (f"VALUES({quoted}[{cols[0]}])" if len(cols) == 1 else
                 f"SUMMARIZE({quoted}, {', '.join(f'{quoted}[{c}]' for c in cols)})")
         return [args[0], f"KEEPFILTERS(FILTER({rows}, {cond}))"]
+
+    def _pushdown_errs_on_blank_row(self, table: str, cond: str, ctx: DAXContext) -> bool:
+        """Is the pushdown's condition an error for T's blank row, BLANK in
+        every column? The rewrite's FILTER over VALUES then raises it, where
+        FILTER(T, ...), which never iterates that row, does not; TRUE and
+        FALSE both keep FILTER's rows (see _pushdown_table_filter). The
+        condition reads only T's columns and pure functions of them, so the
+        answer is the same in every context: memoized per table and
+        condition on the model-wide cache."""
+        tbl = ctx.tables[table]
+        key = (id(tbl), 'pushdown-errs-on-blank-row', cond)
+        cache = ctx._filter_idx_cache
+        hit = cache.get(key)
+        if hit is None:
+            row = {'__table__': table, **dict.fromkeys(tbl['columns'])}
+            try:
+                self._eval_expr(cond, self._make_row_context(row, ctx))
+                hit = False
+            except Exception:  # noqa: BLE001 -- any error on BLANK: the rewrite would raise it
+                hit = True
+            cache[key] = hit
+        return hit
+
+    @staticmethod
+    def _inset_aliases(table: str, col: str, ctx: DAXContext) -> tuple:
+        """``(in_set, in_tuples)``: can a filter on ``table[col]``'s own values
+        select a cell of another value -- as an In-set (make_value_matcher,
+        _filter_value_keys), and as one column of a combination (_tuple_key)?
+        See _inset_aliasing. Memoized per column on the model-wide cache: the
+        pushdown asks on every CALCULATE it rewrites."""
+        tbl = ctx.tables[table]
+        idx = tbl['columns'].index(col)
+        key = (id(tbl), 'inset-aliases', idx)
+        cache = ctx._filter_idx_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = cache[key] = _inset_aliasing(tbl['rows'], idx)
+        out: tuple = hit
+        return out
 
     @staticmethod
     def _peel_call(arg: str, names: tuple) -> tuple:
@@ -8527,7 +9209,7 @@ class DAXEngine:
         if isb:
             cm = _WHOLE_TCOL_RE.match(isb_inner)
             if cm:
-                key = f"{(cm.group(1) or cm.group(2) or '').strip()}.{cm.group(3).strip()}"
+                key = ctx.model_key((cm.group(1) or cm.group(2) or '').strip(), cm.group(3).strip())
                 return (key, {"is_blank": not negate}, keep)
             return ()
 
@@ -8552,7 +9234,8 @@ class DAXEngine:
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
                       '>=': '<', '<': '>='}[op]
-            key = f"{tbl}.{col}"
+            # in the model's spelling, whatever case the reference is in (#226)
+            key = ctx.model_key(tbl, col)
             if val is None:
                 # T[C] = BLANK() is a real filter: BLANK, and the zero of the
                 # column's type, since BLANK = 0 and BLANK = "" are TRUE. It
@@ -8579,7 +9262,7 @@ class DAXEngine:
                 vals = self._in_set_values(in_parts[1], ctx, var_scope)
                 if vals is None:
                     return ()
-                key = f"{lm.group(1).strip()}.{lm.group(2).strip()}"
+                key = ctx.model_key(lm.group(1).strip(), lm.group(2).strip())
                 return (key, {"not_in" if negate else "in": vals}, keep)
         return ()
 
@@ -8595,7 +9278,7 @@ class DAXEngine:
         col2 active for the wrapped expression, deactivating any other active
         relationship between the same two tables (only one may be active per
         pair). No-op (graceful) if no matching relationship exists."""
-        refs = self._two_col_refs(filter_arg)
+        refs = [ctx.model_column(t, c) for t, c in self._two_col_refs(filter_arg)]   # any case (#226)
         if len(refs) < 2:
             return ctx
         (t1, c1), (t2, c2) = refs[0], refs[1]
@@ -8622,7 +9305,7 @@ class DAXEngine:
         direction of the col1<->col2 relationship for the wrapped expression.
         direction: None -> inactive-for-filtering (0), OneWay -> single (1),
         Both -> bidirectional (2)."""
-        refs = self._two_col_refs(filter_arg)
+        refs = [ctx.model_column(t, c) for t, c in self._two_col_refs(filter_arg)]   # any case (#226)
         if len(refs) < 2:
             return ctx
         (t1, c1), (t2, c2) = refs[0], refs[1]
@@ -8708,8 +9391,8 @@ class DAXEngine:
             _tc._filter_idx_cache = ctx._filter_idx_cache
             return _tc
 
-        date_table = match.group(1).strip()
-        date_col = match.group(2).strip()
+        # the model's spelling: the filter is keyed by it (issue #226)
+        date_table, date_col = ctx.model_column(match.group(1).strip(), match.group(2).strip())
         offset = int(match.group(3))
         interval = match.group(4).upper()
 
@@ -8829,7 +9512,8 @@ class DAXEngine:
         col_match = _WHOLE_TCOL_RE.match(ref)
         if col_match:
             # groups: 'quoted name' | bare name | column
-            table_name = (col_match.group(1) or col_match.group(2) or '').strip()
+            # the model's spelling, whatever case the reference is in (#226)
+            table_name = ctx.model_table((col_match.group(1) or col_match.group(2) or '').strip())
             col_name = col_match.group(3).strip()
             # Return all values ignoring filters — use raw table data
             tbl = ctx.tables.get(table_name)
@@ -8843,11 +9527,11 @@ class DAXEngine:
                     if (None not in all_values and not no_blank_row
                             and table_name in ctx.blank_row_tables()):
                         all_values.append(None)
-                    return [{'__table__': table_name, '__column__': col_name,
+                    return [{'__table__': table_name, '__column__': tbl['columns'][col_idx],
                              '__value__': v} for v in all_values]
 
         # Table-level ALL: ALL('TableName') — return all rows as multi-column row dicts
-        table_name = ref.strip("'").strip()
+        table_name = ctx.model_table(ref.strip("'").strip())
         tbl = ctx.tables.get(table_name)
         if tbl and tbl.get('rows'):
             # Return full row dicts with all columns for FILTER to iterate
@@ -9001,7 +9685,7 @@ class DAXEngine:
                 if shifted is not None:
                     return shifted
             return ('__DATEADD__', args_str.strip())
-        dt, dc = m.group(1).strip(), m.group(2).strip()
+        dt, dc = ctx.model_column(m.group(1).strip(), m.group(2).strip())    # any case (#226)
         dates = self._dateadd_dates(dt, dc, int(m.group(3)),
                                     m.group(4).upper(), ctx)
         return [{'__table__': dt, '__column__': dc, '__value__': v}
@@ -9065,13 +9749,15 @@ class DAXEngine:
         if not m:
             shifted = self._shift_date_table(ref, -1, 'YEAR', ctx)
             return shifted if shifted is not None else ('__DATEADD__', ref)
-        dt, dc = m.group(1).strip(), m.group(2).strip()
+        dt, dc = ctx.model_column(m.group(1).strip(), m.group(2).strip())    # any case (#226)
         return [{'__table__': dt, '__column__': dc, '__value__': v}
                 for v in self._dateadd_dates(dt, dc, -1, 'YEAR', ctx)]
 
     def _fn_values(self, args_str: str, ctx: DAXContext) -> Any:
         arg = args_str.strip()
         tname = arg.strip("'")
+        if tname not in ctx.tables and '[' not in tname:
+            tname = ctx.model_table(tname)          # VALUES(f3) is F3's (#226)
         if tname in ctx.tables and not _WHOLE_TCOL_RE.match(arg):
             # VALUES(<table>): the visible rows -- duplicates kept, unlike
             # DISTINCT -- plus the blank row when it is visible (Desktop:
@@ -9094,7 +9780,7 @@ class DAXEngine:
         """VALUES(T[C]) as a list: the visible distinct values, plus BLANK
         when T's blank row is visible (issue #82). Also what HASONEVALUE and
         SELECTEDVALUE count."""
-        values = list(dict.fromkeys(ctx.get_column_data(table_name, col_name)))
+        values = _distinct_cells(ctx.get_column_data(table_name, col_name))
         if None not in values and ctx.blank_row_visible(table_name):
             values.append(None)
         return values
@@ -9743,7 +10429,7 @@ class DAXEngine:
             universe = [r.get('__value__') for r in src
                         if isinstance(r, dict)]
         else:
-            table_name, col_name = col
+            table_name, col_name = ctx.model_column(*col)     # any case (#226)
         expr = args[1].strip() if len(args) > 1 else None
         values = []
         seen = set()
@@ -9945,7 +10631,13 @@ class DAXEngine:
         Such a condition has one value per combination of those columns."""
         return self._condition_columns(cond_expr, table, row_item, self._ROW_ONLY_WORDS)
 
-    def _condition_columns(self, cond_expr: str, table: str, row_item: dict, words: frozenset):
+    def _condition_columns(self, cond_expr: str, table: str, row_item: dict, words: frozenset,
+                           exact: bool = False):
+        """The columns of ``row_item`` the condition reads (see
+        _row_only_condition), each once, in the order they appear. A name is
+        matched ignoring case, as DAX does -- or, with ``exact``, only when the
+        table and the column are spelled as the model spells them (the
+        pushdown, see _pushdown_table_filter)."""
         cols: list = []
         lower = {k.lower(): k for k in row_item if not k.startswith('__')}
         pos = 0
@@ -9963,9 +10655,13 @@ class DAXEngine:
                 tpart = tpart.strip()
                 if tpart.startswith("'"):
                     tpart = tpart[1:-1].replace("''", "'")
-                if tpart.lower() != table.lower():
-                    return None
-                key = lower.get(cpart[:-1].strip().lower())
+                name = cpart[:-1].strip()
+                if exact:
+                    key = name if tpart == table and name in row_item and not name.startswith('__') else None
+                elif tpart.lower() == table.lower():
+                    key = lower.get(name.lower())
+                else:
+                    key = None
                 if key is None:
                     return None
                 if key not in cols:
@@ -9981,6 +10677,39 @@ class DAXEngine:
     # Table functions
     # =========================================================================
 
+    @staticmethod
+    def _order_pairs(fn: str, args: list) -> list:
+        """[(orderBy, descending)] of TOPN's or SAMPLE's ``orderBy [, order]
+        [, orderBy [, order]]...`` arguments, paired by position: the argument
+        after an orderBy is its order, ASC / 1 / TRUE / TRUE() ascending and
+        DESC / 0 / FALSE / FALSE() descending, in any case and spacing; the
+        last orderBy may leave its order out, and the order is then DESC.
+
+        Power BI Desktop 2.152 (issues #211, #212; docs/reverse-engineering/
+        experiments/2026-10-24-sample.md) refuses any other order before
+        running the query -- 2, -1, 1 + 0, BLANK(), "ASC" and a column:
+        "Unexpected value for the ORDER argument in the function SAMPLE. Use
+        0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order"
+        -- and so SAMPLE(5, T, [a], [v]), SAMPLE(5, T, [a], [v], ASC) and
+        TOPN(3, T, [a], [v]) too, where [v] stands in [a]'s order; SAMPLE(5,
+        T, [v], 1, [a]) orders by [v] ascending, then [a] descending. TOPN
+        read a word that was no order as the next orderBy; SAMPLE read ASC /
+        DESC after its first orderBy and nothing else, so 1 and TRUE
+        descended there."""
+        pairs: list = []
+        for i in range(0, len(args), 2):
+            desc = True
+            if i + 1 < len(args):
+                word = ''.join(args[i + 1].split()).upper()
+                if word in _ASC_ORDER_WORDS:
+                    desc = False
+                elif word not in _DESC_ORDER_WORDS:
+                    raise _DAXEvaluationError(
+                        f"Unexpected value for the ORDER argument in the function {fn}. "
+                        "Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order.")
+            pairs.append((args[i].strip(), desc))
+        return pairs
+
     def _fn_topn(self, args_str: str, ctx: DAXContext) -> Any:
         """TOPN(n, table, orderBy [, order [, orderBy [, order]]...]) — the first
         n rows by every order pair in turn, with the rows tied with the n-th.
@@ -9993,30 +10722,23 @@ class DAXEngine:
         (build_b158.py, issue #158): TOPN(1, VALUES(D[Date]), D[Date], ASC)
         is the earliest date; TOPN(1, D, D[Name], ASC) the first name;
         TOPN(2, D, D[Grp], ASC, D[Date], DESC) orders each group by date;
-        TOPN(1, D, D[Grp], ASC) returns both rows of the lowest group."""
+        TOPN(1, D, D[Grp], ASC) returns both rows of the lowest group.
+
+        n rounds half up (_row_count_arg): TOPN(2.5, ...) and TOPN(2.6, ...)
+        are three rows, where int() made them two; the orders pair with
+        their orderBys by position (_order_pairs), so TOPN(3, T, [v], 2) and
+        TOPN(3, T, [a], [v]) are errors (issue #212)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
+        pairs = self._order_pairs('TOPN', args[2:])     # (orderBy, descending)
         n = self._eval_expr(args[0].strip(), ctx)
         if not isinstance(n, (int, float)) or isinstance(n, bool):
             return []
-        n = int(n)
         table_ref = self._eval_expr(args[1].strip(), ctx)
         if not isinstance(table_ref, list):
             return []
-        pairs: list = []        # (orderBy, descending)
-        i = 2
-        while i < len(args):
-            desc = True
-            step = 1
-            if i + 1 < len(args):
-                word = args[i + 1].strip().upper()
-                if word in ('1', 'ASC', 'TRUE', 'TRUE()'):
-                    desc, step = False, 2
-                elif word in ('0', 'DESC', 'FALSE', 'FALSE()'):
-                    step = 2
-            pairs.append((args[i].strip(), desc))
-            i += step
+        n = _row_count_arg(n, len(table_ref))
         if n <= 0:
             return []
         if not pairs:
@@ -10712,18 +11434,18 @@ class DAXEngine:
         return self._eval_expr(expr.strip(), ctx)
 
     def _fn_distinct(self, args_str: str, ctx: DAXContext) -> Any:
-        """DISTINCT(column_or_table) — distinct values, respecting filter context."""
+        """DISTINCT(column_or_table) — distinct values, respecting filter context.
+
+        DISTINCT(T[C]) is VALUES(T[C]) without the blank row a relationship
+        adds: the column's visible cells, each value once (_distinct_cells).
+        They were told apart by their text, so BLANK and the text "None"
+        were one value. Power BI Desktop 2.152 (build_b210.py, issue #223):
+        COUNTROWS(DISTINCT(TA[S])) over "None", BLANK, "x" is 3, as
+        COUNTROWS(VALUES(TA[S])) is."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = ctx.get_column_data(ref[0], ref[1])
-            seen = set()
-            result = []
-            for v in values:
-                key = str(v)
-                if key not in seen:
-                    seen.add(key)
-                    result.append({'__table__': ref[0], '__column__': ref[1], '__value__': v})
-            return result
+            return [{'__table__': ref[0], '__column__': ref[1], '__value__': v}
+                    for v in _distinct_cells(ctx.get_column_data(ref[0], ref[1]))]
         if isinstance(ref, list):
             # Deduplicate table rows as DAX compares their values: text
             # case-insensitively (Desktop: COUNTROWS(DISTINCT({"a", "A", "b"}))
@@ -11107,9 +11829,9 @@ class DAXEngine:
             return multi
         col_match = _WHOLE_TCOL_RE.match(ref)
         if col_match:
-            # groups: 'quoted name' | bare name | column
-            table_name = (col_match.group(1) or col_match.group(2) or '').strip()
-            col_name = col_match.group(3).strip()
+            # groups: 'quoted name' | bare name | column; the model's spelling (#226)
+            table_name, col_name = ctx.model_column(
+                (col_match.group(1) or col_match.group(2) or '').strip(), col_match.group(3).strip())
             values = self._values_with_blank(
                 table_name, col_name,
                 self._selected_on_columns(ctx, table_name, [col_name]))
@@ -13532,33 +14254,74 @@ class DAXEngine:
         return None
 
     def _fn_sample(self, args_str: str, ctx: DAXContext):
+        """SAMPLE(n, table, orderBy [, order [, orderBy [, order]]...]) -- n
+        rows spread evenly over the table in the order of every orderBy in
+        turn, the first and the last row included (_evenly_spaced).
+
+        Power BI Desktop 2.152 over ADOMD, 173 probes run twice (issue #211;
+        docs/reverse-engineering/experiments/2026-10-24-sample.md):
+          * n rounds half up (_row_count_arg): 0.4 is no rows, 0.5 one, 2.5
+            three; BLANK and FALSE are no rows, TRUE one, "3" three. A
+            negative n, -0.5 too, is an error: "The SAMPLE function can only
+            be used with a non-negative sample size argument". 0 and the
+            negatives returned the first row, 2.5 two rows, and an n of
+            BLANK gave BLANK instead of a table.
+          * every orderBy counts, each with its own order (_order_pairs):
+            [a], ASC, [v], DESC over four rows per [a] picks v = 4, 7, 10,
+            14, 17, where only [a] counted. The order is DESC when none is
+            given; SAMPLE(n, table) with no orderBy is refused before the
+            query runs ("Too few arguments ..."), where it was BLANK.
+          * a BLANK orders as 0 among numbers, just before a 0, and first
+            among texts (_sample_order).
+        Rows tied under every orderBy keep the table's order: Desktop's own
+        choice among them follows no order the rows show (2 of 10 rows all
+        tied are rows 6 and 10) and is not reproduced."""
         parts = self._split_args(args_str)
         if len(parts) < 3:
-            return None
-        n = self._num1(parts[0], ctx)
+            raise _DAXEvaluationError(
+                "Too few arguments were passed to the SAMPLE function. "
+                "The minimum argument count for the function is 3.")
+        pairs = self._order_pairs('SAMPLE', parts[2:])
+        n = self._num_arg(parts[0], ctx)
+        if n is not None and not n >= 0:
+            raise _DAXEvaluationError(
+                "The SAMPLE function can only be used with a non-negative sample size argument.")
         rows = self._table_rows(parts[1], ctx)
-        if n is None or rows is None:
+        if rows is None:
             return None
-        order_expr = parts[2].strip()
-        desc = True
-        if len(parts) >= 4 and parts[3].strip().upper() in ("ASC", "DESC"):
-            desc = parts[3].strip().upper() == "DESC"
-        keyed = []
+        count = 0 if n is None else _row_count_arg(n, len(rows))
+        if count <= 0:
+            return []                   # no orderBy evaluated
+        order = self._sample_order(rows, pairs, ctx)
+        return [rows[order[j]] for j in _evenly_spaced(count, len(rows))]
+
+    def _sample_order(self, rows: list, pairs: list, ctx: DAXContext) -> list:
+        """Indexes of ``rows`` in the order of every (orderBy, descending) pair
+        in turn -- stable sorts, the last pair first, so rows tied under all
+        of them keep the table's order.
+
+        A BLANK sorts where 0 does, just before a 0, when the orderBy's other
+        values are numbers, dates or TRUE / FALSE, and before every text
+        otherwise. Power BI Desktop 2.152 (issue #211): over -4 .. 4 with
+        BLANK for 0, SAMPLE(3, T, [v], ASC) picks -4, the BLANK and 4 in
+        either order and SAMPLE(2, ...) -4 and 4, where BLANK first
+        (_order_key) picked the BLANK, -1 and 4, and the BLANK and 4; over 2,
+        BLANK, 0, -1, 1, SAMPLE(3, ..., ASC) picks -1, the 0 and 2 (BLANK
+        second, 0 third) and SAMPLE(4, ..., DESC) 2, 1, the BLANK and -1 (0
+        third, BLANK fourth); over c, BLANK, a, b it picks the BLANK, b and c
+        ascending and c, a and the BLANK descending."""
+        keys = []
         for r in rows:
             row_ctx = self._make_row_context(r, ctx, shadow=rows)
-            k = self._eval_expr(order_expr, row_ctx)
-            k = self._resolve_row_result(k, r, row_ctx)
-            keyed.append((_order_key(_scalarize(k)), r))     # any value, as TOPN (#158)
-        keyed.sort(key=lambda t2: t2[0], reverse=desc)
-        n = int(n)
-        if n >= len(keyed):
-            return [r for _, r in keyed]
-        if n <= 1:
-            return [keyed[0][1]] if keyed else []
-        # evenly spaced across the ordered set, endpoints included
-        step = (len(keyed) - 1) / (n - 1)
-        picked = [keyed[round(i * step)][1] for i in range(n)]
-        return picked
+            keys.append([_scalarize(self._resolve_row_result(self._eval_expr(e, row_ctx), r, row_ctx))
+                         for e, _d in pairs])
+        order = list(range(len(rows)))
+        for k in range(len(pairs) - 1, -1, -1):
+            col = [vals[k] for vals in keys]
+            blank = _order_key(None if any(isinstance(v, str) for v in col) else 0) + (0,)
+            ks = [blank if v is None else _order_key(v) + (1,) for v in col]
+            order.sort(key=ks.__getitem__, reverse=pairs[k][1])
+        return order
 
     def _fn_tocsv(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
@@ -15033,7 +15796,7 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 3:
             return False
-        table_name = args[0].strip().strip("'")
+        table_name = ctx.model_table(args[0].strip().strip("'"))    # in any case (#226)
         tbl = ctx.tables.get(table_name)
         if not tbl:
             return False
@@ -15056,7 +15819,7 @@ class DAXEngine:
         rows = ctx.get_filtered_rows(table_name)
         # Values match as DAX compares them: text case-insensitively, numbers
         # by value (str() missed 1 against 1.0 and "north" against "North").
-        wanted = [(col_idx, _filter_value_keys(value)) for col_idx, value in criteria]
+        wanted = [(col_idx, ctx._column_filter_keys(tbl, col_idx, [value])) for col_idx, value in criteria]
         for row in rows:
             if all(any(k in keys for k in _value_keys(row[col_idx], False))
                    for col_idx, keys in wanted):
@@ -15262,7 +16025,7 @@ class DAXEngine:
 
     def _fn_relatedtable(self, args_str: str, ctx: DAXContext) -> Any:
         """RELATEDTABLE(table) — follow relationship to get filtered related table rows."""
-        table_name = args_str.strip().strip("'")
+        table_name = ctx.model_table(args_str.strip().strip("'"))    # in any case (#226)
         tbl = ctx.tables.get(table_name)
         if not tbl:
             return []
@@ -16354,7 +17117,11 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
         for val in unique_vals:
             bkey = str(val) if key_is_str else val
             brows = buckets.get(bkey, [])
-            tables_copy = dict(tables)
+            # A transient copy evaluates with a cache of its own, so the
+            # buckets leave the model's cache where it is (issue #214). One
+            # per bucket, never shared: the next bucket's fact dict may be
+            # given this one's freed id, and entries are keyed by it.
+            tables_copy = transient_tables(tables)
             tables_copy[ftbl_name] = {**ftbl, "rows": brows}
             res = evaluate_measures_batch(list(ms), tables_copy, measures, {},
                                           date_table, date_column, relationships)

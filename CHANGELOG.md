@@ -5,6 +5,151 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.146] - 2026-10-24
+
+Eighteen fixes, issues #210 - #227. Three come from @allanon2's pull requests #207, #208 and #209, solved on our side. The fuzz of 0.9.144's filter pushdown found that it changes answers (#210). The audits of those pull requests and our own Desktop probes found the other bugs below. Every expected value is Power BI Desktop 2.152's own answer, from two new batteries: `build_b210.py` (57 probes) and 173 SAMPLE probes. Exceptions are noted per issue. The corpus census (1,508 measures in 31 files) changes only the measures that use RAND or RANDBETWEEN. Every other measure is identical to 0.9.145 to the last digit.
+
+Verified before release:
+
+- **Tests:** full suite 7,545 passed, 6 xfailed. The 578 new tests (18 files) all pass; 366 of them fail on 0.9.145.
+- **Desktop batteries:**
+  - b210: 51 of the 56 measured probes match (32 differed on 0.9.145; the 57th is a Desktop error). The 5 left are the Double-sum probes of #228, held back (below).
+  - b200, the #203 pushdown battery: 756 of 756 match, unchanged.
+  - SAMPLE: 160 of 173 match (95 on 0.9.145). The 13 left differ only in which of several fully tied rows comes back.
+  - regress_check: the 3,708 probes of the earlier batteries answer as on 0.9.145.
+- **Lint and types:** ruff is clean. mypy stays at 138: the 135 errors outside `collation.py`, plus the 3 in it that 0.9.145's clean-room rewrite brought; that module stays with a clean-room session.
+
+### Fixed — the CALCULATE filter pushdown changed answers in three cases (issue #210)
+
+A differential fuzz of 0.9.144's rewrite of `CALCULATE(<aggregate of T>, FILTER(T, <condition>))` into `KEEPFILTERS(FILTER(VALUES(T[c]), <condition>))` (#203) ran about 160,000 cases with the rewrite on and off. It found three cases where the rewrite is wrong and the table filter right; Desktop agrees with the table filter in each.
+
+- **References spelled in another case.** `FILTER(F3, F3[s] = "a")` gave BLANK (Desktop 30). A single-column VALUES row matched the column name exactly.
+- **A table with a blank row.** `FILTER(D3, SEARCH("a", D3[N]) > 0)` gave BLANK (Desktop 3). VALUES hands the condition the blank row's BLANK, which FILTER(T) never iterates. Desktop: `KEEPFILTERS(FILTER(VALUES(D3[N]), SEARCH(...)))` is an error.
+- **Text an In-set reads as something else.** `FILTER(TA, TA[S] = "None")` gave 3 (Desktop 1).
+
+The rewrite is now made only when:
+- every reference is spelled as the model spells it;
+- the condition does not fail on the blank row (TRUE or FALSE there both keep the rewrite exact; none of the accepted aggregates counts that row);
+- no value of the column reads as another cell of it (the text "None" beside a BLANK, two spellings of one moment, integers past 2^53).
+
+The AI Sample's [Revenue Won] keeps the rewrite. Tests: `tests/test_issue210_pushdown_exact.py` (67; 37 fail on 0.9.145), including a seeded differential fuzz.
+
+### Fixed — SAMPLE picks the rows Desktop picks (issue #211; reported in PR #208 by @allanon2)
+
+We re-measured on our own Desktop: 173 probes over GENERATESERIES / DATATABLE, run twice with identical answers. The record is `docs/reverse-engineering/experiments/2026-10-24-sample.md`. Desktop contradicts none of the PR's 53 claims, and settles what it left open:
+
+- **Positions:** `floor(i * step + 0.5)` with `step = (N - 1) / (n - 1)` computed first as a Double. This fits all 55 measured position cases; an exact-integer rule fails 5 and round-half-even (0.9.145) fails 11.
+- **n:** rounded half up. BLANK, FALSE and 0 give no rows, TRUE gives one, "3" gives three. A negative n is an error.
+- **Order arguments pair by position.** After an order expression comes ASC / DESC / 1 / 0 / TRUE / FALSE (any case, `TRUE()`), or nothing for the last one. Anything else is Desktop's "Unexpected value for ORDER argument" error. Every order expression counts. The default order is descending. At least one order expression is required.
+- **BLANK** sorts just before 0 in a numeric key, and first in a text key.
+
+Not reproduced: the order Desktop gives rows tied under every order expression; the tests check only what the keys decide. Tests: `tests/test_issue211_sample.py` (171; 57 fail on 0.9.145).
+
+### Fixed — TOPN rounds n half up and refuses an order that is no order (issue #212)
+
+Found with the SAMPLE probes:
+- `TOPN(2.5, ...)` gives 3 rows (it gave 2);
+- `TOPN(3, T, [a], [v])` and `TOPN(3, T, [v], 2)` are errors, as in Desktop; [v] used to be read as a second order expression.
+
+TOPN's sort and tie expansion are unchanged. Tests: `tests/test_issue212_topn_n.py` (6; all fail on 0.9.145).
+
+### Fixed — a DataModel stream's header is checked before anything is decoded (issue #213; reported in PR #209 by @allanon2)
+
+A few bytes of DataModel could:
+- hand the codec a 4 GiB buffer for one chunk;
+- loop over 2^40 empty thread groups when an edited model was saved;
+- decode a 1.6 MB stream to 16 GiB when the file was opened;
+- cost over 400 MB with 200,000 empty chunks.
+
+`datamodel_roundtrip.py` now has one checked chunk-table parser for both formats, replacing three. It refuses each of these with a `DataModelCompressionError` that names the numbers:
+- a chunk that declares more than 16 MiB;
+- an empty chunk (the legacy all-zero terminator still ends a single-threaded table);
+- a payload past the end, or a cut-short header;
+- a declared chunk count larger than the bytes that follow;
+- more than 16 GiB in all, or more than 1000:1 past 64 MiB (the 610 streams on disk reach 31.4:1, and a model our builder writes 92:1).
+
+Groups with no chunks are skipped without looping. The pool keeps at most 32 groups in flight and stops at the first failure. Peak memory is about 2x the model instead of 3x. On save, a refused original falls back to the uncompressed format. Every stream on disk (470 distinct) decodes byte for byte as before. Tests: `tests/test_issue213_datamodel_bounds.py` (54; 45 fail on 0.9.145). None of them allocates.
+
+### Fixed — a transient tables mapping no longer evicts the model's filter cache (issue #214; reported in PR #207 by @allanon2)
+
+`evaluate_per_dimension` evaluated each bucket over a `dict(tables)` copy. Each copy registered a filter cache of its own, and from the fourth bucket on that evicted the model's (FIFO of 4). Calculated-table regeneration did the same. A transient mapping (`transient_tables()`) now carries its own cache and is never registered. The first per-value fallback after the bucketed path takes 0.003 s instead of 0.34 s at 200k rows. Answers are unchanged. Tests: `tests/test_issue214_transient_caches.py` (8; 7 fail on 0.9.145).
+
+### Fixed — a calculated column appended in place is seen by the filter cache (issue #215)
+
+The cache fingerprint now counts each table's columns. On a new shape, the mapping's own stale entries are dropped instead of FIFO-evicting other models. Before, a filter on a column appended after the first evaluation was ignored: 36.0 where 12.0 is right. Tests: `tests/test_issue215_calc_column_cache.py` (4; all fail on 0.9.145).
+
+### Fixed — bare [Column] resolution no longer outlives its model (issue #216)
+
+The owners of a bare `[Column]` were cached by `id(tables)` without holding the mapping, so a model created at a freed model's address resolved `[X]` against the old one. `SUM([X])` gave BLANK instead of 300 in every trial where the address was reused. The owners now live in the model's own filter cache. Tests: `tests/test_issue216_bare_column_cache.py` (5; 3 fail on 0.9.145).
+
+### Fixed — filter-memo signatures tell values of different types apart (issue #217)
+
+`str()` spelled the float 1.0 and the text "1.0", and BLANK and the text "None", alike. Every memo keyed by a filter's signature answered the second filter with the first one's rows, so answers depended on evaluation order. Each value is now spelled with its type, and the >4096-value digest length-prefixes each value. One evaluation on a fresh model was affected too: SUMX over a column holding BLANK and "None". A filter on column combinations is now signed once per filter set instead of once per read (a 1,000-date SUMX: 3.9 s -> 0.5 s). Tests: `tests/test_issue217_filter_signatures.py` (24; 23 fail on 0.9.145).
+
+### Fixed — the cross-filter memo keys the date table (issue #218)
+
+`date_table` and `date_column` were read below the memo but left out of its key: a context with another date table got the first one's answer. Tests: `tests/test_issue218_xtf_date_table.py` (3; all fail on 0.9.145).
+
+### Fixed — a NaN or infinite key no longer blanks the model (issue #219)
+
+`v == int(v)` raised on a NaN or infinite join key. The exception came out of `blank_row_tables`, which walks every relationship, so ONE such key made every cross-filtered measure in the model BLANK. A non-finite key is now spelled as itself. Tests: `tests/test_issue219_nonfinite_keys.py` (14; all fail on 0.9.145).
+
+### Fixed — a relative-date window without an anchor signs today's date (issue #220)
+
+Its memoized rows no longer go stale after midnight in a long-running server. Tests: `tests/test_issue220_relative_date_memo.py` (5; 4 fail on 0.9.145).
+
+### Fixed — filters match a Text column's cells as text (issue #221)
+
+Desktop:
+- `CALCULATE(SUM(TA[A]), TA[S] = "None")` is 1, also through TREATAS and `KEEPFILTERS(FILTER(VALUES(...)))` (ours 3);
+- `TB[S] = "2020-01-01"` is 1 (ours 3);
+- `TB[S] = "1/2/2020"` is 8 (ours 56).
+
+An In-set read the text "None" as BLANK too, and date-like text as its moment, also against Text cells. In a column whose cells are text (and not all dates spelled as text, which #42 keeps), a text value now matches that text alone. Number, date and date-text columns read values as before. Tests: `tests/test_issue221_inset_text.py` (27; 21 fail on 0.9.145).
+
+### Fixed — text join keys keep to their own text (issue #222)
+
+The numeric alternates of #39 were applied to text keys too, so '01', ' 1' and '1.0' joined '1'. Desktop: `CALCULATE(SUM(TK[v]), DK[code] = "01")` is 10 (ours 15). A text target now gets its exact spelling. Number keys keep their int and float spellings. Tests: `tests/test_issue222_text_join_keys.py` (15; 6 fail on 0.9.145).
+
+### Fixed — DISTINCT(column) keeps BLANK and "None" apart (issue #223)
+
+It de-duplicated by `str()`. Desktop: `COUNTROWS(DISTINCT(TA[S]))` over "None", BLANK, "x" is 3 (ours 2). DISTINCTCOUNT, EXCEPT and INTERSECT still compare by text; they are left for their own issue. Tests: `tests/test_issue223_distinct.py` (7; 5 fail on 0.9.145).
+
+### Fixed — NOT T[B] without parentheses (issue #224)
+
+`NOT TBool[B]` was read as a column of a table called "NOT TBool". Desktop: `COUNTROWS(FILTER(TBool, NOT TBool[B]))` is 1 (ours 2). Tests: `tests/test_issue224_not_bare.py` (20; 12 fail on 0.9.145).
+
+### Fixed — a bare outer column inside a nested FILTER over a virtual table (issue #225)
+
+Desktop: `SUMX(SELECTCOLUMNS(GENERATESERIES(1, 20), "v", [Value]), COUNTROWS(FILTER(SELECTCOLUMNS(GENERATESERIES(1, 20), "w", [Value]), [w] > [v])))` is 190; ours BLANK. A bare `[v]` now reads the innermost enclosing row that has it. The walk stops at a measure's or CALCULATE's frame, so a measure body still does not see its caller's row. Tests: `tests/test_issue225_nested_outer_column.py` (24; 15 fail on 0.9.145).
+
+### Fixed — table and column names in another case (issue #226)
+
+DAX names are case-insensitive. Desktop: `SUM(f3[A])` is 42, `MAX(f3[a])` 20, `CALCULATE(SUM(f3[A]), ALL(F3))` 42, `COUNTROWS(FILTER(VALUES(F3[S]), F3[s] = "a"))` 1, `CALCULATE(SUM(F3[A]), FILTER(F3, f3[S] = "a"))` 30; ours BLANK for all. Fixed in:
+- plain aggregates;
+- row references;
+- bare table names;
+- CALCULATE filter keys, ALL / ALLEXCEPT / USERELATIONSHIP / CROSSFILTER and the time-intelligence filters.
+
+Names spelled as the model spells them take the same path as before. Tests: `tests/test_issue226_name_case.py` (73; 69 fail on 0.9.145).
+
+### Fixed — FILTER over either side of a 1:1 relationship (issue #227)
+
+`_hop_keys` treated every 1:1 hop as one -> many. It therefore never selected the other side's blank row for an unmatched key, and the both-ways cross filter then dropped that row. Desktop: `CALCULATE(SUM(FC[A]), FILTER(FC, 1 = 1))` is 30 (ours 10), and `CALCULATE(COUNTROWS(EC), FILTER(EC, 1 = 1))` is 2 (ours 1). A 1:1 hop now runs both branches. Many-to-one, bidirectional and many-to-many hops are unchanged. Tests: `tests/test_issue227_one_to_one_filter.py` (51; 35 fail on 0.9.145).
+
+### Held back — the order Desktop adds Doubles in (issue #228, open)
+
+On small tables Desktop adds Doubles left to right in row order. Ten rows of 0.1 sum to 0.9999999999999999, `SUM = SUMX` there, and 2^53, 1, -2^53 sum to 0. Our SUM and AVERAGE use Python's `sum()`, which compensates from Python 3.12, so they differ there, and they differ between Python versions.
+
+A row-order fold was written and tested. Against the census's Desktop answers on real models, though, it moved 86 measures further from Desktop and 23 nearer. 35 measures had matched Desktop exactly; 2 did with the fold. Example: `SUM(FactSales[SalesAmount])`, a Double column of 199,999 rows:
+- Desktop: 729782919.215398
+- row order: 729782919.215352
+- `sum()`: 729782919.2154
+
+So on large columns Desktop's storage engine adds in some other order (#243). SUM and AVERAGE stay as in 0.9.145 until that order is measured.
+
+Pending for 0.9.147: #228 with #243 and #241 (fixed-decimal sums), PR #205's bounded filter cache (#229), PR #206's speed-ups (#230 - #233), and #234 - #242, found by this release's units and settled by a third battery (`build_b234.py`, 31 probes): EXCEPT / INTERSECT by text, bare column references, a measure body reading its caller's row, TOPNSKIP's direction, a one-sided 1:1's blank row, MOD by 0, Int64 keys past 2^53, fixed-decimal sums, and the ISO basic format on Python 3.10.
+
 ## [0.9.145] - 2026-10-20
 
 Clean-room remediation (#198): part of the text collation 0.9.138 introduced (#185, #180) was derived from Power BI Desktop's engine binary, which `docs/legal-and-cleanroom.md` excludes. It is re-derived in a session that had not seen that material, from Microsoft's published **Windows Server 2008 Sorting Weight Table**, **[MS-UCODEREF] 3.1.5.2** and **black-box Desktop answers** only, and the repository's history from 0.9.138 on is rewritten to carry the clean code. The record, with every rule's evidence and what is still open: `docs/reverse-engineering/experiments/2026-10-19-clean-room-collation.md`.

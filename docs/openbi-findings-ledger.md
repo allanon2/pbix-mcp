@@ -40,8 +40,19 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-20 (0.9.145): docs 1-66 and GitHub issues/PRs #1-#204 are
-closed.** 0.9.145 closes #198: the collation 0.9.138 introduced is re-derived
+**Updated 2026-10-24 (0.9.146): docs 1-66 and GitHub issues/PRs #1-#227 are
+closed except PRs #205 and #206, whose issues #229-#233 are planned for
+0.9.147 with #228 and #234-#243 (follow-ups settled by build_b234.py).** 0.9.146 closes #210-#227: the #203 pushdown's three wrong-answer
+cases (#210), SAMPLE and TOPN as Desktop answers them (#211, #212; PR #208),
+the DataModel stream bounds (#213; PR #209), transient mappings' caches (#214;
+PR #207), memo keys (#215-#220), text matched as text (#221, #222), DISTINCT,
+NOT and nested outer columns (#223-#225), names in another case (#226), 1:1
+FILTER (#227); #228 (row-order Double sums) is held back: on real models it moved
+more measures away from Desktop than nearer (#243). Desktop: build_b210.py (57
+probes) and 173 SAMPLE probes.
+
+As of 0.9.145, docs 1-66 and GitHub issues/PRs #1-#204 were
+closed. 0.9.145 closes #198: the collation 0.9.138 introduced is re-derived
 clean-room -- Microsoft's published Windows Server 2008 sorting weight table,
 [MS-UCODEREF] 3.1.5.2 and black-box Desktop answers (204 new probes) -- and the
 history from 0.9.138 on is rewritten to carry it
@@ -536,6 +547,16 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **GH #210-#227** (PRs #207, #208, #209 by @allanon2; the rest found by the
+  fuzz of #203 and the PR audits) -- CLOSED (0.9.146). Pushdown guards (#210);
+  SAMPLE / TOPN (#211, #212); DataModel stream bounds (#213); filter-cache
+  identity, fingerprint, bare-column owners, signatures, date table, NaN keys,
+  relative dates (#214-#220); Text columns matched as text and text join keys
+  (#221, #222); DISTINCT, NOT T[B], nested outer columns (#223-#225); names in
+  another case (#226); 1:1 FILTER (#227).
+  Desktop: build_b210.py (57), the SAMPLE battery (173). Regression:
+  tests/test_issue210_*.py ... tests/test_issue227_*.py (578 tests).
 
 - **GH #198** -- CLOSED (0.9.145). Part of 0.9.138's collation (#185, #180)
   was derived from Desktop's engine binary; re-derived from the published

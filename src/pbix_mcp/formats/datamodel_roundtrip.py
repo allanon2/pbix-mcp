@@ -9,12 +9,19 @@ Formats supported:
   - Single-threaded XPress9 (signature: "This backup was created using XPress9 compression.")
   - Multi-threaded XPress9  (signature: "This backup was created using multithreaded XPrs9.")
   - Uncompressed ABF (starts with STREAM_STORAGE_SIGNATURE)
+
+Every count and size in a compressed stream's chunk table comes from the
+file, so the whole table is checked against the stream and the bounds below
+before the first chunk is decoded (#213).
 """
 
 import concurrent.futures
 import struct
+from array import array
 
 from xpress9 import Xpress9
+
+from pbix_mcp.errors import DataModelCompressionError
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -34,6 +41,30 @@ STREAM_STORAGE_SIGNATURE = (
 
 # Chunk size used when compressing (2 MiB, same as Power BI)
 COMPRESS_CHUNK_SIZE = 2 * 1024 * 1024
+
+# What a chunk table may declare (#213). The codec commits a chunk's declared
+# size before it decodes anything (measured: asking for 256 MiB from a 4 KB
+# payload committed the 256 MiB) and hands back exactly that many bytes or
+# fails ("Expected X, got Y"), so the declared sizes ARE the output: a few
+# hundred bytes of header could ask for 4 GiB per chunk, or 2^64 groups.
+# Measured envelope, 610 distinct compressed streams (test_samples and the
+# scratch corpus, deduplicated by SHA-1): chunks of 34,728 to 2,097,152
+# bytes, at most 33 per stream, every stream ending exactly at its last
+# chunk; the largest model declares 67,616,768 bytes; ratios 4.4:1 median,
+# 31.4:1 max, 4.2:1 among models over 64 MiB. A model PBIXBuilder writes
+# from one text column of near-identical 16 KB values comes to 92:1, while
+# XPress9 packs 2 MiB of zeros into 186 bytes (11,275:1).
+MAX_CHUNK_UNCOMPRESSED = 16 * 1024 * 1024  # one chunk: 8x the 2 MiB Power BI and we write
+MAX_DECOMPRESSED_BYTES = 16 * 1024 ** 3    # all chunks: 8x the zip guard's 2 GiB member cap
+MAX_RATIO = 1000                           # all chunks per stream byte (11x that 92:1 model),
+RATIO_FLOOR = 64 * 1024 * 1024             # checked only past this total
+
+_SIGNATURE_LEN = 102                         # both compressed formats open with it
+_MULTI_TABLE_START = _SIGNATURE_LEN + 5 * 8  # then multi-threaded has five u64 fields
+_CHUNK_HEADER = 8                            # u32 uncompressed size, u32 payload size
+_END_OF_TABLE = bytes(_CHUNK_HEADER)         # single-threaded: an all-zero header ends it
+_MAX_WORKERS = 16                            # threads decoding session groups
+_MAX_GROUPS_IN_FLIGHT = 32                   # groups queued on them at one time
 
 
 # ---------------------------------------------------------------------------
@@ -57,93 +88,176 @@ def _detect_format(dm_bytes: bytes) -> str:
     )
 
 
-def _decompress_chunks_sequential(data: bytes, offset: int) -> bytearray:
-    """Read (uncompressed_size, compressed_size, payload) pairs and decompress."""
-    result = bytearray()
-    total = len(data)
-    xp = Xpress9()
-    try:
-        while offset < total:
-            if offset + 8 > total:
-                break
-            uncompressed_size = struct.unpack_from("<I", data, offset)[0]
-            compressed_size = struct.unpack_from("<I", data, offset + 4)[0]
-            offset += 8
-            if compressed_size == 0 or offset + compressed_size > total:
-                break
-            chunk = xp.decompress(data[offset : offset + compressed_size], uncompressed_size)
-            result.extend(chunk)
-            offset += compressed_size
-    finally:
-        del xp
-    return result
+class _ChunkTable:
+    """A compressed stream's chunk table, every entry checked: chunk ``i``
+    decodes the ``length[i]`` payload bytes at ``at[i]`` into ``size[i]``
+    bytes, and session group ``g`` (one codec context, decoded in order) is
+    chunks ``first[g]`` up to ``first[g + 1]``.
+
+    Flat arrays rather than a tuple per chunk: a hostile table of minimal
+    9-byte entries costs about 20 bytes per entry here instead of ~120."""
+
+    __slots__ = ("size", "at", "length", "first")
+
+    def __init__(self) -> None:
+        self.size = array("I")
+        self.at = array("Q")
+        self.length = array("I")
+        self.first = array("Q", [0])
+
+    @property
+    def group_count(self) -> int:
+        return len(self.first) - 1
+
+    def chunks_of(self, g: int) -> range:
+        return range(self.first[g], self.first[g + 1])
+
+    def payload(self, dm: bytes, i: int) -> bytes:
+        return dm[self.at[i] : self.at[i] + self.length[i]]
+
+    def add_chunk(self, dm: bytes, off: int) -> int:
+        """Check the entry at ``off`` against the stream and the per-chunk
+        bound, record it, and return the offset after it."""
+        if off + _CHUNK_HEADER > len(dm):
+            raise DataModelCompressionError(
+                f"DataModel stream ends inside the chunk header at byte "
+                f"{off:,} of {len(dm):,} (truncated file?)")
+        us, cs = struct.unpack_from("<II", dm, off)
+        if us == 0 or cs == 0:
+            # the codec answers b"" for any payload asked for 0 bytes, so an
+            # empty entry decodes nothing and costs a decode task each
+            raise DataModelCompressionError(
+                f"DataModel chunk at byte {off:,} is empty ({us:,} bytes "
+                f"uncompressed from a {cs:,}-byte payload)")
+        if us > MAX_CHUNK_UNCOMPRESSED:
+            raise DataModelCompressionError(
+                f"DataModel chunk at byte {off:,} declares {us:,} bytes "
+                f"uncompressed; at most {MAX_CHUNK_UNCOMPRESSED:,} are accepted")
+        at = off + _CHUNK_HEADER
+        end: int = at + cs
+        if end > len(dm):
+            raise DataModelCompressionError(
+                f"DataModel chunk at byte {off:,} has a {cs:,}-byte payload "
+                f"that runs past the end of the {len(dm):,}-byte stream "
+                f"(truncated file?)")
+        self.size.append(us)
+        self.at.append(at)
+        self.length.append(cs)
+        return end
+
+    def end_group(self) -> None:
+        self.first.append(len(self.size))
 
 
-def _decompress_chunk_group(group: list[tuple[int, bytes]]) -> bytearray:
-    """Decompress a list of (uncompressed_size, compressed_data) tuples using one Xpress9 context."""
+def _read_chunk_table(dm: bytes, fmt: str) -> _ChunkTable:
+    """The checked chunk table of a compressed stream -- the one parser every
+    reader goes through. Refuses with DataModelCompressionError, before any
+    chunk is decoded, a table the stream cannot hold or the module bounds do
+    not allow."""
+    table = _ChunkTable()
+    if fmt == "single_threaded":
+        # One session: entries to the end of the stream. An all-zero header
+        # also ends it (where the reader always stopped). Any other entry cut
+        # short or running past the end is a truncated file, which the reader
+        # used to stop at silently, handing back a cut-short ABF.
+        off = _SIGNATURE_LEN
+        while off < len(dm) and dm[off : off + _CHUNK_HEADER] != _END_OF_TABLE:
+            off = table.add_chunk(dm, off)
+        if len(table.size):
+            table.end_group()
+    elif fmt == "multi_threaded":
+        if len(dm) < _MULTI_TABLE_START:
+            raise DataModelCompressionError(
+                f"multi-threaded DataModel stream is {len(dm):,} bytes, "
+                f"shorter than its {_MULTI_TABLE_START}-byte header")
+        (main_per_group, prefix_per_group, prefix_groups, main_groups,
+         _chunk_size) = struct.unpack_from("<5Q", dm, _SIGNATURE_LEN)
+        # Two rectangles, prefix then main, each `groups` session groups of
+        # `per_group` chunks. Every entry takes at least a header, so the
+        # declared PRODUCTS (Python ints, no wrap-around) must fit in the
+        # bytes left; that bounds the loops below by the stream's length.
+        declared = prefix_groups * prefix_per_group + main_groups * main_per_group
+        room = (len(dm) - _MULTI_TABLE_START) // _CHUNK_HEADER
+        if declared > room:
+            raise DataModelCompressionError(
+                f"DataModel header declares {declared:,} chunks; the "
+                f"{len(dm):,}-byte stream has room for at most {room:,}")
+        off = _MULTI_TABLE_START
+        for per_group, groups in ((prefix_per_group, prefix_groups),
+                                  (main_per_group, main_groups)):
+            if not per_group:
+                continue  # groups of no chunks hold nothing, whatever their count
+            for _ in range(groups):
+                for _ in range(per_group):
+                    off = table.add_chunk(dm, off)
+                table.end_group()
+    else:
+        raise ValueError(f"no chunk table in format {fmt!r}")
+
+    total = sum(table.size)
+    if total > MAX_DECOMPRESSED_BYTES:
+        raise DataModelCompressionError(
+            f"DataModel chunks declare {total:,} bytes uncompressed; "
+            f"at most {MAX_DECOMPRESSED_BYTES:,} are accepted")
+    if total > max(RATIO_FLOOR, MAX_RATIO * len(dm)):
+        raise DataModelCompressionError(
+            f"DataModel chunks declare {total:,} bytes uncompressed from a "
+            f"{len(dm):,}-byte stream, over {MAX_RATIO:,}:1")
+    return table
+
+
+def _decompress_chunk_group(dm: bytes, table: _ChunkTable, g: int) -> list[bytes]:
+    """Decode session group ``g`` with one Xpress9 context: its chunks chain
+    one LZ77 window, so they decode in order, in one context."""
     xp = Xpress9()
-    out = bytearray()
     try:
-        for uncompressed_size, compressed_data in group:
-            out.extend(xp.decompress(compressed_data, uncompressed_size))
+        parts = []
+        for i in table.chunks_of(g):
+            try:
+                parts.append(xp.decompress(table.payload(dm, i), table.size[i]))
+            except ValueError as err:  # the codec's "Decompression failed: ..."
+                raise DataModelCompressionError(
+                    f"DataModel chunk at byte {table.at[i] - _CHUNK_HEADER:,} "
+                    f"(session group {g + 1:,} of {table.group_count:,}) did "
+                    f"not decode: {err}") from err
+        return parts
     finally:
         del xp
+
+
+def _decompress_groups(dm: bytes, table: _ChunkTable) -> list[bytes]:
+    """Every chunk decoded, in stream order.
+
+    Session groups are independent, so several decode at once -- but on at
+    most _MAX_WORKERS threads with at most _MAX_GROUPS_IN_FLIGHT queued, the
+    next group submitted as one finishes, and the first failure cancels the
+    rest. The pool used to take every group up front and decode all of them
+    even after one had failed. Hybrid-reuse containers declare one group per
+    tail chunk, so the count can reach the hundreds on a large model: it is a
+    GROUPING, not a concurrency requirement."""
+    n = table.group_count
+    if n <= 1:
+        return _decompress_chunk_group(dm, table, 0) if n else []
+    decoded: list[list[bytes] | None] = [None] * n
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=min(n, _MAX_WORKERS))
+    try:
+        pending: dict[concurrent.futures.Future[list[bytes]], int] = {}
+        queued = 0
+        while queued < n or pending:
+            while queued < n and len(pending) < _MAX_GROUPS_IN_FLIGHT:
+                pending[pool.submit(_decompress_chunk_group, dm, table, queued)] = queued
+                queued += 1
+            finished, _ = concurrent.futures.wait(
+                pending, return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in finished:
+                decoded[pending.pop(fut)] = fut.result()
+    finally:
+        # after a failure: drop what is still queued, let the running few end
+        pool.shutdown(wait=True, cancel_futures=True)
+    out: list[bytes] = []
+    for parts in decoded:
+        out.extend(parts or ())
     return out
-
-
-def _decompress_multi_threaded(data: bytes) -> bytearray:
-    """Handle the multi-threaded XPress9 format."""
-    off = 102
-
-    main_chunks_per_thread = struct.unpack_from("<Q", data, off)[0];   off += 8
-    prefix_chunks_per_thread = struct.unpack_from("<Q", data, off)[0]; off += 8
-    prefix_thread_count = struct.unpack_from("<Q", data, off)[0];      off += 8
-    main_thread_count = struct.unpack_from("<Q", data, off)[0];        off += 8
-    _chunk_uncompressed_size = struct.unpack_from("<Q", data, off)[0]; off += 8
-
-    result = bytearray()
-
-    def _read_chunks(count):
-        nonlocal off
-        chunks = []
-        for _ in range(count):
-            us = struct.unpack_from("<I", data, off)[0]; off += 4
-            cs = struct.unpack_from("<I", data, off)[0]; off += 4
-            cd = data[off : off + cs]; off += cs
-            chunks.append((us, cd))
-        return chunks
-
-    def _process_groups(chunks, chunks_per_thread, thread_count):
-        groups = [
-            chunks[i * chunks_per_thread : (i + 1) * chunks_per_thread]
-            for i in range(thread_count)
-        ]
-        # Cap the pool: hybrid-reuse containers declare one thread-group per
-        # tail chunk, so thread_count can reach the hundreds on a large model
-        # — the declared count is a GROUPING, not a concurrency requirement.
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, min(thread_count, 16))) as pool:
-            futures = {pool.submit(_decompress_chunk_group, g): idx for idx, g in enumerate(groups)}
-            ordered = [None] * len(groups)
-            for fut in concurrent.futures.as_completed(futures):
-                ordered[futures[fut]] = fut.result()
-        out = bytearray()
-        for part in ordered:
-            if part:
-                out.extend(part)
-        return out
-
-    # Prefix chunks
-    if prefix_thread_count > 0 and prefix_chunks_per_thread > 0:
-        prefix_chunks = _read_chunks(prefix_thread_count * prefix_chunks_per_thread)
-        result.extend(_process_groups(prefix_chunks, prefix_chunks_per_thread, prefix_thread_count))
-
-    # Main chunks
-    if main_thread_count > 0 and main_chunks_per_thread > 0:
-        main_chunks = _read_chunks(main_thread_count * main_chunks_per_thread)
-        result.extend(_process_groups(main_chunks, main_chunks_per_thread, main_thread_count))
-
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -163,19 +277,23 @@ def decompress_datamodel(dm_bytes: bytes) -> bytes:
     -------
     bytes
         The decompressed ABF (Analysis Backup Format) binary blob.
+
+    Raises
+    ------
+    DataModelCompressionError
+        The chunk table does not fit the stream or declares more than the
+        module bounds allow (checked before anything is decoded), or a chunk
+        does not decode.
     """
     fmt = _detect_format(dm_bytes)
 
     if fmt == "uncompressed":
         return bytes(dm_bytes)
 
-    if fmt == "single_threaded":
-        return bytes(_decompress_chunks_sequential(dm_bytes, 102))
-
-    if fmt == "multi_threaded":
-        return bytes(_decompress_multi_threaded(dm_bytes))
-
-    raise ValueError(f"Unsupported format: {fmt}")
+    table = _read_chunk_table(dm_bytes, fmt)
+    # one copy into the result; extending a bytearray and then taking
+    # bytes() of it made two (peak ~3x the ABF, now ~2x)
+    return b"".join(_decompress_groups(dm_bytes, table))
 
 
 def _compress_single_threaded(abf_bytes: bytes, chunk_size: int) -> bytes:
@@ -205,23 +323,6 @@ def _compress_single_threaded(abf_bytes: bytes, chunk_size: int) -> bytes:
     return b"".join(parts)
 
 
-def _parse_single_threaded_chunks(dm_bytes: bytes) -> list[tuple[int, bytes]]:
-    """The (uncompressed_size, compressed_payload) chunk table of a
-    single-threaded DataModel stream."""
-    chunks: list[tuple[int, bytes]] = []
-    offset = 102
-    total = len(dm_bytes)
-    while offset + 8 <= total:
-        u = struct.unpack_from("<I", dm_bytes, offset)[0]
-        c = struct.unpack_from("<I", dm_bytes, offset + 4)[0]
-        offset += 8
-        if c == 0 or offset + c > total:
-            break
-        chunks.append((u, dm_bytes[offset : offset + c]))
-        offset += c
-    return chunks
-
-
 def _common_prefix_len(a: bytes, b: bytes) -> int:
     n = min(len(a), len(b))
     lo, step = 0, 1 << 20
@@ -237,37 +338,15 @@ def _common_prefix_len(a: bytes, b: bytes) -> int:
 def _parse_session_groups(dm_bytes: bytes) -> list[list[tuple[int, bytes]]]:
     """The stream's chunks partitioned into SESSION groups — the units a
     decoder context consumes whole. A single-threaded stream is one session;
-    a multi-threaded stream has one session per thread-group."""
+    a multi-threaded stream has one session per thread-group. Read through
+    the same checked chunk table as decompress_datamodel, so the save path
+    (_compress_hybrid_reuse) never loops over a count the stream cannot hold."""
     fmt = _detect_format(dm_bytes)
-    if fmt == "single_threaded":
-        chunks = _parse_single_threaded_chunks(dm_bytes)
-        return [chunks] if chunks else []
-    if fmt != "multi_threaded":
+    if fmt == "uncompressed":
         raise ValueError(f"no session groups in format {fmt!r}")
-
-    off = 102
-    main_cpt = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
-    prefix_cpt = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
-    prefix_tc = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
-    main_tc = struct.unpack_from("<Q", dm_bytes, off)[0]; off += 8
-    off += 8  # chunk uncompressed size
-
-    def _read(count):
-        nonlocal off
-        out = []
-        for _ in range(count):
-            us = struct.unpack_from("<I", dm_bytes, off)[0]; off += 4
-            cs = struct.unpack_from("<I", dm_bytes, off)[0]; off += 4
-            out.append((us, dm_bytes[off : off + cs]))
-            off += cs
-        return out
-
-    groups: list[list[tuple[int, bytes]]] = []
-    for _ in range(prefix_tc):
-        groups.append(_read(prefix_cpt))
-    for _ in range(main_tc):
-        groups.append(_read(main_cpt))
-    return [g for g in groups if g]
+    table = _read_chunk_table(dm_bytes, fmt)
+    return [[(table.size[i], table.payload(dm_bytes, i)) for i in table.chunks_of(g)]
+            for g in range(table.group_count)]
 
 
 def _compress_hybrid_reuse(abf_bytes: bytes, original_dm: bytes,
@@ -394,7 +473,8 @@ def compress_datamodel(abf_bytes: bytes, chunk_size: int = COMPRESS_CHUNK_SIZE,
     abf_bytes : bytes
         The raw ABF blob.
     chunk_size : int, optional
-        Chunk size for compression.  Defaults to 2 MiB (matching Power BI).
+        Chunk size for compression.  Defaults to 2 MiB (matching Power BI);
+        at most MAX_CHUNK_UNCOMPRESSED, the largest chunk the reader accepts.
     original_dm : bytes, optional
         The DataModel bytes this ABF was decompressed from, when the caller
         is round-tripping an edit. Enables chunk reuse.
@@ -404,8 +484,14 @@ def compress_datamodel(abf_bytes: bytes, chunk_size: int = COMPRESS_CHUNK_SIZE,
     bytes
         DataModel bytes ready to be stored in a PBIX ZIP.
     """
+    if not 1 <= chunk_size <= MAX_CHUNK_UNCOMPRESSED:
+        # 0 or less never advanced through the ABF (an endless loop of empty
+        # chunks); past the bound, decompress_datamodel would refuse the file
+        raise ValueError(
+            f"chunk_size must be 1 to {MAX_CHUNK_UNCOMPRESSED:,} bytes (the "
+            f"largest chunk decompress_datamodel accepts); got {chunk_size:,}")
     try:
-        return _compress_single_threaded(abf_bytes, chunk_size)
+        out = _compress_single_threaded(abf_bytes, chunk_size)
     except ValueError as primary_err:
         if "not effective" not in str(primary_err):
             raise
@@ -413,7 +499,9 @@ def compress_datamodel(abf_bytes: bytes, chunk_size: int = COMPRESS_CHUNK_SIZE,
         if original_dm is not None:
             try:
                 return _compress_hybrid_reuse(abf_bytes, original_dm, chunk_size)
-            except ValueError:
+            except (ValueError, DataModelCompressionError):
+                # an original the reader refuses or cannot decode (#213)
+                # falls through like a failed re-encode, not out of the save
                 pass  # fall through to the uncompressed format
 
         # Uncompressed ABF: recognized by every reader of this entry
@@ -431,3 +519,14 @@ def compress_datamodel(abf_bytes: bytes, chunk_size: int = COMPRESS_CHUNK_SIZE,
             "and the ABF blob does not carry STREAM_STORAGE_SIGNATURE for "
             "the uncompressed fallback. Original error: " + str(primary_err)
         ) from primary_err
+
+    # What we write passes our own reader's bounds, so a saved file always
+    # reopens here: a header walk, nothing decoded (the hybrid path above
+    # decodes its output in full anyway).
+    try:
+        _read_chunk_table(out, "single_threaded")
+    except DataModelCompressionError as err:
+        raise DataModelCompressionError(
+            "refusing to write a DataModel stream that decompress_datamodel "
+            f"would not read back: {err.message}") from err
+    return out

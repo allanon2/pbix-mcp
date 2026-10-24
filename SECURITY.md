@@ -44,6 +44,9 @@ following inputs as **untrusted** and validates them:
   XPRESS9 codec treat every length, offset, and count field in a file as
   untrusted: sizes are bound-checked before allocation and malformed input fails
   closed (a clear error) rather than over-allocating or reading out of bounds.
+  A DataModel stream's XPress9 chunk table is checked against the stream, and
+  the output it declares against absolute and compression-ratio bounds, before
+  the first chunk is decoded.
 - **Working / temp directories** — each open file gets its own working directory
   created with a secure API (unpredictable name, not shared across files) and
   removed after use; nothing is written to a predictable shared temp path.

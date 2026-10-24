@@ -13267,6 +13267,7 @@ def _evaluate_calc_table_partition(query_definition: str, abf, meta) -> tuple:
     data — minutes of work, and the source of a hang this project already had.
     """
     from pbix_mcp.dax.calc_tables import evaluate_calc_table_expression
+    from pbix_mcp.dax.engine import transient_tables
     from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
 
     expr = (query_definition or "").strip()
@@ -13275,7 +13276,9 @@ def _evaluate_calc_table_partition(query_definition: str, abf, meta) -> tuple:
 
     referenced = {m.group(1) or m.group(2)
                   for m in _DAX_TABLE_REF_RE.finditer(expr)}
-    tables: dict = {}
+    # Built for this one evaluation: it carries its own filter cache rather
+    # than taking a slot from the open models' (issue #214).
+    tables: dict = transient_tables()
     for name in referenced:
         try:
             td = read_table_from_abf(abf, name, meta)
