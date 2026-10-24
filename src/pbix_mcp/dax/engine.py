@@ -2818,6 +2818,37 @@ def _shared_filter_cache(tables) -> dict:
     return hit
 
 
+_ROW_META = ('__table__', '__column__', '__value__', '__blank_row__', '__parts__', '__row__')
+
+
+def _current_row_column(row: dict, name: str):
+    """``(found, value)`` of the column ``name`` in a row dict: its own key, the
+    same name in another case (DAX names ignore case), or the single column a
+    ``__column__``/``__value__`` row carries (CALENDAR, VALUES)."""
+    if name in row:
+        return True, row[name]
+    low = name.lower()
+    for k, v in row.items():
+        if k not in _ROW_META and isinstance(k, str) and k.lower() == low:
+            return True, v
+    col = row.get('__column__')
+    if isinstance(col, str) and '__value__' in row and col.lower() == low:
+        return True, row['__value__']
+    return False, None
+
+
+def _named_columns(row) -> dict:
+    """A result row's columns by name: a single-column row's ``__column__`` /
+    ``__value__`` spelled out, the other meta keys dropped."""
+    if not isinstance(row, dict):
+        return {'Value': row}
+    out = {k: v for k, v in row.items() if k not in _ROW_META}
+    col = row.get('__column__')
+    if isinstance(col, str) and '__value__' in row and col not in out:
+        out[col] = row['__value__']
+    return out
+
+
 def _extremum(cur, cand, want_max: bool):
     """Running MAX/MIN across the types DAX's MAXX/MINX accept.
 
@@ -6773,9 +6804,10 @@ class DAXEngine:
                         f"found or may not be used in this expression")
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
-                    return ctx._current_row[data]
+                if ctx._current_row and not self._measure_exists(data, ctx):
+                    found, val = _current_row_column(ctx._current_row, data)
+                    if found:
+                        return val
                 if not self._measure_exists(data, ctx):
                     # An enclosing row context's own column (issue #225).
                     found, val = self._outer_row_value(data, ctx)
@@ -6852,9 +6884,10 @@ class DAXEngine:
             if kind == _P_VARRET:
                 return self._eval_var_return(data, ctx, var_scope)
             if kind == _P_BRACKET2:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
-                    return ctx._current_row[data]
+                if ctx._current_row and not self._measure_exists(data, ctx):
+                    found, val = _current_row_column(ctx._current_row, data)
+                    if found:
+                        return val
                 if not self._measure_exists(data, ctx):
                     found, val = self._outer_row_value(data, ctx)
                     if found:
@@ -12170,31 +12203,24 @@ class DAXEngine:
 
     def _fn_generate(self, args_str: str, ctx: DAXContext) -> Any:
         """GENERATE(table1, table2_expr) — like CROSS APPLY (inner join behavior)."""
-        args = self._split_args(args_str)
-        if len(args) < 2:
-            return []
-        table_ref = self._eval_expr(args[0].strip(), ctx)
-        if not isinstance(table_ref, list):
-            return []
-        result = []
-        for row_item in table_ref:
-            if isinstance(row_item, dict) and '__table__' in row_item:
-                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-            else:
-                row_ctx = ctx
-            inner = self._eval_expr(args[1].strip(), row_ctx)
-            if isinstance(inner, list) and inner:
-                for inner_item in inner:
-                    merged = {}
-                    if isinstance(row_item, dict):
-                        merged.update(row_item)
-                    if isinstance(inner_item, dict):
-                        merged.update({f"_inner_{k}": v for k, v in inner_item.items()})
-                    result.append(merged)
-        return result
+        return self._generate(args_str, ctx, keep_empty=False)
 
     def _fn_generateall(self, args_str: str, ctx: DAXContext) -> Any:
         """GENERATEALL(table1, table2_expr) — like CROSS APPLY (includes empty inner)."""
+        return self._generate(args_str, ctx, keep_empty=True)
+
+    def _generate(self, args_str: str, ctx: DAXContext, keep_empty: bool) -> Any:
+        """Each row of table1 with each row table2_expr gives in its row context. A result row has both sides'
+        columns under their own names (a single-column row's ``__column__``/``__value__`` spelled out), keeps
+        table1's own keys and each side's row as a part (``__parts__``), as CROSSJOIN does, so T[C] still reads
+        table1's columns and a context transition filters them. A name both sides have is refused, as DAX refuses a repeated column."""
+        from pbix_mcp.errors import DAXEvaluationError
+
+        def parts(item) -> tuple:
+            if not isinstance(item, dict):
+                return ()
+            return tuple(item.get('__parts__') or (item,))
+
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
@@ -12203,22 +12229,28 @@ class DAXEngine:
             return []
         result = []
         for row_item in table_ref:
-            if isinstance(row_item, dict) and '__table__' in row_item:
+            if isinstance(row_item, dict) and ('__table__' in row_item or '__parts__' in row_item):
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+            elif isinstance(row_item, dict):
+                row_ctx = self._transitioned_ctx(ctx, {})
+                row_ctx._current_row = row_item
+                row_ctx._outer_ctx = ctx
             else:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
+            outer = _named_columns(row_item)
+            # table1's own keys stay (__table__ included), as CROSSJOIN keeps them: T[C] resolves through them.
+            own = {k: v for k, v in row_item.items() if k != '__parts__'} if isinstance(row_item, dict) else {}
             if isinstance(inner, list) and inner:
                 for inner_item in inner:
-                    merged = {}
-                    if isinstance(row_item, dict):
-                        merged.update(row_item)
-                    if isinstance(inner_item, dict):
-                        merged.update({f"_inner_{k}": v for k, v in inner_item.items()})
-                    result.append(merged)
-            else:
-                # GENERATEALL keeps rows even when inner is empty
-                result.append(row_item if isinstance(row_item, dict) else {'__value__': row_item})
+                    named = _named_columns(inner_item)
+                    clash = {k.lower() for k in outer} & {k.lower() for k in named}
+                    if clash:
+                        raise DAXEvaluationError(
+                            f"GENERATE: a column named '{sorted(clash)[0]}' comes from both tables")
+                    result.append({**own, **outer, **named, '__parts__': parts(row_item) + parts(inner_item)})
+            elif keep_empty:
+                result.append({**own, **outer, '__parts__': parts(row_item)})
         return result
 
     def _fn_generateseries(self, args_str: str, ctx: DAXContext) -> Any:
