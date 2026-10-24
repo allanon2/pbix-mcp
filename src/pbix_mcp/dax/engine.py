@@ -2486,7 +2486,8 @@ class _FilterIndexCache(dict):
     row-expansion memos) carry bounds of their own."""
 
     def __init__(self, tables):
-        super().__init__(__tables_ref__=tables)
+        # a transient mapping's (tables None) holds no reference back to it (#214)
+        super().__init__(() if tables is None else {'__tables_ref__': tables})
         self.weight = 0       # the filter-named entries'
         self.pinned = 0       # the structural entries'
 
@@ -2512,7 +2513,8 @@ class _FilterIndexCache(dict):
         else:
             for k in [k for k in dict.keys(self) if _cache_kind(k) not in _STRUCTURAL_KINDS]:
                 dict.__delitem__(self, k)
-        dict.__setitem__(self, '__tables_ref__', tables)
+        if tables is not None:
+            dict.__setitem__(self, '__tables_ref__', tables)
         self.weight = 0
 
 
@@ -2824,7 +2826,9 @@ _ROW_META = ('__table__', '__column__', '__value__', '__blank_row__', '__parts__
 def _current_row_column(row: dict, name: str):
     """``(found, value)`` of the column ``name`` in a row dict: its own key, the
     same name in another case (DAX names ignore case), or the single column a
-    ``__column__``/``__value__`` row carries (CALENDAR, VALUES)."""
+    ``__column__``/``__value__`` row carries (CALENDAR, VALUES). A SELECTCOLUMNS
+    row (_ColumnsRow) carries its source's ``__column__`` as lineage only, so an
+    enclosing row's column of that name is the one meant (#225)."""
     if name in row:
         return True, row[name]
     low = name.lower()
@@ -2832,7 +2836,8 @@ def _current_row_column(row: dict, name: str):
         if k not in _ROW_META and isinstance(k, str) and k.lower() == low:
             return True, v
     col = row.get('__column__')
-    if isinstance(col, str) and '__value__' in row and col.lower() == low:
+    if (isinstance(col, str) and '__value__' in row and col.lower() == low
+            and not isinstance(row, _ColumnsRow)):
         return True, row['__value__']
     return False, None
 
@@ -3513,12 +3518,14 @@ class DAXContext:
         hit = self._filter_idx_cache.get(key)
         if hit is None:
             vmap = self._value_index_map(tbl, fact_idx)
+            # a text key compares as text: no numeric spellings into a text column (#222)
+            numeric = not self._text_column(tbl, fact_idx)
             hit = _Weighed()
             held = 0
             for r in src_tbl['rows']:
                 keys: set = set()
                 for a in _join_key_aliases(r[dim_idx] if dim_idx < len(r) else None):
-                    keys.update(_index_spellings(a))
+                    keys.update(_index_spellings(a, numeric))
                 found = [vmap[k] for k in keys if k in vmap]
                 rows = found[0] if len(found) == 1 else frozenset().union(*found)
                 held += len(rows) + 1
