@@ -138,6 +138,35 @@ class TestConversions:
         with pytest.raises(MError, match="de-DE"):
             self.transform(['"1,5"'], "type number", '"de-DE"')
 
+    def test_en_au_reads_day_first(self):
+        # As a Desktop refresh reads them with an explicit "en-AU" culture.
+        assert self.transform(['"20/11/2015 10:59:30 pm"', '"5/1/2015"', '"20/11/15"', '"20-11-2015 10:59"',
+                               '"20.11.2015"', '"2015/11/20"', '"Friday, 20 November 2015 10:59:30 AM"'],
+                              "type datetime", '"en-AU"') == [
+            dt.datetime(2015, 11, 20, 22, 59, 30), dt.datetime(2015, 1, 5), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 10, 59), dt.datetime(2015, 11, 20), dt.datetime(2015, 11, 20),
+            dt.datetime(2015, 11, 20, 10, 59, 30)]
+        assert self.transform(['"20/11/49"', '"20/11/50"'], "type date", '[Culture="en-AU"]') == [
+            dt.date(2049, 11, 20), dt.date(1950, 11, 20)]
+
+    @pytest.mark.parametrize("text, culture", [("11/20/2015", "en-AU"), ("20/11/2015", "en-US"),
+                                               ("Saturday, 20 November 2015", "en-AU"), ("20/11/2015 24:00", "en-AU")])
+    def test_a_date_in_the_other_order_or_a_wrong_day_name_is_an_error(self, text, culture):
+        [cell] = self.transform([f'"{text}"'], "type datetime", f'"{culture}"')
+        assert isinstance(cell, CellError) and cell.error.reason == "DataFormat.Error"
+
+    def test_en_us_reads_dashes_dots_and_its_long_date(self):
+        assert self.transform(['"11-20-2015"', '"11.20.2015"', '"2015/11/20"', '"Friday, November 20, 2015"'],
+                              "type datetime") == [dt.datetime(2015, 11, 20)] * 4
+
+    def test_en_au_writes_day_first_with_a_two_digit_month(self):
+        cells = ['#datetime(2015, 1, 5, 13, 5, 9)', '#date(5, 1, 1)', '1234.5']
+        assert self.transform(cells, "type text", '"en-AU"') == ["5/01/2015 1:05:09 PM", "1/01/0005", "1234.5"]
+        assert self.transform(cells, "type text") == ["1/5/2015 1:05:09 PM", "1/1/0005", "1234.5"]
+
+    def test_en_au_reads_numbers_as_en_us(self):
+        assert self.transform(['"$1,000"', '"(1,000)"', '"12.5%"'], "type number", '"en-AU"') == [1000, -1000, 0.125]
+
     def test_a_missing_column_is_an_error(self):
         with pytest.raises(MError, match="column 'x'"):
             evaluate('Table.TransformColumnTypes(#table({"c"}, {}), {{"x", type text}})')

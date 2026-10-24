@@ -155,18 +155,18 @@ def _promote_headers(table: Any, options: Any = None) -> Table:
     ColumnN name. As a Desktop refresh shows (#104's probes): an empty name stays empty, and a name already taken
     gets "_<n>" with one counter across the table, counting on until the name is free ("a", "a", "a_1" become
     a, a_1, a_1_2; "a", "a_1", "a" become a, a_1, a_2; "a", "a", "b", "a" become a, a_1, b, a_2)."""
+    from .library import CULTURES, to_text
     t = _need_table(table, "Table.PromoteHeaders")
-    all_scalars = False
+    all_scalars, culture = False, None
     if options is not None:
         if not isinstance(options, Record) or any(k not in ("PromoteAllScalars", "Culture") for k in options.fields):
             raise _error("Table.PromoteHeaders: only the PromoteAllScalars and Culture options are known.")
         all_scalars = bool(options["PromoteAllScalars"]) if "PromoteAllScalars" in options else False
         culture = options["Culture"] if "Culture" in options else None
-        if culture not in (None, "en-US"):
+        if culture is not None and culture not in CULTURES:
             raise _error(f"Table.PromoteHeaders: the culture {culture!r} isn't supported yet.")
     if not t.rows:
         return Table(list(t.columns), [], list(t.types))
-    from .library import to_text
     first = []
     for i, cell in enumerate(t.rows[0]):
         v = force(cell)
@@ -174,7 +174,7 @@ def _promote_headers(table: Any, options: Any = None) -> Table:
             first.append(v)
         elif v is not None and (all_scalars and kind_of(v) in _SCALARS or
                                 isinstance(v, (int, float)) and not isinstance(v, bool)):
-            first.append(to_text(v, "en-US"))
+            first.append(to_text(v, culture or "en-US"))
         else:
             first.append(t.columns[i])
     names: list[str] = []
