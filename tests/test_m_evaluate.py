@@ -183,6 +183,16 @@ class TestConversions:
         assert self.transform(['"20 Nov"', '"20.11.15"'], "type date", '"en-AU"') == [dt.date(2026, 11, 20),
                                                                                       dt.date(2015, 11, 20)]
 
+    def test_a_time_after_a_month_name_and_a_short_year(self):
+        # .NET's DateTime.TryParse (not a Desktop refresh): the date's numbers are spent once it is read, and a
+        # second AM/PM after a number is skipped with that number ("10 PM,5 PM" is 22:00); a second AM/PM on its
+        # own ("10:59 PM PM") fails.
+        cells = self.transform(['"20/Nov/15 5 PM"', '"20 Nov 15 10:59"', '"20/11/2015 10 PM,5 PM"',
+                                '"20/11/2015 10:59 PM PM"'], "type datetime", '"en-AU"')
+        assert cells[:3] == [dt.datetime(2015, 11, 20, 17), dt.datetime(2015, 11, 20, 10, 59),
+                             dt.datetime(2015, 11, 20, 22)]
+        assert isinstance(cells[3], CellError)
+
     @pytest.mark.parametrize("text", ["2015-11-20 10:59 GMT", "20/11/2015 10:59 +10:00", "2015-11-20T10:59:00Z"])
     def test_a_time_zone_is_refused(self, text):
         [cell] = self.transform([f'"{text}"'], "type datetime", '"en-AU"')

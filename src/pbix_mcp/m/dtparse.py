@@ -473,7 +473,12 @@ def _default_year(r: _Result) -> None:
 
 
 def _terminal(state: int, r: _Result, raw: _Raw, c: DateCulture) -> None:
-    """ProcessTerminalState: fill the result from the numbers read so far."""
+    """ProcessTerminalState: fill the result from the numbers read so far, then start the numbers again."""
+    _fill(state, r, raw, c)
+    raw.nums = []
+
+
+def _fill(state: int, r: _Result, raw: _Raw, c: DateCulture) -> None:
     n = raw.nums
     if state == DX_NN:
         _no_date_yet(r)
@@ -558,8 +563,6 @@ def _terminal(state: int, r: _Result, raw: _Raw, c: DateCulture) -> None:
         r.have_time = True
     elif state in (DX_DS, TX_TS, DX_DSN, DX_NDS, DX_NNDS):
         raise _Fail                                  # date and time suffixes: no culture here has them
-    if state > ERROR:
-        raw.nums = []
 
 
 def _fraction(s: _Str) -> tuple[float, int]:
@@ -602,7 +605,7 @@ def _lex(state: int, s: _Str, raw: _Raw, r: _Result, c: DateCulture) -> int:
                 return T_YEAR_END
             if sep in (SEP_AM, SEP_PM):
                 if raw.time_mark != _TM_NOT_SET:
-                    raise _Fail
+                    return T_UNK                     # a second AM/PM: .NET notes a failure it never reads
                 raw.time_mark = _TM_AM if sep == SEP_AM else _TM_PM
                 return T_YEAR_SPACE
             if sep == SEP_SPACE:
@@ -621,7 +624,7 @@ def _lex(state: int, s: _Str, raw: _Raw, r: _Result, c: DateCulture) -> int:
             return T_NUM_END
         if sep in (SEP_AM, SEP_PM):
             if raw.time_mark != _TM_NOT_SET:
-                raise _Fail
+                return T_UNK                         # as above: the number is dropped and the parse goes on
             raw.time_mark = _TM_AM if sep == SEP_AM else _TM_PM
             if state == D_NN:                         # "1/10 5 AM"
                 _terminal(DX_NN, r, raw, c)
