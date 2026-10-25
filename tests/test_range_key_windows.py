@@ -393,3 +393,20 @@ def test_own_column_planted_defects_are_seen(plant, monkeypatch, grouped):
     change = {"base ignored": _base_ignored, "a BLANK group admitted": _blank_group_own}[plant]
     monkeypatch.setattr(de.DAXEngine, "_key_own_aggregate", _own_plant(change))
     assert _differential(tables, OWN, rels, cells, repeat=1) != [], plant
+
+
+def test_own_column_under_a_date_part_userelationship(grouped, own_answers):
+    """A USERELATIONSHIP context keeps the date-part joins of the set it came
+    from, and a context made afresh takes the set's own: a base read through
+    without_filters joined F's 12:30 ships by date part where the scan joins
+    them by value (MIN 2 where the scan says 200; the review of c9ad9c7).
+    The route steps aside there, as _range_aggregate does."""
+    from tests.test_issue231_aggregate_memo import DP_RELS, _dp_model
+    tables = _dp_model()
+    days = [r[0] for r in tables["Cal"]["rows"]]
+    ms = {"MinV": "CALCULATE(MIN(F[v]), USERELATIONSHIP(F[Ship], Cal[Date]))",
+          "MaxV": "CALCULATE(MAX(F[v]), USERELATIONSHIP(F[Ship], Cal[Date]))",
+          "Inner": "CALCULATE(CALCULATE(MIN(F[v]), USERELATIONSHIP(F[Ship], Cal[Date])), Cal[Date] = DATE(2024, 1, 3))"}
+    cells = [(m, fc, {}) for m in ms for k in range(1, 5)
+             for fc in ({"F.pk": G([k]), "Cal.Date": [days[2]]}, {"F.pk": G([k])})]
+    assert _differential(tables, ms, DP_RELS, cells, repeat=1) == []

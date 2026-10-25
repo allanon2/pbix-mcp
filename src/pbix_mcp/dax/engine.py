@@ -10489,10 +10489,18 @@ class DAXEngine:
         the key's are the scan's rows, provided the other tables' filters
         reach tbl the same with and without the key. They do when nothing
         filters back toward tbl: no active relationship is bidirectional or
-        one-to-one (a conservative condition). The values are read in row
-        order and given to the scan's own ``compute``."""
+        one-to-one (a conservative condition). The base is read through
+        without_filters, which takes the relationship set's own date-part
+        joins: not in a context that keeps another set's (_range_joins_current).
+        The values are read in row order and given to the scan's own
+        ``compute``."""
         fc = ctx.filter_context
         if ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
+            return _MISSING
+        if not self._range_joins_current(ctx):
+            # a USERELATIONSHIP / CROSSFILTER context keeps its set's date-part
+            # joins, while the base, read through without_filters, takes the
+            # set's own (see _range_aggregate)
             return _MISSING
         keys = [k for k, _v in _group_filters(fc) if k.partition('.')[0] == tname]
         if len(keys) != 1 or self._range_row_transition(fc, tname):
