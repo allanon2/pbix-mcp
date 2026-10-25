@@ -310,3 +310,86 @@ def test_the_differential_reaches_the_route(mode, request, builds):
     cells = [(m, fc, {}) for fc in _contexts(tables, 0) for m in ("OwnSUMAmt", "SUMQ")]
     assert _differential(tables, MEASURES, rels, cells, repeat=1) == []
     assert builds[0] > 0
+
+
+# ---- MIN / MAX of the grouped table's own column, in a grouped batch ------------
+
+OWN = {
+    "MinDate": "MIN(Cal[Date])", "MaxDate": "MAX(Cal[Date])", "MinYear": "MIN(Cal[Year])",
+    "MinX": "MIN(D[X])", "MaxX": "MAX(D[X])", "MaxCat": "MAX(D[Cat])", "MaxKey": "MAX(D[Key])",
+    "Span": "VAR a = MIN(Cal[Date]) VAR b = MAX(Cal[Date]) RETURN IF(a <= b, b - a)",
+    "OwnInRT": "VAR d = MAX(Cal[Date]) RETURN CALCULATE(SUM(F[Q]), Cal[Date] <= d)",
+}
+
+
+@pytest.fixture
+def own_answers(monkeypatch):
+    """How many aggregates _key_own_aggregate answered."""
+    count = [0]
+    real = de.DAXEngine._key_own_aggregate
+
+    def spy(self, *a):
+        got = real(self, *a)
+        count[0] += got is not de._MISSING
+        return got
+
+    monkeypatch.setattr(de.DAXEngine, "_key_own_aggregate", spy)
+    return count
+
+
+@pytest.mark.parametrize("seed", range(12))
+def test_own_column_differential_on_random_models(seed, grouped, own_answers):
+    tables, rels, _ = _fuzz_model(seed)
+    cells = [(m, fc, {}) for fc in _contexts(tables, seed) for m in OWN]
+    assert _differential(tables, OWN, rels, cells, repeat=1) == []
+    # every model but the bidirectional and one-to-one ones reaches the route
+    card = [(2, 1), (2, 1), (1, 1), (2, 2)][seed % 4 if seed % 3 else 0]
+    if card != (1, 1):
+        assert own_answers[0] > 0
+
+
+def test_a_lone_call_scans_the_own_column(own_answers):
+    tables, rels, _ = _fuzz_model(0)
+    de.evaluate_measure("MinDate", tables, OWN, {"Cal.Date": G([tables["Cal"]["rows"][0][0]])}, relationships=rels)
+    assert own_answers[0] == 0
+
+
+def _own_plant(change):
+    real = de.DAXEngine._key_own_aggregate
+
+    def plant(self, ctx, tname, tbl, idx, compute):
+        return change(real, self, ctx, tname, tbl, idx, compute)
+    return plant
+
+
+def _base_ignored(real, self, ctx, tname, tbl, idx, compute):
+    """The key's rows alone, the base's filters not applied."""
+    got = real(self, ctx, tname, tbl, idx, compute)
+    if got is de._MISSING:
+        return got
+    (rkey,) = [k for k, _v in de._group_filters(ctx.filter_context) if k.partition('.')[0] == tname]
+    x_idx = ctx._find_col_idx(tbl["columns"], rkey.partition('.')[2])
+    keep = ctx._column_filter_rows(tbl, x_idx, ctx.filter_context[rkey])
+    return compute([tbl["rows"][i][idx] for i in sorted(keep)])
+
+
+def _blank_group_own(real, self, ctx, tname, tbl, idx, compute):
+    """A BLANK group read as the rows holding no key, not left to the scan."""
+    gk = [(k, v) for k, v in de._group_filters(ctx.filter_context) if k.partition('.')[0] == tname]
+    if len(gk) == 1 and any(v is None for v in gk[0][1]):
+        return compute([])
+    return real(self, ctx, tname, tbl, idx, compute)
+
+
+@pytest.mark.parametrize("plant", ["base ignored", "a BLANK group admitted"])
+def test_own_column_planted_defects_are_seen(plant, monkeypatch, grouped):
+    tables, rels, _ = _fuzz_model(0)
+    days = [r[0] for r in tables["Cal"]["rows"]]
+    cells = [(m, fc, {}) for m in ("MinX", "MaxCat", "MinDate")
+             for fc in ([{"D.X": G([x]), "D.Cat": ["a"]} for x in {r[2] for r in tables["D"]["rows"]} if x is not None]
+                        + [{"D.X": G([None])}, {"Cal.Date": G([None])},
+                           {"Cal.Date": G([days[2]]), "Cal.Year": [1999]}])]
+    assert _differential(tables, OWN, rels, cells, repeat=1) == []
+    change = {"base ignored": _base_ignored, "a BLANK group admitted": _blank_group_own}[plant]
+    monkeypatch.setattr(de.DAXEngine, "_key_own_aggregate", _own_plant(change))
+    assert _differential(tables, OWN, rels, cells, repeat=1) != [], plant

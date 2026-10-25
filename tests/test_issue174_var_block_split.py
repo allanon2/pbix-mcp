@@ -66,7 +66,7 @@ def test_matches_desktop(name):
     ("VAR a = {1, VAR b = 2 RETURN b} RETURN a", [("a", "{1, VAR b = 2 RETURN b}")], "a"),
 ])
 def test_the_block_splits_at_its_own_keywords(text, decls, ret):
-    assert dax._var_block_parts(text) == (decls, ret)
+    assert dax._var_block_parts(text) == (tuple(decls), ret)
 
 
 def test_the_builder_reads_no_variable_in_a_quoted_name():
