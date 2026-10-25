@@ -1640,8 +1640,12 @@ def evaluate_row_context_column(
     target_table: str,
     all_tables: Dict[str, dict],
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ):
     """Evaluate a row-context calc-column expression against a table's rows.
+
+    ``culture`` is the model's (FORMAT's separators and names); None leaves the
+    engine's default.
 
     Returns ``(values, error)``. ``error`` is None on success; otherwise a
     string and ``values`` is None. The caller MUST have already cleared
@@ -1726,6 +1730,7 @@ def evaluate_row_context_column(
         try:
             actx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            actx.culture = culture
             base_scope[_AGG_MASK.format(n)] = engine._eval_expr(call, actx)
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
@@ -1809,6 +1814,7 @@ def evaluate_row_context_column(
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            ctx.culture = culture
             # Column refs resolve through the engine's own row context, so the
             # SAME text evaluates on every row and its plan is parsed once.
             ctx._current_row = {'__table__': target_table, **row_data}
@@ -1896,6 +1902,7 @@ def _flatten_part_rows(result: list) -> list:
             continue
         part_cols: list = []
         part_vals: list = []
+        cell_only = False   # a single-column part whose cell the row holds only in that part (GENERATE)
         for part in parts:
             plain = [k for k in part if not str(k).startswith("__")]
             if plain:
@@ -1904,10 +1911,11 @@ def _flatten_part_rows(result: list) -> list:
             elif part.get("__column__"):
                 part_cols.append(part["__column__"])
                 part_vals.append(part.get("__value__"))
+                cell_only = cell_only or part["__column__"] not in r
         dup = next((c for c in part_cols if part_cols.count(c) > 1), None)
         if dup is not None:
             raise ValueError(f"a column named '{dup}' comes from two tables")
-        if any(str(k).startswith("_2_") for k in r):
+        if cell_only or any(str(k).startswith("_2_") for k in r):
             row = dict(zip(part_cols, part_vals))
             row.update({k: v for k, v in r.items() if not str(k).startswith(("__", "_2_"))
                         and k not in row})
@@ -1922,8 +1930,16 @@ def evaluate_calc_table_expression(
     tables: Dict[str, dict],
     measures: Optional[Dict[str, str]] = None,
     relationships: Optional[List[dict]] = None,
+    *,
+    culture: Optional[str] = None,
+    measure_tables: Optional[Dict[str, str]] = None,
+    model_columns: Optional[dict] = None,
 ):
     """Evaluate a calculated-table DAX expression to ``{columns, rows}``.
+
+    ``culture``, ``measure_tables`` and ``model_columns`` are the model's, as
+    a measure evaluation gets them (FORMAT's culture; a measure's home table
+    for its bare column references; the model's own column list).
 
     Returns ``(result, error)``; ``error`` is None on success. Refuses (rather
     than returning a partial/blank table) when the engine reports an
@@ -1937,6 +1953,11 @@ def evaluate_calc_table_expression(
     engine = dax_engine.DAXEngine()
     ctx = dax_engine.DAXContext(
         tables, measures or {}, None, None, None, relationships or [])
+    ctx.culture = culture
+    if measure_tables is not None:
+        ctx.measure_tables = measure_tables
+    if model_columns is not None:
+        ctx.model_columns = model_columns
     try:
         result = engine._eval_expr(clean, ctx)
     except Exception as e:  # noqa: BLE001 — refuse, never persist garbage
@@ -1978,6 +1999,13 @@ def evaluate_calc_table_expression(
     for r in result:
         if [k for k in r.keys() if k not in meta] != cols:
             return None, "result rows have inconsistent columns"
+    # ADDCOLUMNS(VALUES(T[C]), "N", ...) keeps T[C] as __column__/__value__
+    # beside its added columns: it is the table's first column, not noise.
+    lead = result[0].get("__column__")
+    if (lead and "__value__" in result[0] and lead not in cols
+            and all(r.get("__column__") == lead and "__value__" in r for r in result)):
+        return {"columns": [lead, *cols],
+                "rows": [[r.get("__value__"), *(r.get(c) for c in cols)] for r in result]}, None
     return {"columns": cols,
             "rows": [[r.get(c) for c in cols] for r in result]}, None
 
