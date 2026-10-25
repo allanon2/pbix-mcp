@@ -5,6 +5,143 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.147] - 2026-10-25
+
+@allanon2's pull requests #205 and #206, redesigned around what their reviews measured, plus the follow-ups that 0.9.146's units found and Power BI Desktop 2.152 settled. Desktop batteries: `build_b234.py` (31 probes) and `build_b247.py` (73 probes).
+
+- **Running totals per date:** 10.7x faster (17.7 s to 1.65 s over 200 dates; answers identical to a plain-Python reference). On a 1,200-date running total, memory stays bounded where 0.9.146 grew without end: 198 MB against 506 MB and growing, and for the `FILTER(ALL(Cal))` form a 40 MB plateau against 638 MB.
+- **The corpus census (1,508 measures in 31 files):** runs in 962 s, against 1,990 s for the 0.9.145 run (not timed side by side). 11 measures that timed out on 0.9.146 now give Desktop's answers. The census also changed the measures that use RAND or RANDBETWEEN, as on every run, and none of the census measures that matched Desktop stopped matching.
+
+Verified before release:
+
+- **Tests:** full suite 8,336 passed, 6 xfailed, on Python 3.13; this release's 1,049 tests also pass on 3.10. The 791 new tests (16 files) all pass; 435 of them fail on 0.9.146.
+- **Desktop batteries:**
+  - b234: 25 of 26 match (8 on 0.9.146); the last is `1 / BLANK()`, infinity on both.
+  - b247: 40 of 47 match (27 on 0.9.146), and none that matched before stopped matching.
+  - b210 51 of 56, b200 756 of 756 and SAMPLE 160 of 173, all unchanged.
+  - regress_check: the 3,708 probes of the earlier batteries answer as on 0.9.146.
+- **Lint and types:** ruff is clean. mypy is at 137.
+
+### Changed — one model's filter cache is bounded (issue #229; reported in PR #205 by @allanon2)
+
+The per-model cache kept every filter context's entries: a running total asked once per date grew it quadratically (1.5 GB by 2,267 dates in our reproduction; 16 GB in the PR's).
+
+It is now a bounded `_FilterIndexCache`:
+- **What gets dropped:** entries named by a filter set go first-in-first-out past a weight bound of 10 x the model's cells, held between 4M and 16M units (a unit is about 64 bytes). The registered models share one budget.
+- **Weights:** each entry is weighed cheaply as it is stored, with its key counted: a filter set's weight is kept on its context as its signatures are made.
+- **Long keys:** signatures over 256 characters, or with over 64 values, are digests. The KEEPFILTERS-per-date form's keys had grown to 120,000 characters.
+- **What is kept:** facts about the model (value maps, blank-row tables, sorted orders, one-side buckets, the running totals' owners and axis, the shield analysis). Each dimension member's related rows ('hop-rows', 'row-expansion') sit outside the FIFO with a cap of their own.
+- **Row-expansion slots:** they end with the outermost evaluation and are kept per thread.
+- **Transient mappings (#214):** they get the bounded class too.
+
+Answers never change: every entry is a pure function of its key. Tests: `tests/test_issue229_bounded_filter_cache.py` (26; 22 fail on 0.9.146).
+
+### Changed — filter propagation per filter context (issue #230; part of PR #206 by @allanon2)
+
+- **A source table's cross filter is memoized by that source's own filters**, as target rows (exact typed signatures, #217), instead of by the whole filter set. A running total's year filter is now propagated once, not once per date.
+- **A direct one -> many hop reads per-row buckets filled lazily**, only for the selected rows; an eager build made a one-shot query on a 200k-row dimension 17x slower in review. The buckets keep text keys exact (#222).
+- **An inequality on a number or date column is answered from a sorted index behind a bounded memo.** The index handles BLANK, NaN and text cells, and integers past 2^53, exactly as the matcher does.
+
+All of it sits behind one switch, `_FAST_PROPAGATION`. A differential fuzz compares the switch on against off, varying the date table and reaching ALL() suppression and row transitions. Tests: `tests/test_issue230_fast_propagation.py` (31; all fail on 0.9.146).
+
+### Changed — column aggregates per filter context, and running totals from per-key totals (issue #231; part of PR #206 by @allanon2)
+
+- **The column-aggregate memo:** SUM, AVERAGE, COUNT, COUNTA, MIN, MAX, DISTINCTCOUNT and DISTINCTCOUNTNOBLANK of a column are memoized outside a row context. The key is what decides the visible values: the canonical table and column, the typed filter set, the ALL() snapshot, the relationship set and its date-part joins, the date table. A measure asking `CALCULATE(MAX(Sales[Date]), REMOVEFILTERS())` per row went from 49 ms to 3.4 ms a row.
+- **The running-total route:** under one inequality on a dimension across a many-to-one or 1:1 hop, SUM / AVERAGE / COUNT / COUNTA are read off per-key totals. Integers and Fixed Decimal counts are exact. Doubles are held as exact integers over a power of two, so any window's total, rounded once, is SUM's correctly rounded answer (#246) in any row order.
+- **When the route stays out:** it is refused where the owners' buckets overlap, and where the date-part joins in force are not the relationship set's. It is built only once the scans have cost 20 times its estimated build.
+
+Tests: `tests/test_issue231_aggregate_memo.py` (62; 36 fail on 0.9.146), with ten planted defects that the differential must catch.
+
+### Changed — per-context fixed costs (issue #232; part of PR #206 by @allanon2)
+
+- Measure text is whitespace-collapsed once, through a cache.
+- Strict date text is parsed without trying seven strptime formats; a serial-number string took 109 us.
+- A column's datetime-ness is memoized.
+- The shield analysis is kept per model, validated by the held model parts, never by id() alone.
+- A query memo's name is worked out once per cache.
+
+On a 731-context workload the per-call route takes 0.57x the time, and the batch route 0.29x at 1,000 measures. Tests: `tests/test_issue232_hot_paths.py` (19; 9 fail on 0.9.146).
+
+### Added — pbix_evaluate_dax_batch (issue #233; part of PR #206 by @allanon2)
+
+`pbix_evaluate_dax_batch(alias, measures, contexts, max_contexts=10000)`:
+- each element is exactly what `pbix_evaluate_dax` answers for that context (default filters never applied), statuses and messages included;
+- a malformed context answers its own element, not the whole call;
+- one measure memo is shared, bounded.
+
+134 tools. Tests: `tests/test_issue233_evaluate_dax_batch.py` (60; all fail on 0.9.146).
+
+### Fixed — an error an IFERROR / ISERROR caught inside a referenced measure no longer reaches the caller (issue #244)
+
+Desktop (b247), with `e_safe = IFERROR([e_bad], 5)`:
+- `IFERROR([e_safe], 99)` is 5; 0.9.146 gave 99 when evaluated alone;
+- `ISERROR([e_safe])` is FALSE;
+- `SUMX(GENERATESERIES(1, 2), IFERROR([e_bad], 5))` is 10; 0.9.146 gave 4.
+
+The caught error is now taken back, from the degradation counter, the nested-error record and eval_errors. Covered by #233's tests.
+
+### Fixed — the shield analysis read the previous evaluation's marked date tables (issue #245)
+
+The query route served that analysis to the next model: 6 where 2 is right. The outermost measure now snapshots its own date tables first. Test in `tests/test_issue232_hot_paths.py`.
+
+### Fixed — SUM, AVERAGE, AVERAGEA and AVERAGEX add correctly rounded on every Python version (issue #246)
+
+They used `sum()`, which is compensated on Python 3.12+ and plain on 3.10 / 3.11, and even 3.12's is not always correctly rounded (7e-17, 1e16, 1.0 gave 1e16). They now use `math.fsum`; ints stay exact, and Fixed Decimal columns stay exact (#241).
+
+Measured against the census's Desktop answers, over the 112 measures the rules tell apart: correctly rounded 65, `sum()` 64, a left-to-right fold 56. On large columns Desktop's storage engine adds very nearly exactly (#243). SUMX keeps adding left to right, as Desktop does on a few rows (#228). Tests: `tests/test_issue246_sum_correctly_rounded.py` (13; 5 fail on 0.9.146 under 3.13, 12 under 3.10).
+
+### Fixed — EXCEPT and INTERSECT compare rows by their cells, not their text (issue #234)
+
+Desktop (b234): EXCEPT over "None", BLANK, "x" against "None", "y" keeps 2 rows (ours 1); INTERSECT keeps 1 (ours 2). Rows of ADDCOLUMNS / GENERATE / SELECTCOLUMNS / CROSSJOIN are read as all their cells. GENERATE keeps its outer row's kind: Desktop (b247) `SUMX(GENERATE(ALL(M[a], M[b]), ROW("q", 1)), CALCULATE(COUNTROWS(DM)))` is 12 (ours 4), and 4 over the table itself. NaN is one value, as in VALUES. Tests: `tests/test_issue234_except_intersect.py` (30; 20 fail on 0.9.146).
+
+### Fixed — bare [Column] references (issue #235)
+
+Desktop (b234), with measures on home table TA:
+- `SUMX(TBool, SUM([A]))` is 14: an aggregate's bare column argument names the measure's home table (ours BLANK).
+- `SUMX(VALUES(TBool[A]), SUM([A]))` is 14 (ours 30).
+- `SUMX(F4, SUMX(D4, [A]))` is 90: a scalar bare column reads the innermost row that has it (ours BLANK).
+- `COUNTROWS(FILTER(ALL(TBool[B]), NOT [B]))` is 1 (ours BLANK).
+
+Tests: `tests/test_issue235_bare_columns.py` (28; 22 fail on 0.9.146).
+
+### Fixed — a measure body does not read its caller's row (issue #236)
+
+Desktop (b234): `mrow = [v] + 0` called from an iterator over a virtual table is an error ("the value for v cannot be determined"); ours answered 6. Window functions in a measure called per row (OFFSET / INDEX / WINDOW / ROWNUMBER / RANK) now find their current row in the filter context, among the relation's rows, and unite the windows of several current rows. Desktop (b247): `CONCATENATEX(Dim, [offd], ...)` is ",15,20", `SUMX(Dim, [wind])` 92, `[offd]` under South 15, and from a GENERATESERIES caller "35,35". Tests: `tests/test_issue236_measure_caller_row.py` (7; 3 fail on 0.9.146) and `tests/test_issue236_window_current_row.py` (51; 29 fail on 0.9.146).
+
+### Fixed — TOPNSKIP's order arguments (issue #237)
+
+They pair as TOPN's do (#212). Desktop (b234): `TOPNSKIP(3, 0, T, [v], 1)` gives 1, 2, 3 (ours 8, 9, 10). Tests: `tests/test_issue237_topnskip_order.py` (11; 7 fail on 0.9.146).
+
+### Fixed — a 1:1 with an unmatched key on one side only (issue #238)
+
+Only the side lacking a key gets a blank row. Desktop (b234): `COUNTROWS(VALUES(A1[k]))` is 2 (ours 3); `CALCULATE(COUNTROWS(VALUES(B1[z])), A1[k] <> 2)` is 1 (ours 2). Tests: `tests/test_issue238_one_sided_one_to_one.py` (267; 40 fail on 0.9.146).
+
+### Fixed — MOD by 0 or BLANK is an error (issue #239)
+
+Desktop (b234): `ISERROR(MOD(2, 0))` and `ISERROR(MOD(2, BLANK()))` are TRUE. `&&` and `||` now stop at the deciding side, as Desktop does (b247): `IF(FALSE() && ERROR("x"), 1, 0)` is 0, `IF(TRUE() || ERROR("x"), 1, 0)` is 1, and `COUNTROWS(FILTER(TMOD, TMOD[d] <> 0 && MOD(TMOD[n], TMOD[d]) = 1))` is 2. Desktop evaluates some guarded forms eagerly and errors where we answer (#249, open). Tests: `tests/test_issue239_mod_zero.py` (21; 8 fail on 0.9.146).
+
+### Fixed — Int64 keys past 2^53 keep their exact value (issue #240)
+
+In filters, join keys and the inequality index. Desktop (b234): `CALCULATE(SUM(TI[A]), TI[K] = 9007199254740993)` is 2 (ours 3). Tests: `tests/test_issue240_int_keys_past_2_53.py` (22; 18 fail on 0.9.146).
+
+### Fixed — Fixed Decimal (Currency) columns add exactly (issue #241)
+
+Desktop (b234): SUM, SUMX and AVERAGE of ten rows of 0.1 give exactly 1 and 0.1. The server records each table's Currency columns from the model schema. SUM, AVERAGE, AVERAGEA, and SUMX / AVERAGEX over such a column add the counts of 1/10,000 exactly; the values stay floats. Currency arithmetic and AVERAGE's 4-decimal Currency result are #248 (open). Tests: `tests/test_issue241_currency_sum.py` (30; 23 fail on 0.9.146).
+
+### Fixed — ISO date-time text is read the same way on every Python version (issue #242)
+
+The extended format is read as Python 3.11+ does, on every version. The basic format ('20240110'), week and ordinal dates are refused everywhere; before, they joined a date on 3.11+ but not on 3.10. A strict spelling with a time keeps its time. Tests: `tests/test_issue242_iso_basic.py` (113; 102 fail on 0.9.146).
+
+### Still open
+
+- #243 (which takes over #228): the order in which Desktop adds Doubles.
+- #247: window functions over a relation without a known key; Desktop refuses them.
+- #248: Currency results.
+- #249: Desktop's eager evaluation of guarded forms.
+- #250: USERELATIONSHIP's date-part joins.
+- #251: the version-dependent date parse in calc_tables and the encoder.
+- #252: ordering past 2^53.
+
 ## [0.9.146] - 2026-10-24
 
 Eighteen fixes, issues #210 - #227. Three come from @allanon2's pull requests #207, #208 and #209, solved on our side. The fuzz of 0.9.144's filter pushdown found that it changes answers (#210). The audits of those pull requests and our own Desktop probes found the other bugs below. Every expected value is Power BI Desktop 2.152's own answer, from two new batteries: `build_b210.py` (57 probes) and 173 SAMPLE probes. Exceptions are noted per issue. The corpus census (1,508 measures in 31 files) changes only the measures that use RAND or RANDBETWEEN. Every other measure is identical to 0.9.145 to the last digit.

@@ -13877,6 +13877,20 @@ def _get_dax_context(alias: str) -> dict:
         except Exception:
             continue
 
+    # Fixed Decimal (Currency) columns: the decoder hands their values over as
+    # Doubles and the tables dict carries no types, so each table records its
+    # Currency columns from the model's schema. Desktop adds Currency values
+    # exactly, where it adds Doubles in row order (issue #241; issue #228).
+    # Recorded before the calculated tables and columns are evaluated, so what
+    # they compute from a Currency column adds as Desktop adds it, and again
+    # after, for the Currency columns they add.
+    from pbix_mcp.dax.engine import mark_currency_columns
+    currency_columns: dict = {}
+    for r in schema_list:
+        if r.get('DataType') == 'Decimal' and r.get('ColumnName'):
+            currency_columns.setdefault(r['TableName'], []).append(r['ColumnName'])
+    mark_currency_columns(tables, currency_columns)
+
     # --- Load calculated tables from ABF metadata ---
     # Uses calc_tables.py as the single source of truth for evaluating
     # DATATABLE, GENERATESERIES, CALENDAR, and other calculated table expressions
@@ -13886,6 +13900,7 @@ def _get_dax_context(alias: str) -> dict:
         tables = load_calculated_tables(info["path"], tables, relationships)
     except Exception:
         pass  # If calculated table loading fails, continue without them
+    mark_currency_columns(tables, currency_columns)
 
     # Performance warning for large tables
     _LARGE_TABLE_THRESHOLD = 100_000
@@ -14214,6 +14229,211 @@ def _resolve_default_filters(ctx: dict, page_index: int) -> dict | None:
         return None
 
 
+def _unexpected_error_text(e: Exception) -> str:
+    """The response text for an exception no handler expected, from inside
+    the ``except`` that caught it: its message and traceback, and its
+    ``code`` when it carries one (no error_code otherwise), as the tools'
+    own handlers answer it."""
+    code: Any = getattr(e, "code", None)
+    return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", code).to_text()
+
+
+def _evaluate_dax_response(ctx: dict, alias: str, measure_names: list[str],
+                           fc: dict | None, group_keys: set, selected: dict | None,
+                           cache: dict | None = None) -> str:
+    """Evaluate ``measure_names`` and build the text pbix_evaluate_dax
+    returns, once the arguments are parsed and checked: ``fc`` holds the
+    filters (defaults and top_n resolved), ``group_keys`` and ``selected``
+    the group_by and selected_filter_context.
+
+    ``cache`` is the measure memo the contexts of one
+    pbix_evaluate_dax_batch call share (issue #233, _attach_query_memo);
+    pbix_evaluate_dax passes none. The engine's trackers are cleared here,
+    per context, so each context reports its own errors, unsupported
+    functions and timeouts; a value served from the shared memo reports
+    what its evaluation did (DAXEngine._replay_nested_errors)."""
+    from pbix_mcp.dax import engine as dax_engine
+
+    # Reset unsupported + error trackers before evaluation
+    dax_engine._engine.unsupported_functions.clear()
+    dax_engine._engine.unsupported_by_measure.clear()
+    dax_engine._engine.eval_errors.clear()
+    dax_engine._engine.timed_out.clear()
+    logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
+
+    # simulate_row_context=False: report what the MODEL returns, exactly as
+    # Desktop's own engine does. The fallback that guesses a parameter-table
+    # selection when a measure is BLANK produced numbers Desktop never shows
+    # at the grand total (see evaluate_measures_smart).
+    results = dax_engine.evaluate_measures_smart(
+        measure_names, ctx['tables'], ctx['measure_defs'],
+        fc, ctx['date_table'], ctx['date_column'],
+        ctx.get('relationships'), simulate_row_context=False,
+        measure_tables=ctx.get('measure_tables'),
+        model_columns=ctx.get('model_columns'),
+        culture=ctx.get('culture'),
+        group_by=group_keys or None,
+        selected_filters=selected,
+        date_tables=ctx.get('date_tables'),
+        cache=cache,
+    )
+    # A selected calculation item's format-string expression decides the
+    # format its values are shown with (issue #121).
+    item_formats: dict = {}
+    if ctx.get('calculation_groups'):
+        item_formats = dax_engine.evaluate_format_strings(
+            measure_names, ctx['tables'], ctx['measure_defs'], fc,
+            ctx['date_table'], ctx['date_column'], ctx.get('relationships'),
+            group_keys=group_keys or None,
+            selected_filters=(selected if selected is not None or not group_keys else
+                              {k: v for k, v in (fc or {}).items() if k not in group_keys}),
+            culture=ctx.get('culture'), date_tables=ctx.get('date_tables'),
+            measure_tables=ctx.get('measure_tables'),
+            model_columns=ctx.get('model_columns'))
+
+    # Build structured response with DAXResult objects
+    unsupported = set(dax_engine._engine.unsupported_functions)
+    # Which measure depended on which unsupported function (PR #96). The
+    # call-wide set made every BLANK in the call "unsupported", a measure
+    # that is legitimately empty included, and said nothing about a NUMBER
+    # computed past an unsupported call.
+    by_measure = dax_engine._engine.unsupported_by_measure
+
+    def _unsupported_of(measure: str) -> list[str] | None:
+        hit = by_measure.get(measure)
+        return sorted(hit) if hit else None
+
+    timed_out = set(dax_engine._engine.timed_out)
+    dax_results = []
+    for name, val in results.items():
+        if val is not None:
+            # A declared Measure.DataType of Int64 (6) coerces an integral
+            # float result to int, exactly as Analysis Services casts to
+            # the declared type — so DISTINCTCOUNT-style measures report
+            # data_type "Int64", not "Double" (issue #40). Only the
+            # value-consistent direction is trusted: Measure.DataType is
+            # unreliable the other way (currency measures stored as Int64
+            # with non-integral values keep their real Double typing).
+            if (ctx.get('measure_types', {}).get(name) == 6
+                    and isinstance(val, float) and val.is_integer()):
+                val = int(val)
+            dax_results.append(DAXResult(name=name, value=val, status="ok",
+                                         unsupported_functions=_unsupported_of(name),
+                                         format_string=item_formats.get(name)))
+        elif name in timed_out:
+            # NOT a blank: the evaluation was abandoned on the wall-clock
+            # budget. Reporting it as blank made "no value" and "we ran out
+            # of time" look identical in the tool output.
+            dax_results.append(DAXResult(
+                name=name, value=None, status="error",
+                error_message=(
+                    "evaluation budget exceeded "
+                    f"({dax_engine._engine._max_eval_seconds:.0f}s); raise "
+                    "PBIX_DAX_MAX_SECONDS to allow longer"),
+            ))
+        elif name in dax_engine._engine.eval_errors:
+            # NOT a blank: evaluation RAISED (unresolvable reference,
+            # circular definition, ...). Reporting it as blank made a
+            # broken measure indistinguishable from a legitimately empty
+            # one (ledger issues-7).
+            dax_results.append(DAXResult(
+                name=name, value=None, status="error",
+                error_message=dax_engine._engine.eval_errors[name],
+            ))
+        elif _unsupported_of(name) or (unsupported and not by_measure):
+            # BLANK because this measure's own evaluation hit unsupported
+            # functions, named per measure (the call-wide set only when the
+            # engine attributed none).
+            mine = _unsupported_of(name) or sorted(unsupported)
+            dax_results.append(DAXResult(
+                name=name, value=None, status="unsupported",
+                error_message=f"Uses unsupported function(s): {', '.join(mine)}",
+                unsupported_functions=mine,
+            ))
+        else:
+            dax_results.append(DAXResult(name=name, value=None, status="blank"))
+
+    warnings = []
+    if unsupported:
+        warnings.append(f"{len(unsupported)} unsupported DAX function(s): {', '.join(sorted(unsupported))}")
+
+    response = DAXEvalResponse(
+        success=True,
+        results=dax_results,
+        warnings=warnings,
+    )
+    logger.debug("DAX eval complete: %d ok, %d blank",
+                  sum(1 for r in dax_results if r.status == "ok"),
+                  sum(1 for r in dax_results if r.status == "blank"))
+    return response.to_text()
+
+
+def _evaluate_dax_for_context(ctx: dict, alias: str, measure_names: list[str],
+                              filter_context: str, apply_default_filters: bool,
+                              page_index: int, group_by: str,
+                              selected_filter_context: str,
+                              cache: dict | None = None) -> str:
+    """pbix_evaluate_dax's answer for one filter context once the file, its
+    model and the measure names are resolved: the arguments as that tool
+    takes them, its validation messages and its error handling.
+
+    pbix_evaluate_dax_batch answers each of its contexts through this as
+    well (issue #233), so an element is the single call's text by
+    construction -- a group_by key missing from filter_context, a
+    selected_filter_context that is not an object or a bad top_n spec
+    included, traceback and all -- rather than a second copy of these
+    rules that could drift from the first."""
+    try:
+        parsed_fc = FilterContext.from_json_str(filter_context)
+        if parsed_fc.filters:
+            parsed_fc.filters = _resolve_topn_filters(ctx, parsed_fc.filters)
+        fc: dict | None
+        if parsed_fc.filters:
+            fc = parsed_fc.filters
+        elif apply_default_filters:
+            # Auto-apply default slicer filters from the report layout, re-derived
+            # from the current layout (not the open-time snapshot) so a slicer/
+            # filter edit is honored on the next evaluate (OpenBI #7).
+            fc = _resolve_default_filters(ctx, page_index)
+        else:
+            fc = None
+
+        group_keys: set = set()
+        if group_by:
+            try:
+                parsed_gb = json.loads(group_by)
+            except (json.JSONDecodeError, TypeError):
+                parsed_gb = None
+            if not isinstance(parsed_gb, list) or not all(isinstance(k, str) for k in parsed_gb):
+                return ToolResponse.error(
+                    "group_by must be a JSON array of 'Table.Column' filter_context keys",
+                    "INVALID_INPUT").to_text()
+            missing = [k for k in parsed_gb if k not in (fc or {})]
+            if missing:
+                return ToolResponse.error(
+                    f"group_by keys must also be in filter_context: {missing}",
+                    "INVALID_INPUT").to_text()
+            group_keys = set(parsed_gb)
+        selected = None
+        if group_keys and selected_filter_context:
+            try:
+                parsed_sel = json.loads(selected_filter_context)
+            except (json.JSONDecodeError, TypeError):
+                parsed_sel = None
+            if not isinstance(parsed_sel, dict):
+                return ToolResponse.error(
+                    "selected_filter_context must be a JSON object like filter_context",
+                    "INVALID_INPUT").to_text()
+            selected = parsed_sel
+
+        return _evaluate_dax_response(ctx, alias, measure_names, fc, group_keys,
+                                      selected, cache)
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return _unexpected_error_text(e)
+
+
 @mcp.tool()
 def pbix_evaluate_dax(
     alias: str,
@@ -14268,168 +14488,181 @@ def pbix_evaluate_dax(
                 UnsupportedFormatError.code,
             ).to_text()
 
+        ctx = _get_dax_context(alias)
+        measure_names = _parse_measure_names(measures, ctx['measure_defs'])
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return _unexpected_error_text(e)
+    return _evaluate_dax_for_context(ctx, alias, measure_names, filter_context,
+                                     apply_default_filters, page_index, group_by,
+                                     selected_filter_context)
+
+
+_BATCH_CONTEXT_KEYS = ("filter_context", "group_by", "selected_filter_context")
+_BATCH_CONTEXT_SHAPE = ('{"filter_context": {"Table.Column": [values]}, '
+                        '"group_by": ["Table.Column"], '
+                        '"selected_filter_context": {"Table.Column": [values]}}')
+# How many measure values pbix_evaluate_dax_batch's shared memo may hold
+# before it starts afresh (issue #233). A single call's memo is freed with
+# the call; the batch's would also keep every value no later context reuses:
+# SUMX(ALL(F[id]), [V]) on 2,000 rows keeps 2,000 per context. tracemalloc
+# puts a memo value at about 90 B (40,020 values: 70.5 MB traced with the
+# shared memo, 66.9 MB without), so 100,000 values are about 9 MB, where
+# 10,000 such contexts would keep 20 million (about 1.8 GB). Answers never
+# depend on the memo, only the time does. This bounds the memo only: the
+# other ~3.3 MB a context of that workload adds is the model's filter cache
+# (filter signatures, cross-table filter keys), which consecutive
+# pbix_evaluate_dax calls keep in the same way and issue #229 bounds.
+_BATCH_MEMO_MAX_ENTRIES = 100_000
+_JSON_TYPE_NAMES = {dict: "an object", list: "an array", str: "a string",
+                    bool: "a boolean", int: "a number", float: "a number",
+                    type(None): "null"}
+
+
+def _batch_context_problem(item) -> str | None:
+    """Why ``item`` is not a context pbix_evaluate_dax_batch takes, or None.
+
+    Only the batch's own shape is checked here; what the values mean, and
+    every refusal of pbix_evaluate_dax, is _evaluate_dax_for_context's. A
+    filter_context that is not an object is refused, although
+    pbix_evaluate_dax reads unparseable filter_context text as no filter at
+    all: in a batch that would silently answer a malformed row for the whole
+    model."""
+    if not isinstance(item, dict):
+        return (f"a context is a JSON object, {_BATCH_CONTEXT_SHAPE}; "
+                f"this one is {_JSON_TYPE_NAMES.get(type(item), 'not one')}")
+    extra = sorted(k for k in item if k not in _BATCH_CONTEXT_KEYS)
+    if extra:
+        return (f"unknown context key(s) {extra}: a context takes "
+                + ", ".join(_BATCH_CONTEXT_KEYS))
+    fc = item.get("filter_context")
+    if fc is not None and not isinstance(fc, dict):
+        return ('filter_context is an object of filters, e.g. {"dim-Date.Year": [2015]}; '
+                f"this one is {_JSON_TYPE_NAMES.get(type(fc), 'not one')}")
+    return None
+
+
+@mcp.tool()
+def pbix_evaluate_dax_batch(
+    alias: str,
+    measures: str,
+    contexts: str,
+    max_contexts: int = 10000,
+) -> str:
+    """Answer pbix_evaluate_dax for a whole list of filter contexts at once.
+
+    Meant for clients that query a visual row by row (a running total over
+    dates asks one context per date): rather than one tool call per row,
+    send the rows' contexts together. The open file, its model and the
+    measure list are resolved a single time, and every context draws on one
+    measure memo, so a value that does not depend on the row -- the
+    per-item totals a RANKX ranks, an ALL(...) denominator -- is computed
+    for the first context and reused by the rest (issue #233). The memo is
+    restarted when it reaches 100,000 values; that changes the time a call
+    takes, never its answers.
+
+    results[i] is what pbix_evaluate_dax returns for context i when called
+    with apply_default_filters=False and that context's filter_context,
+    group_by and selected_filter_context: the same values, statuses ("ok",
+    "blank", "error", "unsupported"), messages, calculation-item format
+    strings and warnings. The report's default slicer selections play no
+    part: a context without filters is evaluated against the whole model.
+
+    Args:
+        alias: The alias of the open file
+        measures: The measures to evaluate in every context, a
+            comma-separated list like pbix_evaluate_dax's, e.g. "Sales,Sales LY"
+        contexts: A JSON array with one object per context. An object may
+            hold filter_context (an object of filters), group_by (an array
+            of filter_context keys) and selected_filter_context (an object
+            of filters): each means what the pbix_evaluate_dax argument of
+            that name means, written as a JSON value instead of JSON text. A
+            missing or null key is that argument's default.
+        max_contexts: Upper limit on the number of contexts, 10000 unless
+            given. Every context gets pbix_evaluate_dax's per-measure time
+            budget (PBIX_DAX_MAX_SECONDS), so the limit caps how long one
+            call can run and how large its answer can be.
+
+    Returns:
+        {"success": true, "message": "", "warnings": [], "results": [...]}
+        with one complete pbix_evaluate_dax response per context, in input
+        order. A problem with one context stays in that context's element,
+        and the other contexts are evaluated as usual: the refusals
+        pbix_evaluate_dax gives (a group_by key not in filter_context, a
+        selected_filter_context that is not an object, an invalid top_n),
+        and an element this tool cannot read (not an object, a key other
+        than those three, a filter_context that is not an object -- where
+        pbix_evaluate_dax reads unreadable filter_context text as no filter,
+        a batch refuses it rather than answer that row for the whole model).
+        The call as a whole fails only for a contexts value that is not a
+        JSON array, more contexts than max_contexts, a max_contexts below 1,
+        or a shared argument pbix_evaluate_dax fails on as well (alias not
+        open, DirectQuery, unknown measure).
+    """
+    try:
         from pbix_mcp.dax import engine as dax_engine
+
+        if max_contexts < 1:
+            return ToolResponse.error(
+                f"max_contexts is the most contexts one call evaluates, at least 1; got {max_contexts}",
+                "INVALID_INPUT").to_text()
+        try:
+            items = json.loads(contexts)
+        except (json.JSONDecodeError, TypeError):
+            items = None
+        if not isinstance(items, list):
+            return ToolResponse.error(
+                "contexts is not a JSON array: pass one object per filter context, "
+                f"[{_BATCH_CONTEXT_SHAPE}, ...]",
+                "INVALID_INPUT").to_text()
+        if len(items) > max_contexts:
+            return ToolResponse.error(
+                f"{len(items)} filter contexts exceed max_contexts={max_contexts}: "
+                "split them over several calls or raise max_contexts",
+                "INVALID_INPUT").to_text()
+
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — DAX evaluation requires local data. "
+                "Use layout, measure, and metadata tools instead.",
+                UnsupportedFormatError.code,
+            ).to_text()
 
         ctx = _get_dax_context(alias)
         measure_names = _parse_measure_names(measures, ctx['measure_defs'])
 
-        parsed_fc = FilterContext.from_json_str(filter_context)
-        if parsed_fc.filters:
-            parsed_fc.filters = _resolve_topn_filters(ctx, parsed_fc.filters)
-        fc: dict | None
-        if parsed_fc.filters:
-            fc = parsed_fc.filters
-        elif apply_default_filters:
-            # Auto-apply default slicer filters from the report layout, re-derived
-            # from the current layout (not the open-time snapshot) so a slicer/
-            # filter edit is honored on the next evaluate (OpenBI #7).
-            fc = _resolve_default_filters(ctx, page_index)
-        else:
-            fc = None
-
-        # Reset unsupported + error trackers before evaluation
-        dax_engine._engine.unsupported_functions.clear()
-        dax_engine._engine.unsupported_by_measure.clear()
-        dax_engine._engine.eval_errors.clear()
-        dax_engine._engine.timed_out.clear()
-        logger.info("Evaluating %d measures for '%s'", len(measure_names), alias)
-
-        # simulate_row_context=False: report what the MODEL returns, exactly as
-        # Desktop's own engine does. The fallback that guesses a parameter-table
-        # selection when a measure is BLANK produced numbers Desktop never shows
-        # at the grand total (see evaluate_measures_smart).
-        group_keys: set = set()
-        if group_by:
-            try:
-                parsed_gb = json.loads(group_by)
-            except (json.JSONDecodeError, TypeError):
-                parsed_gb = None
-            if not isinstance(parsed_gb, list) or not all(isinstance(k, str) for k in parsed_gb):
-                return ToolResponse.error(
-                    "group_by must be a JSON array of 'Table.Column' filter_context keys",
-                    "INVALID_INPUT").to_text()
-            missing = [k for k in parsed_gb if k not in (fc or {})]
-            if missing:
-                return ToolResponse.error(
-                    f"group_by keys must also be in filter_context: {missing}",
-                    "INVALID_INPUT").to_text()
-            group_keys = set(parsed_gb)
-        selected = None
-        if group_keys and selected_filter_context:
-            try:
-                parsed_sel = json.loads(selected_filter_context)
-            except (json.JSONDecodeError, TypeError):
-                parsed_sel = None
-            if not isinstance(parsed_sel, dict):
-                return ToolResponse.error(
-                    "selected_filter_context must be a JSON object like filter_context",
-                    "INVALID_INPUT").to_text()
-            selected = parsed_sel
-
-        results = dax_engine.evaluate_measures_smart(
-            measure_names, ctx['tables'], ctx['measure_defs'],
-            fc, ctx['date_table'], ctx['date_column'],
-            ctx.get('relationships'), simulate_row_context=False,
-            measure_tables=ctx.get('measure_tables'),
-            model_columns=ctx.get('model_columns'),
-            culture=ctx.get('culture'),
-            group_by=group_keys or None,
-            selected_filters=selected,
-            date_tables=ctx.get('date_tables'),
-        )
-        # A selected calculation item's format-string expression decides the
-        # format its values are shown with (issue #121).
-        item_formats: dict = {}
-        if ctx.get('calculation_groups'):
-            item_formats = dax_engine.evaluate_format_strings(
-                measure_names, ctx['tables'], ctx['measure_defs'], fc,
-                ctx['date_table'], ctx['date_column'], ctx.get('relationships'),
-                group_keys=group_keys or None,
-                selected_filters=(selected if selected is not None or not group_keys else
-                                  {k: v for k, v in (fc or {}).items() if k not in group_keys}),
-                culture=ctx.get('culture'), date_tables=ctx.get('date_tables'),
-                measure_tables=ctx.get('measure_tables'),
-                model_columns=ctx.get('model_columns'))
-
-        # Build structured response with DAXResult objects
-        unsupported = set(dax_engine._engine.unsupported_functions)
-        # Which measure depended on which unsupported function (PR #96). The
-        # call-wide set made every BLANK in the call "unsupported", a measure
-        # that is legitimately empty included, and said nothing about a NUMBER
-        # computed past an unsupported call.
-        by_measure = dax_engine._engine.unsupported_by_measure
-
-        def _unsupported_of(measure: str) -> list[str] | None:
-            hit = by_measure.get(measure)
-            return sorted(hit) if hit else None
-
-        timed_out = set(dax_engine._engine.timed_out)
-        dax_results = []
-        for name, val in results.items():
-            if val is not None:
-                # A declared Measure.DataType of Int64 (6) coerces an integral
-                # float result to int, exactly as Analysis Services casts to
-                # the declared type — so DISTINCTCOUNT-style measures report
-                # data_type "Int64", not "Double" (issue #40). Only the
-                # value-consistent direction is trusted: Measure.DataType is
-                # unreliable the other way (currency measures stored as Int64
-                # with non-integral values keep their real Double typing).
-                if (ctx.get('measure_types', {}).get(name) == 6
-                        and isinstance(val, float) and val.is_integer()):
-                    val = int(val)
-                dax_results.append(DAXResult(name=name, value=val, status="ok",
-                                             unsupported_functions=_unsupported_of(name),
-                                             format_string=item_formats.get(name)))
-            elif name in timed_out:
-                # NOT a blank: the evaluation was abandoned on the wall-clock
-                # budget. Reporting it as blank made "no value" and "we ran out
-                # of time" look identical in the tool output.
-                dax_results.append(DAXResult(
-                    name=name, value=None, status="error",
-                    error_message=(
-                        "evaluation budget exceeded "
-                        f"({dax_engine._engine._max_eval_seconds:.0f}s); raise "
-                        "PBIX_DAX_MAX_SECONDS to allow longer"),
-                ))
-            elif name in dax_engine._engine.eval_errors:
-                # NOT a blank: evaluation RAISED (unresolvable reference,
-                # circular definition, ...). Reporting it as blank made a
-                # broken measure indistinguishable from a legitimately empty
-                # one (ledger issues-7).
-                dax_results.append(DAXResult(
-                    name=name, value=None, status="error",
-                    error_message=dax_engine._engine.eval_errors[name],
-                ))
-            elif _unsupported_of(name) or (unsupported and not by_measure):
-                # BLANK because this measure's own evaluation hit unsupported
-                # functions, named per measure (the call-wide set only when the
-                # engine attributed none).
-                mine = _unsupported_of(name) or sorted(unsupported)
-                dax_results.append(DAXResult(
-                    name=name, value=None, status="unsupported",
-                    error_message=f"Uses unsupported function(s): {', '.join(mine)}",
-                    unsupported_functions=mine,
-                ))
-            else:
-                dax_results.append(DAXResult(name=name, value=None, status="blank"))
-
-        warnings = []
-        if unsupported:
-            warnings.append(f"{len(unsupported)} unsupported DAX function(s): {', '.join(sorted(unsupported))}")
-
-        response = DAXEvalResponse(
-            success=True,
-            results=dax_results,
-            warnings=warnings,
-        )
-        logger.debug("DAX eval complete: %d ok, %d blank",
-                      sum(1 for r in dax_results if r.status == "ok"),
-                      sum(1 for r in dax_results if r.status == "blank"))
-        return response.to_text()
+        logger.info("Evaluating %d measures under %d filter contexts for '%s'",
+                    len(measure_names), len(items), alias)
+        cache: dict = {}
+        answers = []
+        for item in items:
+            problem = _batch_context_problem(item)
+            if problem is not None:
+                answers.append(ToolResponse.error(problem, "INVALID_INPUT").to_text())
+                continue
+            # The arguments pbix_evaluate_dax would get, so that the same code
+            # parses, validates and answers them; omitted or null is the
+            # argument's default.
+            fc, gb, sel = (item.get(k) for k in _BATCH_CONTEXT_KEYS)
+            answers.append(_evaluate_dax_for_context(
+                ctx, alias, measure_names,
+                "" if fc is None else json.dumps(fc), False, -1,
+                "" if gb is None else json.dumps(gb),
+                "" if sel is None else json.dumps(sel),
+                cache))
+            if dax_engine.query_memo_entries(cache) > _BATCH_MEMO_MAX_ENTRIES:
+                cache = {}
+        # Each answer is a complete response object already: they are joined
+        # as they are, in DAXEvalResponse's envelope, rather than parsed and
+        # dumped again.
+        return ('{"success":true,"message":"","warnings":[],"results":['
+                + ",".join(answers) + "]}")
     except PBIXMCPError as e:
         return ToolResponse.error(e.message, e.code).to_text()
     except Exception as e:
-        return ToolResponse.error(f"{str(e)}\n{traceback.format_exc()}", getattr(e, "code", None)).to_text()
+        return _unexpected_error_text(e)
 
 
 @mcp.tool()

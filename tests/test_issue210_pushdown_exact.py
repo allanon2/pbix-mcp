@@ -179,6 +179,9 @@ PUSHED = [
     ('SUM(TN[A])', 'FILTER(TN, TN[S] = "None")', None),
     ('SUM(TN[A])', 'FILTER(TN, ISBLANK(TN[S]))', None),
     ('SUM(TD[A])', 'FILTER(TD, LEN(TD[S]) = 10)', None),
+    # the ISO basic format is no date on any Python (issue #242): "20200101"
+    # meets no other cell
+    ('SUM(TI[A])', 'FILTER(TI, LEN(TI[S]) = 8)', None),
 ]
 
 
@@ -207,7 +210,6 @@ NOT_PUSHED = {
     "the text None next to BLANK, any condition": ['SUM(TA[A])', 'FILTER(TA, NOT ISBLANK(TA[S]))'],
     "ISO and d/m/Y text": ['SUM(TB[A])', 'FILTER(TB, LEN(TB[S]) = 10)'],
     "two offsets of one time": ['SUM(TC[A])', 'FILTER(TC, RIGHT(TC[TS], 6) = "+01:00")'],
-    "ISO basic and extended": ['SUM(TI[A])', 'FILTER(TI, LEN(TI[S]) = 8)'],
     "integers past 2**53": ['SUM(TBig[B])', 'FILTER(TBig, TBig[K] = 9007199254740993)'],
     "integers past 2**53, a combination": ['SUM(TBig[B])',
                                            'FILTER(TBig, TBig[K] = 9007199254740993 && TBig[A] = 1)'],
@@ -232,12 +234,10 @@ def test_no_rewrite_where_the_kept_values_are_not_filters_rows(name):
 
 
 # Where a reading meets another cell the rewrite is refused, and the answer
-# is FILTER's, which compares the cells themselves: "20200101" is not
-# "2020-01-01" (LEN 8 keeps 1), the key 2**53 + 1 is not 2**53 (2, alone and in
-# the combination), the text "5" is not the number 5 (1). 0.9.145 rewrote
-# these and answered 3.
+# is FILTER's, which compares the cells themselves: the key 2**53 + 1 is not
+# 2**53 (2, alone and in the combination), the text "5" is not the number 5
+# (1). 0.9.145 rewrote these and answered 3.
 REFUSED_VALUES = {
-    'CALCULATE(SUM(TI[A]), FILTER(TI, LEN(TI[S]) = 8))': 1,
     'CALCULATE(SUM(TBig[B]), FILTER(TBig, TBig[K] = 9007199254740993))': 2,
     'CALCULATE(SUM(TBig[B]), FILTER(TBig, TBig[K] = 9007199254740993 && TBig[A] = 1))': 2,
     'CALCULATE(SUM(TMix[A]), FILTER(TMix, TMix[S] = "5"))': 1,
@@ -248,6 +248,11 @@ KEPT_VALUES = {
     'CALCULATE(SUM(TN[A]), FILTER(TN, ISBLANK(TN[S])))': None,
     'CALCULATE(SUM(TD[A]), FILTER(TD, LEN(TD[S]) = 10))': 3,
     'CALCULATE(SUM(TD[A]), FILTER(TD, TD[S] = "2020-01-01"))': 1,
+    # "20200101" is not "2020-01-01" (LEN 8 keeps 1). On Python 3.11+, where
+    # fromisoformat read the basic format as a date, the In-set took one for
+    # the other: 0.9.145 rewrote and answered 3, 0.9.146 refused the rewrite
+    # there (and the test asking for that failed on 3.10; issue #242)
+    'CALCULATE(SUM(TI[A]), FILTER(TI, LEN(TI[S]) = 8))': 1,
 }
 
 

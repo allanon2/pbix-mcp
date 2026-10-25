@@ -40,9 +40,21 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-24 (0.9.146): docs 1-66 and GitHub issues/PRs #1-#227 are
+**Updated 2026-10-25 (0.9.147): docs 1-66 and GitHub issues/PRs #1-#246 are
+closed except #243; #247-#252 are open.** 0.9.147 closes PRs #205
+and #206 (issues #229-#233: the bounded filter cache, per-source filter
+propagation, column-aggregate memo and running totals, per-context fixed
+costs, pbix_evaluate_dax_batch) and #234-#242, #244-#246: EXCEPT / INTERSECT
+by cell, bare columns, a measure body without its caller's row, TOPNSKIP,
+one-sided 1:1, MOD by 0 and && / || stopping early, Int64 keys past 2^53,
+Fixed Decimal sums, ISO text on every Python, caught errors consumed, the
+shield analysis's date tables, correctly rounded SUM. Desktop: build_b234.py
+(31) and build_b247.py (73). #228 is closed into #243 (Desktop's summation
+order) and #246.
+
+As of 0.9.146 (2026-10-24): docs 1-66 and GitHub issues/PRs #1-#227 are
 closed except PRs #205 and #206, whose issues #229-#233 are planned for
-0.9.147 with #228 and #234-#243 (follow-ups settled by build_b234.py).** 0.9.146 closes #210-#227: the #203 pushdown's three wrong-answer
+0.9.147 with #228 and #234-#243 (follow-ups settled by build_b234.py). 0.9.146 closes #210-#227: the #203 pushdown's three wrong-answer
 cases (#210), SAMPLE and TOPN as Desktop answers them (#211, #212; PR #208),
 the DataModel stream bounds (#213; PR #209), transient mappings' caches (#214;
 PR #207), memo keys (#215-#220), text matched as text (#221, #222), DISTINCT,
@@ -547,6 +559,17 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **GH #229-#242, #244-#246** (PRs #205, #206 by @allanon2; the rest found by
+  0.9.146's units, settled by Desktop) -- CLOSED (0.9.147). Bounded filter
+  cache (#229); per-source propagation (#230); column-aggregate memo and exact
+  running-total partials (#231); per-context costs (#232); batch tool (#233);
+  EXCEPT / INTERSECT (#234); bare columns (#235); measure caller row and window
+  current rows (#236); TOPNSKIP (#237); one-sided 1:1 (#238); MOD / && / ||
+  (#239); keys past 2^53 (#240); Currency sums (#241); ISO text (#242); caught
+  errors (#244); shield date tables (#245); correctly rounded SUM (#246).
+  Desktop: build_b234.py, build_b247.py. Regression: tests/test_issue229_*.py
+  ... test_issue246_*.py (791 tests).
 
 - **GH #210-#227** (PRs #207, #208, #209 by @allanon2; the rest found by the
   fuzz of #203 and the PR audits) -- CLOSED (0.9.146). Pushdown guards (#210);

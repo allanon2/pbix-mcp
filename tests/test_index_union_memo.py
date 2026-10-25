@@ -53,7 +53,10 @@ def test_values_python_calls_equal_are_not_confused():
     assert ctx._indices_for_values(tbl, 3, [1, 0]) == frozenset()     # True is not 1 (#39)
 
 
-def test_year_to_date_by_country_and_day_through_the_memo():
+def test_year_to_date_by_country_and_day_through_the_memo(monkeypatch):
+    # the key path; propagation per filter context (#230) answers a direct
+    # hop from its row buckets and memoizes the rows by the dates instead
+    monkeypatch.setattr(de, "_FAST_PROPAGATION", False)
     tables = model()
     eng = de.DAXEngine()
     for day in DAYS:
@@ -67,12 +70,13 @@ def test_year_to_date_by_country_and_day_through_the_memo():
 
 
 def test_the_memo_starts_again_past_its_bound(monkeypatch):
+    # what it holds counts its keys too (issue #229)
     monkeypatch.setattr(de.DAXContext, "_UNION_MEMO_MAX_ROWS", 25)
     ctx = de.DAXContext(model(), {}, "Cal", "D", None, RELS)
     tbl = ctx.tables["F"]
-    ab = ctx._indices_for_values(tbl, 1, ["a", "b"])                   # 20 rows held
+    ab = ctx._indices_for_values(tbl, 1, ["a", "b"])                   # 20 rows, 2 keys held
     memo = ctx._filter_idx_cache["__index_unions__"]
-    assert memo["__rows__"] == 20
-    bc = ctx._indices_for_values(tbl, 1, ["b", "c"])                   # 40 > 25: starts again
-    assert memo["__rows__"] == 20 and len(memo) == 2
+    assert memo["__held__"] == 22
+    bc = ctx._indices_for_values(tbl, 1, ["b", "c"])                   # 44 > 25: starts again
+    assert memo["__held__"] == 22 and len(memo) == 2
     assert ctx._indices_for_values(tbl, 1, ["a", "b"]) == ab != bc
