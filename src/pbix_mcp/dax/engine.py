@@ -356,6 +356,11 @@ _RANGE_UNUSABLE = object()
 _RANGE_NO = (_MISSING, None)
 # The aggregates the running-total route answers.
 _RANGE_KINDS = frozenset({'SUM', 'AVERAGE', 'COUNT', 'COUNTA'})
+# The aggregates of a grouped table's own column a grouped batch reads off
+# the base's rows (DAXEngine._key_own_aggregate).
+_KEY_OWN_KINDS = frozenset({'MIN', 'MAX'})
+# _key_own_aggregate's record of a base that keeps every row.
+_ALL_ROWS = object()
 # make_value_matcher's ordering comparisons (_compare's spellings), each with
 # the bisection of the sorted keys that ends (an upper bound) or starts (a
 # lower bound) the window of keys it keeps.
@@ -379,6 +384,28 @@ _RANGE_LOWER = {'>': bisect.bisect_right, '>=': bisect.bisect_left, '=>': bisect
 # (h 10 to 21 us, s 0.34 to 0.78 us), the axis up to 3.1 s, the totals up to
 # 1.07 s; each factor is above the worst case seen.
 _RANGE_BUILD_FACTOR = 20.0
+# A grouped query's rows still to come, per thread: pbix_evaluate_dax_batch
+# sets, before each context, how many later contexts of the call share its
+# filters but for its grouped keys -- the rest of one visual's rows
+# (set_batch_ahead). While any are, the route builds a base's totals without
+# _range_pays: on its first request when the window is the grouped key (every
+# row then asks the same base), else on its second (a base that has repeated;
+# one that holds the row's own key never does). Power BI Desktop answers a visual's query
+# with one storage-engine scan per aggregation, grouped by the query's columns,
+# and evaluates every row over that scan (2.157's trace of a running total by
+# date: 9 scans for 4,017 dates). The rule stays for a lone call, which says
+# nothing about requests to come.
+_BATCH_STATE = threading.local()
+
+
+def set_batch_ahead(n: int) -> None:
+    """Tell the running-total route that ``n`` more rows of the same grouped
+    query follow in this thread (0: none known)."""
+    _BATCH_STATE.ahead = n
+
+
+def _batch_ahead() -> int:
+    return getattr(_BATCH_STATE, 'ahead', 0)
 _RANGE_OWNERS_FACTOR = 2.5
 _RANGE_HOP_FLOOR = 16.0
 _RANGE_CLAIM_FACTOR = 1.0
@@ -396,6 +423,14 @@ def _predicate_filters(fc: dict) -> list:
     for t in set(map(type, fc.values())):
         if issubclass(t, dict):
             return [(k, v) for k, v in fc.items() if isinstance(v, dict)]
+    return []
+
+
+def _group_filters(fc: dict) -> list:
+    """The filters of ``fc`` that are the query's grouping (GroupByValues),
+    as ``(key, values)`` pairs; looked for by type, as _predicate_filters."""
+    if GroupByValues in set(map(type, fc.values())):
+        return [(k, v) for k, v in fc.items() if type(v) is GroupByValues]
     return []
 
 
@@ -488,14 +523,22 @@ class _RangeAxis:
     keeps the D rows of a window of positions, plus the -1 rows when it keeps
     BLANK."""
 
-    __slots__ = ('keys', 'pos')
+    __slots__ = ('keys', 'pos', 'counts')
 
     def __init__(self, keys: list, pos):
         self.keys = keys
         self.pos = pos
+        # how many D rows hold each key: built with the axis, so the cache
+        # weighs it when the axis is stored
+        per = Counter(pos[:-2])
+        self.counts = [per.get(i, 0) for i in range(len(keys))]
+
+    def count(self, p: int) -> int:
+        """How many D rows hold the key at position p."""
+        return self.counts[p]
 
     def __len__(self) -> int:
-        return len(self.keys) + len(self.pos)
+        return len(self.keys) + len(self.pos) + len(self.counts)
 
 
 class _RangePartials:
@@ -1650,20 +1693,24 @@ def _var_block_keywords(text: str) -> list:
     return out
 
 
+@lru_cache(maxsize=4096)
 def _var_block_parts(text: str):
-    """([(name or None, expression)], RETURN expression or None) of a VAR
+    """(((name or None, expression), ...), RETURN expression or None) of a VAR
     block (_var_block_keywords); the RETURN expression runs to the end. A
-    declaration that is no `name = expression` has the name None."""
+    declaration that is no `name = expression` has the name None. A pure
+    function of the text, so each measure's block is split once, not on every
+    evaluation (a running total's VAR block, once per row of its visual: 6% of
+    a 4,017-row query); tuples, so no caller can change the shared answer."""
     decls: list = []
     kws = _var_block_keywords(text)
     for k, (_pos, kw, end) in enumerate(kws):
         if kw == 'RETURN':
-            return decls, text[end:].strip()
+            return tuple(decls), text[end:].strip()
         stop = kws[k + 1][0] if k + 1 < len(kws) else len(text)
         block = text[end:stop].strip()
         m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
         decls.append((m.group(1), m.group(2).strip()) if m else (None, block))
-    return decls, None
+    return tuple(decls), None
 
 
 def _strip_line_comments(expr):
@@ -10242,8 +10289,10 @@ class DAXEngine:
             return None if hit is _AGG_BLANK else hit
         got: Any = _MISSING
         note = None
-        if preds and kind in _RANGE_KINDS:
+        if kind in _RANGE_KINDS and (preds or _group_filters(actx.filter_context)):
             got, note = self._range_aggregate(kind, actx, tname, tbl, idx, preds)
+        elif kind in _KEY_OWN_KINDS and _batch_ahead():
+            got = self._key_own_aggregate(actx, tname, tbl, idx, compute)
         if got is _MISSING:
             got = (compute(actx.get_column_data(*col)) if note is None
                    else self._range_scan(actx, note, tname, col, compute))
@@ -10334,9 +10383,16 @@ class DAXEngine:
         rkey = None
         for k, spec in (_predicate_filters(fc) if preds is None else preds):
             if _is_inequality(spec):
+                if ctx.model_table(k.partition('.')[0]) == tname:
+                    continue          # a comparison on T's own column: part of the base
                 if rkey is not None:
                     return _RANGE_NO
                 rkey = k
+        keyed = False
+        if rkey is None:
+            # no window comparison: the grouped key of another table, if one (_range_group_key)
+            rkey = self._range_group_key(ctx, fc, tname)
+            keyed = True
         if rkey is None or ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
             return _RANGE_NO
         if not self._range_joins_current(ctx) or self._range_row_transition(fc, tname):
@@ -10345,9 +10401,9 @@ class DAXEngine:
         if not sep or dname == tname:
             return _RANGE_NO
         spec = fc[rkey]
-        bounds = _range_bounds(spec)
+        bounds = None if keyed else _range_bounds(spec)
         dtbl = ctx.tables.get(dname)
-        if bounds is None or not dtbl:
+        if (bounds is None and not keyed) or not dtbl:
             return _RANGE_NO
         x_idx = ctx._find_col_idx(dtbl.get('columns') or [], xcol)
         hop = self._range_hop(ctx, tname, tbl, dname, dtbl) if x_idx >= 0 else None
@@ -10377,9 +10433,10 @@ class DAXEngine:
             note = (skey, hkey, dname, dtbl)
             seen = cache.get(skey)
             hops = cache.get(hkey) if hkey is not None else None
-            if seen is None or not self._range_pays(
+            grouped = _batch_ahead() and (keyed or seen is not None)
+            if not grouped and (seen is None or not self._range_pays(
                     seen, hops[0] if hops is not None and hops[0] < math.inf else None,
-                    owners is None, axis is None, len(tbl['rows']), len(dtbl['rows'])):
+                    owners is None, axis is None, len(tbl['rows']), len(dtbl['rows']))):
                 return _MISSING, note
             if owners is None:
                 owners = self._range_owners(ctx, okey, tname, tbl, hop[0], dname, dtbl, hop[1])
@@ -10396,6 +10453,12 @@ class DAXEngine:
                               + (len(part) if part is not _RANGE_UNUSABLE else 0))
         if part is _RANGE_UNUSABLE:
             return _RANGE_NO
+        if keyed:
+            axis = cache.get(akey)
+            win = self._range_key_window(ctx, dtbl, x_idx, axis, spec) if isinstance(axis, _RangeAxis) else None
+            if win is None:
+                return _RANGE_NO
+            return part.answer(kind, win[0], win[1], False), None
         try:
             # whether the window keeps D's BLANK x and blank row, as the hop
             # decides it (_filters_admit_blank)
@@ -10421,6 +10484,110 @@ class DAXEngine:
         takes the set's own (see _range_aggregate)."""
         joins = _relationship_indexes(ctx.relationships)[6]
         return joins is ctx._date_part_joins or joins == ctx._date_part_joins
+
+    def _key_own_aggregate(self, ctx: DAXContext, tname: str, tbl: dict, idx: int, compute) -> Any:
+        """``compute`` of tbl's column idx under a grouping by one of tbl's
+        own columns, for a row of a grouped batch: the rows the rest of the
+        filters keep (the base) found once per base and kept, and this row's
+        the base's rows that hold its key; _MISSING for the scan.
+
+        A visual's rows ask MIN('Calendar'[Date]) and MAX('Calendar'[Date])
+        each under their own date, and every one scanned Calendar again.
+        Power BI Desktop 2.157 takes MIN and MAX of the date in one scan
+        grouped by the date for the whole query (the trace of a running total
+        by date over 4,017 dates).
+
+        The scan intersects one set of rows per filter (_surviving_indices),
+        the key's from _column_filter_rows, as here; so the base's rows and
+        the key's are the scan's rows, provided the other tables' filters
+        reach tbl the same with and without the key. They do when nothing
+        filters back toward tbl: no active relationship is bidirectional or
+        one-to-one (a conservative condition). The base is read through
+        without_filters, which takes the relationship set's own date-part
+        joins: not in a context that keeps another set's (_range_joins_current).
+        The values are read in row order and given to the scan's own
+        ``compute``."""
+        fc = ctx.filter_context
+        if ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
+            return _MISSING
+        if not self._range_joins_current(ctx):
+            # a USERELATIONSHIP / CROSSFILTER context keeps its set's date-part
+            # joins, while the base, read through without_filters, takes the
+            # set's own (see _range_aggregate)
+            return _MISSING
+        keys = [k for k, _v in _group_filters(fc) if k.partition('.')[0] == tname]
+        if len(keys) != 1 or self._range_row_transition(fc, tname):
+            return _MISSING
+        rkey = keys[0]
+        spec = fc[rkey]
+        if not isinstance(spec, list) or any(v is None for v in spec):
+            return _MISSING
+        x_idx = ctx._find_col_idx(tbl.get('columns') or [], rkey.partition('.')[2])
+        if x_idx < 0:
+            return _MISSING
+        for r in ctx.relationships:
+            if r.get('IsActive') and (r.get('CrossFilteringBehavior') == 2
+                                      or (r.get('FromCardinality'), r.get('ToCardinality')) == (1, 1)):
+                return _MISSING
+        cache = ctx._filter_idx_cache
+        try:
+            base_sig = ctx._filters_sig() - {(rkey, ctx._filters_sigd()[rkey])}
+            bkey = (id(tbl), 'key-base-rows', x_idx, base_sig, ctx._rels_sig,
+                    ctx.date_table, ctx.date_column, ctx._date_part_joins)
+            base: Any = cache.get(bkey)
+        except (TypeError, KeyError):
+            return _MISSING
+        if base is None:
+            base = ctx.without_filters([rkey])._surviving_indices(tname, tbl)
+            base = _ALL_ROWS if base is None else base
+            _put_filter_entry(cache, bkey, base, 3 + ctx._filters_sig_weight()
+                              + (0 if base is _ALL_ROWS else len(base)))
+        keep = ctx._column_filter_rows(tbl, x_idx, spec)
+        if base is not _ALL_ROWS:
+            keep = keep & base
+        rows = tbl['rows']
+        return compute([rows[i][idx] for i in sorted(keep)])
+
+    @staticmethod
+    def _range_group_key(ctx: DAXContext, fc: dict, tname: str) -> Optional[str]:
+        """The filter_context key of the query's grouping (GroupByValues) on
+        a column of another table than tname, when there is exactly one; None
+        otherwise. A visual's rows differ in their grouped keys only, so under
+        a grouping by D[x] every row asks the same base -- the filter set
+        without x -- and the row's own total is the window of x's one key:
+        Desktop scans SUM(T[c]) grouped by the query's columns once and reads
+        each row's group off that scan."""
+        found = None
+        for k, v in _group_filters(fc):
+            if ctx.model_table(k.partition('.')[0]) == tname:
+                continue
+            if found is not None:
+                return None
+            found = k
+        return found
+
+    @staticmethod
+    def _range_key_window(ctx: DAXContext, dtbl: dict, x_idx: int, axis: _RangeAxis,
+                          spec) -> Optional[tuple]:
+        """``(lo, hi)``: the window of positions the In-set ``spec`` on D[x]
+        keeps, when it keeps exactly the D rows of one position (one key, every
+        D row holding it) or none; None otherwise, for the scan. The rows are
+        found as the scan finds them (_column_filter_rows, the column's typed
+        index), so a spelling the scan matches differently is never read as
+        the key. A BLANK in the set keeps the -1 rows and D's blank row: the
+        scan."""
+        if not isinstance(spec, list) or any(v is None for v in spec):
+            return None
+        rows = ctx._column_filter_rows(dtbl, x_idx, spec)
+        if not rows:
+            return 0, 0
+        pos = axis.pos
+        p = pos[next(iter(rows))]
+        if p < 0 or any(pos[j] != p for j in rows):
+            return None
+        if len(rows) != axis.count(p):
+            return None
+        return p, p + 1
 
     @staticmethod
     def _range_row_transition(fc: dict, tname: str) -> bool:

@@ -769,7 +769,7 @@ def test_entries_are_named_and_weighed(eager):
     # per date, the blank row and "no row", and the 90 keys; three running
     # lists over the 90 dates, and the base filter set the key holds
     assert len(owners[0]) == len(tables["Sales"]["rows"])
-    assert len(axes[0]) == 90 + 2 + 90
+    assert len(axes[0]) == 90 + 2 + 90 + 90      # keys, positions (and the two markers), rows per key
     pkey, part = partials[0]
     assert len(part) == 3 * 91 + len(pkey[5])
     assert all(isinstance(k[1], str) for k in cache if isinstance(k, tuple) and len(k) > 1

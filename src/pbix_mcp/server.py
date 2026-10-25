@@ -21,6 +21,7 @@ import copy
 import difflib
 import hashlib
 import io
+import collections
 import json
 import math
 import os
@@ -14514,6 +14515,32 @@ def pbix_evaluate_dax(
 
 
 _BATCH_CONTEXT_KEYS = ("filter_context", "group_by", "selected_filter_context")
+
+
+def _batch_ahead_counts(items: list) -> list:
+    """For each context, how many later contexts of the batch have the same
+    group_by keys and the same filters but for those keys: the other rows of
+    one visual, which ask the same aggregates under the same base filters
+    (dax_engine.set_batch_ahead). A context that is not an object counts as
+    unlike every other."""
+    sigs = []
+    for item in items:
+        try:
+            fc = item.get("filter_context") or {}
+            gb = item.get("group_by") or []
+            sigs.append(json.dumps([sorted(gb), {k: v for k, v in fc.items() if k not in gb}],
+                                   sort_keys=True, default=str))
+        except (AttributeError, TypeError, ValueError):
+            sigs.append(None)
+    left = collections.Counter(s for s in sigs if s is not None)
+    out = []
+    for s in sigs:
+        if s is None:
+            out.append(0)
+            continue
+        left[s] -= 1
+        out.append(left[s])
+    return out
 _BATCH_CONTEXT_SHAPE = ('{"filter_context": {"Table.Column": [values]}, '
                         '"group_by": ["Table.Column"], '
                         '"selected_filter_context": {"Table.Column": [values]}}')
@@ -14651,23 +14678,28 @@ def pbix_evaluate_dax_batch(
                     len(measure_names), len(items), alias)
         cache: dict = {}
         answers = []
-        for item in items:
-            problem = _batch_context_problem(item)
-            if problem is not None:
-                answers.append(ToolResponse.error(problem, "INVALID_INPUT").to_text())
-                continue
-            # The arguments pbix_evaluate_dax would get, so that the same code
-            # parses, validates and answers them; omitted or null is the
-            # argument's default.
-            fc, gb, sel = (item.get(k) for k in _BATCH_CONTEXT_KEYS)
-            answers.append(_evaluate_dax_for_context(
-                ctx, alias, measure_names,
-                "" if fc is None else json.dumps(fc), False, -1,
-                "" if gb is None else json.dumps(gb),
-                "" if sel is None else json.dumps(sel),
-                cache))
-            if dax_engine.query_memo_entries(cache) > _BATCH_MEMO_MAX_ENTRIES:
-                cache = {}
+        ahead = _batch_ahead_counts(items)
+        try:
+            for item, n_ahead in zip(items, ahead):
+                dax_engine.set_batch_ahead(n_ahead)
+                problem = _batch_context_problem(item)
+                if problem is not None:
+                    answers.append(ToolResponse.error(problem, "INVALID_INPUT").to_text())
+                    continue
+                # The arguments pbix_evaluate_dax would get, so that the same code
+                # parses, validates and answers them; omitted or null is the
+                # argument's default.
+                fc, gb, sel = (item.get(k) for k in _BATCH_CONTEXT_KEYS)
+                answers.append(_evaluate_dax_for_context(
+                    ctx, alias, measure_names,
+                    "" if fc is None else json.dumps(fc), False, -1,
+                    "" if gb is None else json.dumps(gb),
+                    "" if sel is None else json.dumps(sel),
+                    cache))
+                if dax_engine.query_memo_entries(cache) > _BATCH_MEMO_MAX_ENTRIES:
+                    cache = {}
+        finally:
+            dax_engine.set_batch_ahead(0)
         # Each answer is a complete response object already: they are joined
         # as they are, in DAXEvalResponse's envelope, rather than parsed and
         # dumped again.
