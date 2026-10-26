@@ -52,12 +52,25 @@ import time
 from calendar import monthrange
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
+from fractions import Fraction
 from functools import lru_cache
 from itertools import accumulate, compress, repeat
 from typing import AbstractSet, Any, Optional
 
 from pbix_mcp.dax import collation as _collation
+from pbix_mcp.dax import se_scan as _se_scan
 from pbix_mcp.errors import DAXEvaluationError as _DAXEvaluationError
+
+
+def _uncatchable(exc: Exception) -> Exception:
+    """``exc`` marked as an error IFERROR / ISERROR cannot catch
+    (DAXEngine._eval_catching re-raises it). Some such errors Desktop
+    reports before evaluating anything, so IF(FALSE(), <it>, 1) fails too
+    (the ORDER refusal, _order_definition_error, checked per measure); others
+    only where the call runs (GENERATESERIES' step and BLANK errors:
+    build_b257d.py e_gs_if_false is 7)."""
+    exc._dax_uncatchable = True  # type: ignore[attr-defined]
+    return exc
 
 # Sentinel returned by _eval_binary to mean "this expression is NOT a binary
 # expression" — distinct from a genuine BLANK (None) result of an operation such
@@ -70,21 +83,452 @@ _NOT_APPLICABLE = object()
 # "this bare column name resolves to nothing").
 _MISSING = object()
 
+# No columns (DAXEngine._se_fused), and the types whose sums are exact in any
+# order (DAXEngine._se_total, issue #243).
+_NO_COLUMNS: frozenset = frozenset()
+_INT_KINDS = frozenset({int, bool})
+
 # An aggregation call in a FILTER condition aggregates over the context rather
 # than the iterated row, so its column references must NOT be substituted with
 # the row's values (see _fn_filter).
 
 class _Currency(float):
-    """Marker for DAX's Fixed Decimal (Currency) type. CURRENCY() returns it;
-    ISCURRENCY / ISDECIMAL test for it -- Desktop treats the two names as the
-    same underlying type (ISDECIMAL(CURRENCY(1)) is TRUE, ISDECIMAL(1.5) is
-    FALSE). A sum of Currency values is one too (_currency_total, issue
-    #241); arithmetic on it returns a plain float."""
-    __slots__ = ()
+    """DAX's Fixed Decimal (Currency) type: a whole count of 1/10,000 in a
+    signed 64-bit integer. CURRENCY() returns it; ISCURRENCY / ISDECIMAL
+    test for it -- Desktop treats the two names as the same underlying type
+    (ISDECIMAL(CURRENCY(1)) is TRUE, ISDECIMAL(1.5) is FALSE).
+
+    The float is the count over 10,000. A count past 2^51, where that float
+    no longer gives the count back, also keeps it exactly in ``n``
+    (_cur_make; _cur_count reads it): Power BI Desktop 2.152 adds,
+    multiplies by an Integer and prints such counts exactly (build_b254b.py
+    a_fe_big, issue #248: CURRENCY("900719925474.0993") * 3 is
+    2702159776422.2979, the count 2^53 + 1 survives + 0 and * 1).
+
+    Reads of a Fixed Decimal column, the arithmetic, the aggregates and the
+    functions over it keep the type, as Desktop does (issue #248; the
+    _cur_* helpers below); base-table rows keep plain floats (see
+    mark_currency_columns).
+
+    + - * / with a number are Desktop's Currency arithmetic (_cur_arith):
+    Python hands ``float op _Currency`` and ``int op _Currency`` to the
+    reflected methods here, so the engine's arithmetic needs no test of its
+    own on the operands -- a sum of Doubles pays nothing for the type."""
+    __slots__ = ('n',)
+    n: int
+
+    def __add__(self, other):
+        return _cur_arith('+', self, other) if isinstance(other, (int, float)) else NotImplemented
+
+    def __radd__(self, other):
+        return _cur_arith('+', other, self) if isinstance(other, (int, float)) else NotImplemented
+
+    def __sub__(self, other):
+        return _cur_arith('-', self, other) if isinstance(other, (int, float)) else NotImplemented
+
+    def __rsub__(self, other):
+        return _cur_arith('-', other, self) if isinstance(other, (int, float)) else NotImplemented
+
+    def __mul__(self, other):
+        return _cur_arith('*', self, other) if isinstance(other, (int, float)) else NotImplemented
+
+    def __rmul__(self, other):
+        return _cur_arith('*', other, self) if isinstance(other, (int, float)) else NotImplemented
+
+    def __truediv__(self, other):
+        return _cur_arith('/', self, other) if isinstance(other, (int, float)) else NotImplemented
+
+    def __rtruediv__(self, other):
+        return _cur_arith('/', other, self) if isinstance(other, (int, float)) else NotImplemented
 
 
 # a value's count of 1/10,000 before rounding (_currency_total)
 _CURRENCY_SCALE = (10000.0).__mul__
+
+# ---- Fixed Decimal (Currency) arithmetic, issue #248 -------------------------
+# Power BI Desktop 2.152's answers over ADOMD, black-box (batteries
+# build_b254.py, build_b254b.py): a Currency is a signed 64-bit count of
+# 1/10,000.
+_I64_MIN = -(1 << 63)
+_I64_MAX = (1 << 63) - 1
+# below 2^51 counts, round(n / 10000 * 10000) is n again (_currency_total)
+_CUR_EXACT = 1 << 51
+# Desktop's text (in Norwegian: "Resultatet av en konverteringsoperasjon
+# eller en aritmetisk operasjon er enten for stort eller for lite.") for
+# CURRENCY(1E15), CURRENCY(5E14) * 2.5 and CONVERT(1E19, INTEGER)
+# (build_b254b.py g_ovf_conv, g_ovf_mul, g_ovf_int)
+_CUR_RANGE_MSG = ("The result of a conversion or arithmetic operation is either "
+                  "too large or too small.")
+# "Deling på null er funnet." for CURRENCY(1) / 0, / BLANK(), / 0.0 and
+# / FALSE() (build_b254.py d0_ci, d0_cb, d0_zz; build_b254b.py d0_cd, d0_cf)
+_DIV0_MSG = "Division by zero was encountered."
+# "Et argument i funksjonen POWER har feil datatype, eller resultatet er for
+# stort eller for lite." for 0 ^ 0 (build_b248c.py a_err_pow00): the ^
+# operator is POWER, and its domain and range errors are POWER's
+# (#314, _dax_pow)
+_POWER_MSG = ("An argument of function 'POWER' has the wrong data type or the result is "
+              "too large or too small.")
+_CUR_DEC_CTX = decimal.Context(prec=60, rounding=decimal.ROUND_HALF_EVEN)
+
+
+def _wrap64(n: int) -> int:
+    """``n`` wrapped into a signed 64-bit integer, two's complement. Desktop's
+    integer Currency arithmetic wraps: CURRENCY(5E14) + CURRENCY(5E14) and
+    CURRENCY(5E14) * 2 are -844674407370955.1616, SUM of three 4E14 rows
+    -644674407370955.1616 (build_b254.py o_scalar, o_column;
+    #308)."""
+    if _I64_MIN <= n <= _I64_MAX:
+        return n
+    return ((n - _I64_MIN) & 0xFFFFFFFFFFFFFFFF) + _I64_MIN
+
+
+# |value| below which a Currency carries no exact count ``n`` (_cur_make sets
+# it from 2^51 counts, 225,179,981,368.5248, on): reading the unset slot costs
+# an AttributeError inside getattr, so the usual value is not asked
+_CUR_N_BELOW = 2.2e11
+
+
+def _cur_count(v: float) -> int:
+    """A Currency value's (or a Currency column's float's) count of 1/10,000."""
+    if -_CUR_N_BELOW < v < _CUR_N_BELOW:
+        return round(_CURRENCY_SCALE(v))
+    n: Optional[int] = getattr(v, 'n', None)
+    return round(_CURRENCY_SCALE(v)) if n is None else n
+
+
+def _cur_count_any(v: float) -> int:
+    """_cur_count, an Int64 (or TRUE / FALSE) beside a Currency as its count."""
+    t = type(v)
+    if t is int or t is bool:
+        return int(v) * 10000
+    if -_CUR_N_BELOW < v < _CUR_N_BELOW:
+        return round(_CURRENCY_SCALE(v))
+    n: Optional[int] = getattr(v, 'n', None)
+    return round(_CURRENCY_SCALE(v)) if n is None else n
+
+
+def _cur_make(n: int) -> '_Currency':
+    """The Currency of count ``n``, which the caller has wrapped or checked."""
+    c = _Currency(n / 10000)
+    if not -_CUR_EXACT < n < _CUR_EXACT:
+        c.n = n
+    return c
+
+
+def _cur_checked(n: int) -> int:
+    """``n`` when it fits the Currency range, else Desktop's overflow error:
+    a conversion from a Double raises where the integer arithmetic wraps
+    (build_b254.py o_scalar: CURRENCY(1E15), CURRENCY(5E14) * 2.5 and
+    CURRENCY(5E14) / 0.1 are errors; build_b254b.py g_ovf: CURRENCY(5E14) *
+    2.0 too; #308)."""
+    if _I64_MIN <= n <= _I64_MAX:
+        return n
+    raise _DAXEvaluationError(_CUR_RANGE_MSG)
+
+
+def _div_half_away(num: int, den: int) -> int:
+    """num / den rounded half away from zero, exactly (den != 0)."""
+    if den < 0:
+        num, den = -num, -den
+    q, r = divmod(abs(num), den)
+    if 2 * r >= den:
+        q += 1
+    return q if num >= 0 else -q
+
+
+def _round_double_half_away(q: float) -> int:
+    """A Double rounded to a whole number half away from zero; an infinity
+    or NaN is out of the Currency range."""
+    if q != q or q in (math.inf, -math.inf):
+        raise _DAXEvaluationError(_CUR_RANGE_MSG)
+    a = abs(q)
+    f = math.floor(a)
+    n = f + 1 if a - f >= 0.5 else f
+    return n if q >= 0 else -n
+
+
+def _dax_pow(base, exp):
+    """``base ^ exp`` and POWER(base, exp), numbers or None for BLANK, as
+    Power BI Desktop 2.152 answers them (#314,
+    #321): a Double; a BLANK base is BLANK (BLANK() ^ 0
+    and BLANK() ^ 2 are BLANK), a BLANK exponent is 0 (2 ^ BLANK() is 1);
+    a negative base takes an odd root -- (-8) ^ (1 / 3) is -2 -- and no
+    other fractional exponent ((-8) ^ 0.5 and POWER(-8, 0.5) are errors);
+    0 ^ 0, 0 ^ -1 and a result past the Double's range (10 ^ 400) are
+    POWER's error (build_b248c.py b_pow, b_pow2, a_err_pow00; build_b254b.py
+    h_pow). The odd root is taken where the exponent is the Double 1 / n of
+    an odd n, the measured case; (-8) ^ (2 / 3) stays an error (not
+    measured, build_b248g.py asks).
+
+    A BLANK base with a BLANK exponent is 0 ^ 0, POWER's error: Power BI
+    Desktop 2.152 (build_b248g.py p_pow) answers BLANK() ^ BLANK() E, where
+    POWER(BLANK(), 0) is BLANK and 0 ^ BLANK() E."""
+    if base is None:
+        if exp is None:
+            raise _DAXEvaluationError(_POWER_MSG)
+        return None
+    b = float(base)
+    e = 0.0 if exp is None else float(exp)
+    if b > 0:
+        # the usual case: no domain to check
+        try:
+            return math.pow(b, e)
+        except OverflowError:
+            raise _DAXEvaluationError(_POWER_MSG) from None
+    if b == 0 and e <= 0:
+        raise _DAXEvaluationError(_POWER_MSG)
+    sign = 1.0
+    if b < 0 and e == e and not e.is_integer():
+        r = 1.0 / e if e else 0.0
+        n = round(r) if math.isfinite(r) else 0
+        if n % 2 != 1 or 1.0 / n != e:
+            raise _DAXEvaluationError(_POWER_MSG)
+        b, sign = -b, -1.0
+    try:
+        out = math.pow(b, e)
+    except (ValueError, OverflowError):
+        raise _DAXEvaluationError(_POWER_MSG) from None
+    return -out if sign < 0 else out
+
+
+def _cur_sig_count(sig) -> int:
+    """CEILING's / FLOOR's / MROUND's significance beside a Currency, as its
+    whole count of 1/10,000: a Currency's count, an Int64's * 10,000, a
+    Double's x 10,000 when that is a whole count (0.01 is 100, 0.07 700 --
+    its Double 700.0000000000001); 0 for a significance of no whole count
+    or past the range (0.00001, 1E16), whose callers take the Double's
+    arithmetic and convert its result (_cur_double_multiple; Power BI
+    Desktop 2.152, build_b248c.py h_fn_edges: MROUND(CURRENCY(1.2345),
+    0.00001) and CEILING(.., 0.00001) are C1.2345, FLOOR(.., 1E16) C0;
+    #305). It was rounded to a count: 0.00001 to 0, where
+    a Double came back, and 1E16 past the range, an error."""
+    t = type(sig)
+    if t is _Currency:
+        return _cur_count(sig)
+    if t is int or t is bool:
+        n = int(sig) * 10000
+    else:
+        x = float(sig) * 10000.0
+        if not math.isfinite(x):
+            return 0
+        n = round(x)
+        if abs(x - n) > 1e-9 * abs(x):
+            return 0
+    return n if _I64_MIN <= n <= _I64_MAX else 0
+
+
+def _cur_double_multiple(val, sig, step) -> '_Currency':
+    """A Currency rounded to a multiple of ``sig`` in Double arithmetic
+    (``step``: math.ceil / math.floor / half away from zero of val / sig),
+    the result converted to a Currency (_cur_sig_count's fallback)."""
+    try:
+        return _cur_from_double(step(float(val) / float(sig)) * float(sig))
+    except (OverflowError, ValueError):
+        raise _DAXEvaluationError(_CUR_RANGE_MSG) from None
+
+
+def _half_away_whole(q: float) -> int:
+    """A Double rounded to a whole number half away from zero (MROUND)."""
+    return math.floor(q + 0.5) if q >= 0 else math.ceil(q - 0.5)
+
+
+def _cur_from_double(x: float) -> '_Currency':
+    """CURRENCY(<Double>), CONVERT(<Double>, CURRENCY): x * 10000 in Double,
+    rounded half away from zero (build_b254b.py a_fe_conv: CURRENCY(0.00035)
+    is 4 counts, 0.00045 5, 0.00065 7, -0.00035 -4 -- the products 3.5, 4.5,
+    6.5 of the binary values below the ties; build_b254.py r_cur_lit,
+    r_cur_col, r_conv_col: 1/32 is 313 counts, 0.00015 is 1;
+    #310). Past the range an error (_cur_checked)."""
+    return _cur_make(_cur_checked(_round_double_half_away(x * 10000.0)))
+
+
+def _cur_from_text(s: str, culture=None) -> '_Currency':
+    """CURRENCY(<text>), CONVERT(<text>, CURRENCY): the text read as an exact
+    decimal and rounded half to EVEN (build_b254.py r_cur_text: "0.00005" is
+    0, "0.00015" 2, "0.00025" 2, "1.00005" 1.0000, "0.03125" 0.0312;
+    build_b254b.py a_text: CONVERT("0.00015", CURRENCY) 2 counts, "1.5E-4"
+    and " 0.00025 " 2). Text that is no number, "" too, is an error
+    (CURRENCY("abc"), CURRENCY("") are errors on Desktop;
+    #309)."""
+    t = s.strip()
+    d = None
+    try:
+        d = decimal.Decimal(t)
+    except (decimal.InvalidOperation, ValueError):
+        # the culture's group separator and a currency symbol, as arithmetic
+        # reads text (_arith_text_number)
+        group, dec = _culture_seps(culture)
+        u = t[1:].strip() if t[:1] in _CURRENCY_CHARS else t[:-1].strip() if t[-1:] in _CURRENCY_CHARS else t
+        u = u.replace(group, '').replace(' ', '') if group else u
+        if dec != '.':
+            u = u.replace(dec, '.')
+        try:
+            d = decimal.Decimal(u) if u else None
+        except (decimal.InvalidOperation, ValueError):
+            d = None
+    if d is None or not d.is_finite():
+        f = _arith_text_number(t, culture) if t else None
+        if f is None:
+            raise _DAXEvaluationError(f"Cannot convert value '{s}' of type Text to type Currency.")
+        return _cur_from_double(f)
+    n = int(d.scaleb(4, _CUR_DEC_CTX).to_integral_value(rounding=decimal.ROUND_HALF_EVEN,
+                                                         context=_CUR_DEC_CTX))
+    return _cur_make(_cur_checked(n))
+
+
+def _cur_from_value(v, culture=None):
+    """A value converted to Currency (CURRENCY(), CONVERT(..., CURRENCY), a
+    DIVIDE alternate): BLANK stays BLANK, TRUE is 1, an Int64 is its count
+    WRAPPED (build_b254b.py g_ovf: CURRENCY(1) + 1000000000000000 and
+    CONVERT(1000000000000000, CURRENCY) wrap), a Double and a date convert
+    as _cur_from_double (a_text: CURRENCY(DATE(2024, 1, 1)) is 45292), text
+    as _cur_from_text."""
+    if isinstance(v, list):
+        v = _scalarize(v)
+    if v is None:
+        return None
+    t = type(v)
+    if t is _Currency:
+        return v
+    if t is bool:
+        return _cur_make(int(v) * 10000)
+    if t is int:
+        return _cur_make(_wrap64(v * 10000))
+    if isinstance(v, float):
+        return _cur_from_double(float(v))
+    if isinstance(v, str):
+        return _cur_from_text(v, culture)
+    if isinstance(v, (datetime, date)):
+        n = _as_number(v)
+        return None if n is None else _cur_from_double(float(n))
+    if isinstance(v, int):
+        return _cur_make(_wrap64(int(v) * 10000))
+    raise _DAXEvaluationError(f"Cannot convert value '{v}' to type Currency.")
+
+
+def _cur_avg(total: int, k: int) -> '_Currency':
+    """AVERAGE / AVERAGEX / AVERAGEA of Currency: the exact total of the
+    counts over the count, rounded half away from zero (build_b254.py r_avg,
+    r_avgx: 0.5, 1.5, 2.5, -0.5, -1.5, 2/3, 1/3, -2/3 and -2.5 counts give
+    1, 2, 3, -1, -2, 1, 0, -1, -3; a_col AVERAGE(TCur3[v]) 0.1333)."""
+    return _cur_make(_div_half_away(total, k))
+
+
+def _cur_half_up(r: Fraction) -> int:
+    """A rational count rounded half toward +infinity (_cur_percentile)."""
+    return math.floor(r + Fraction(1, 2))
+
+
+def _cur_percentile(counts: list, pos) -> '_Currency':
+    """MEDIAN / MEDIANX / PERCENTILE(X).INC/EXC of Currency: the counts
+    interpolated at ``pos`` (0-based) exactly, a tie rounded toward
+    +infinity (build_b254.py r_median: (0, 1) gives 1, (1, 2) 2, (0, 5) 3,
+    (-1, 0) 0; build_b254b.py f_median: MEDIANX over (-1, 0) 0 and (-3, 0)
+    -1, PERCENTILEX.INC(TR, TR[v], 0.25) over -7..7 counts -3)."""
+    c = sorted(counts)
+    p = Fraction(pos)
+    lo = math.floor(p)
+    hi = min(lo + 1, len(c) - 1)
+    return _cur_make(_cur_half_up(c[lo] + (c[hi] - c[lo]) * (p - lo)))
+
+
+def _cur_text(v) -> str:
+    """A Currency value's text: its exact decimal digits, no trailing zeros
+    (build_b254.py m_fmt: CURRENCY(123456789012.3456) & "" is
+    123456789012.3456 where the Double prints 123456789012.346;
+    CURRENCY(-1.5) & "" -1.5; build_b254b.py g_text: the wrapped
+    -844674407370955.1616 and the extremes +-922337203685477.5807/.5808)."""
+    n = _cur_count(v)
+    if n == 0:
+        return '0'
+    return format(decimal.Decimal(n).scaleb(-4, _CUR_DEC_CTX).normalize(_CUR_DEC_CTX), 'f')
+
+
+def _cur_decimal(v) -> decimal.Decimal:
+    """A Currency value as its exact decimal (FORMAT's custom formats)."""
+    return decimal.Decimal(_cur_count(v)).scaleb(-4, _CUR_DEC_CTX)
+
+
+# ``on`` while a storage-engine shaped iteration evaluates its row expression
+# (DAXEngine._se_value_space): Currency * Double then works on the values.
+# Per thread, as an evaluation is.
+_SE_STATE = threading.local()
+
+
+def _cur_div0_error() -> Exception:
+    """The error of a Currency divided by a zero that is no Currency: the
+    formula engine's "Division by zero was encountered." (build_b254.py
+    d0_ci .. d0_cf, #307); in a storage-engine iteration
+    (_SE_STATE) the quotient's conversion past the Currency range
+    (build_b248c.py d_div0_se_raw, d_div0_se_g: SUMX(T3, T3[v] / (T3[id] -
+    1)) fails with "The result of a conversion or arithmetic operation is
+    either too large or too small.", #318)."""
+    return _DAXEvaluationError(_CUR_RANGE_MSG if getattr(_SE_STATE, 'on', False) else _DIV0_MSG)
+
+
+def _cur_arith(op: str, a, b):
+    """``a op b`` where a side is a Fixed Decimal (Currency) and the other a
+    number, as Power BI Desktop 2.152 computes it (issue #248;
+    build_b254.py, build_b254b.py). A Currency is a 64-bit count of
+    1/10,000; an Int64 (or TRUE / FALSE, or BLANK as 0) beside it counts as
+    a whole number, a Double (text read as one) as a Double.
+
+    + and -: Currency with Currency / Int64 is the exact count, wrapped past
+    the range (t_add: CURRENCY(1.0001) + 2 is C3.0001; o_scalar:
+    CURRENCY(5E14) + CURRENCY(5E14) wraps); with a Double it is the Double
+    sum (CURRENCY(1.0001) + 0.00002 is D1.00012).
+
+    *: Currency * Int64 is the exact count, wrapped (t_mul: C3.0003;
+    a_fe_big: CURRENCY("900719925474.0993") * 3 exact past 2^53); Currency *
+    Double is the Double product of the count and the Double, rounded half
+    away from zero to a count (a_fe_mul: CURRENCY(1) * 0.00015 is 1 count, *
+    0.00035 4, * 0.00045 5 -- the IEEE products 1.4999999999999998,
+    3.5000000000000004, 4.5; r_mul05: counts 1, 3, 5 times 0.5 are 1, 2, 3),
+    an error past the range (g_ovf: CURRENCY(5E14) * 2.0); Currency *
+    Currency is the Double product (t_mul: D1.00020001). In a storage-engine
+    iteration the Currency * Double product is taken on the values instead
+    (_SE_STATE, DAXEngine._se_value_space; #318).
+
+    /: Currency / Int64 and / Double are the count's Double quotient rounded
+    half away (t_div: CURRENCY(1) / 3 is C0.3333; a_fe_big:
+    CURRENCY("900719925474.0993") / 1 is ...0992, the count's Double); any /
+    Currency is the Double quotient (1 / CURRENCY(3) D0.333333333,
+    CURRENCY(1) / CURRENCY(0) +Infinity, d0_zc CURRENCY(0) / CURRENCY(0) NaN).
+    A Currency divided by an Int64, Double, BLANK or FALSE zero is Desktop's
+    error "Division by zero was encountered." (d0_ci, d0_cb, d0_zz, d0_cd,
+    d0_cf; #307). Past the range the integer results wrap
+    and the Double ones raise (#308).
+
+    Every operand is turned into a float or an int first, so nothing here
+    comes back through _Currency's own operators."""
+    ta, tb = type(a), type(b)
+    ca, cb = ta is _Currency, tb is _Currency
+    if op == '+' or op == '-':
+        if (ca or ta is int or ta is bool) and (cb or tb is int or tb is bool):
+            na = _cur_count(a) if ca else int(a) * 10000
+            nb = _cur_count(b) if cb else int(b) * 10000
+            return _cur_make(_wrap64(na + nb if op == '+' else na - nb))
+        return float(a) + float(b) if op == '+' else float(a) - float(b)
+    if op == '*':
+        if ca and cb:
+            return float(a) * float(b)
+        c, x = (a, b) if ca else (b, a)
+        tx = type(x)
+        if tx is int or tx is bool:
+            return _cur_make(_wrap64(_cur_count(c) * int(x)))
+        if getattr(_SE_STATE, 'on', False):
+            return _cur_from_double(float(c) * float(x))
+        return _cur_make(_cur_checked(_round_double_half_away(float(_cur_count(c)) * float(x))))
+    if op == '/':
+        if cb:
+            fa, fb = float(a), float(b)
+            if fb == 0:
+                return math.nan if fa == 0 else (math.inf if fa > 0 else -math.inf)
+            return fa / fb
+        if b == 0:
+            raise _cur_div0_error()
+        return _cur_make(_cur_checked(_round_double_half_away(float(_cur_count(a)) / float(b))))
+    raise _DAXEvaluationError(f"Operator '{op}' is not supported on a Currency value.")
 
 
 def _currency_total(values) -> '_Currency':
@@ -103,8 +547,189 @@ def _currency_total(values) -> '_Currency':
     exact, so the order of the rows does not matter, and the total is the
     Double nearest the exact count over 10,000 (int / int rounds once). The
     caller knows the values are Currency: they are a Currency column's
-    (DAXEngine._currency_column) or all _Currency. The loops run in C."""
-    return _Currency(sum(map(round, map(_CURRENCY_SCALE, values))) / 10000)
+    (DAXEngine._currency_column) or all _Currency. The loops run in C.
+
+    The total wraps around past the 64-bit range as Desktop's does
+    (build_b254.py o_column: SUM of three rows of 4E14 is
+    -644674407370955.1616; issue #248)."""
+    return _cur_make(_wrap64(sum(map(round, map(_CURRENCY_SCALE, values)))))
+
+
+def _currency_total_typed(values) -> '_Currency':
+    """_currency_total of computed values -- _Currency results (whose count
+    may be past 2^51, _cur_count) and Int64s beside them (an Int64 is its
+    count, build_b254.py x_sumx2: SUMX(TCur, IF(TCur[v] > 0, TCur[v], 0)) is
+    an exact Currency)."""
+    return _cur_make(_wrap64(sum(map(_cur_count_any, values))))
+
+
+# Bumped whenever mark_currency_columns records a column, so the model-wide
+# set of Currency columns a DAXContext reads (_currency_tcols) is rebuilt.
+_CURRENCY_MARK_EPOCH = 0
+
+
+def _value_num_type(v):
+    """'I' / 'C' / 'D' for an Int64 / Currency / Double value, 'B' for
+    BLANK, else None (IF's unification, DAXEngine._branch_num_type)."""
+    t = type(v)
+    if t is int:
+        return 'I'
+    if t is _Currency:
+        return 'C'
+    if t is float:
+        return 'D'
+    return 'B' if v is None else None
+
+
+def _unify_num_types(types) -> Optional[str]:
+    """The number type IF / SWITCH / COALESCE / two-argument MIN and MAX give
+    branches of ``types``: a Double beside any number is a Double, a Currency
+    beside an Int64 a Currency (Power BI Desktop 2.152, build_b254b.py c_if,
+    c_coalesce; issue #248); None when no branch is a Double or a Currency
+    (an Int64 stays one, other types are left alone)."""
+    if 'D' in types:
+        return 'D'
+    if 'C' in types:
+        return 'C'
+    return None
+
+
+# static types (DAXEngine._static_type) that are no number: text, TRUE /
+# FALSE, a date, and 'V', a Variant (a mix of types), and the number types
+_NONNUM_KINDS = frozenset({'S', 'L', 'T', 'V'})
+_NUM_KINDS = frozenset({'I', 'C', 'D'})
+
+
+def _value_static_type(v):
+    """_value_num_type, and 'S' / 'L' / 'T' for text, TRUE / FALSE and a
+    date (a VAR branch's value, DAXEngine._branch_num_type)."""
+    t = type(v)
+    if t is str:
+        return 'S'
+    if t is bool:
+        return 'L'
+    if isinstance(v, (datetime, date)):
+        return 'T'
+    return _value_num_type(v)
+
+
+def _unify_branch_types(types) -> Optional[str]:
+    """The number type IF / SWITCH / COALESCE convert their chosen number to:
+    _unify_num_types of the branches' types -- or None when a branch is no
+    number (text, TRUE / FALSE, a date, a Variant) beside a number: the call
+    is then a Variant, and its branches keep their own types. Power BI
+    Desktop 2.152 (build_b248c.py f_if_types: IF(TRUE(), 1, IF(FALSE(),
+    2.5, "x")) is I1 -- the inner IF is a Variant; build_b254b.py c_if:
+    IF(TRUE(), CURRENCY(1.5), "x") C1.5; #320). The inner
+    IF was typed a Double, and the 1 came back D1."""
+    kinds = set(types)
+    if kinds & _NONNUM_KINDS and kinds & _NUM_KINDS:
+        return None
+    return _unify_num_types(kinds)
+
+
+def _branch_static_type(types) -> Optional[str]:
+    """The static type of IF / SWITCH / COALESCE over its result branches'
+    ``types`` (DAXEngine._static_type): 'V' for a Variant -- a branch that
+    is no number beside a number, or two kinds of those (_unify_branch_types)
+    -- the one such type every branch has, else the number type the
+    branches unify to (None for Int64s); None when a branch is unknown and
+    may decide."""
+    kinds = {t for t in types if t != 'B'}
+    unknown = None in kinds
+    kinds.discard(None)
+    nonnum = kinds & _NONNUM_KINDS
+    if nonnum and (kinds & _NUM_KINDS or len(nonnum) > 1):
+        return 'V'
+    if nonnum:
+        return None if unknown else next(iter(nonnum))
+    return _unify_num_types(kinds)
+
+
+def _arith_type(op: str, a, b):
+    """The static type of ``a op b`` for operand types a and b (DAXEngine.
+    _static_type): Desktop's rules (build_b254.py t_add .. t_div, issue
+    #248) -- + and -: a Double beside a number is a Double, else a Currency
+    beside an Int64 a Currency; *: Currency * Currency a Double, Currency
+    * Int64 / Double a Currency; /: anything over a Currency a Double, a
+    Currency over a non-Currency a Currency, else a Double. BLANK takes the
+    other side's type, TRUE / FALSE are Int64s and text a Double."""
+    if a is None or b is None:
+        return None
+    if a == 'B':
+        return b if op in ('+', '-') else ('B' if op in ('*', '/') else None)
+    if b == 'B':
+        return a if op in ('+', '-') else ('B' if op == '*' else ('D' if a in ('I', 'D', 'L', 'S') else None))
+    if 'T' in (a, b):
+        return 'T' if op in ('+', '-') and a == 'T' or (op == '+' and b == 'T') else None
+    a = 'I' if a == 'L' else 'D' if a == 'S' else a
+    b = 'I' if b == 'L' else 'D' if b == 'S' else b
+    if a not in ('I', 'C', 'D') or b not in ('I', 'C', 'D'):
+        return None
+    if op in ('+', '-'):
+        return 'D' if 'D' in (a, b) else 'C' if 'C' in (a, b) else 'I'
+    if op == '*':
+        if a == 'C' and b == 'C':
+            return 'D'
+        return 'C' if 'C' in (a, b) else 'D' if 'D' in (a, b) else 'I'
+    if op == '/':
+        return 'D' if b == 'C' else 'C' if a == 'C' else 'D'
+    return None
+
+
+def _cur_typed(ctx, table, column, v):
+    """``v`` read from ``table``[``column``]: a Fixed Decimal column's float
+    as a Currency (issue #248), anything else as it is."""
+    if type(v) is float and (table, column) in ctx._cur_tcols:
+        return _Currency(v)
+    return v
+
+
+def _cur_lineage(row: dict, name: str) -> bool:
+    """Whether ``row``'s float cell ``name``, of its table's Fixed Decimal
+    column by name, still reads as a Currency: not when a UNION made that
+    column a Double (``__dbl__``, _unify_number_columns; build_b257d.py
+    u_cur_dbl_min, #326)."""
+    d = row.get('__dbl__')
+    return d is None or name not in d
+
+
+def _joined_typed(ctx, row: dict, column, v):
+    """``v``, a natural join row's key ``column`` (a float of no Currency
+    column of the row's own table), typed by the right-hand row's table when
+    that row gave it (``__joined__``, DAXEngine._fn_naturaljoin;
+    #300)."""
+    for part in row.get('__joined__') or ():
+        if column in part:
+            return _cur_typed(ctx, part.get('__table__'), column, v)
+    return v
+
+
+def _currency_tcols(tables, cache) -> frozenset:
+    """{(table, column)} of the model's Fixed Decimal columns, which a read
+    in a row context types as _Currency (issue #248). Kept on the model's
+    filter cache (_FilterIndexCache.cur_tcols, one per model), rebuilt after
+    mark_currency_columns records more (the server marks again after the
+    calculated tables)."""
+    epoch = _CURRENCY_MARK_EPOCH
+    held = type(cache) is _FilterIndexCache
+    if held and cache.cur_epoch == epoch:
+        cached: frozenset = cache.cur_tcols
+        return cached
+    found = frozenset((t, c) for t, tbl in tables.items() if isinstance(tbl, dict)
+                      for c in tbl.get('currency_columns') or ())
+    if held:
+        if cache.cur_epoch >= 0 and found != cache.cur_tcols:
+            # the memos typed against the earlier set -- the storage-engine
+            # shapes ('se-shape'), the measures' and the IF / SWITCH /
+            # COALESCE result types ('static-mtype', the unify_* slots) -- are stale:
+            # the cache starts over (every entry is a function of the model,
+            # so this costs only their rebuilding; the server marks before
+            # its first query)
+            cache.clear()
+        cache.cur_tcols = found
+        cache.cur_epoch = epoch
+    return found
 
 
 def mark_currency_columns(tables: dict, columns: dict) -> int:
@@ -125,7 +750,10 @@ def mark_currency_columns(tables: dict, columns: dict) -> int:
     alone is not), and over a 300,000-row table with one Currency column,
     iterations that never read it ran slower by 7% (MAXX(T, T[k] + 1)) to
     37% (SUMX(T, T[w])), COUNTROWS(FILTER(T, T[k] > 1000)) by 23%, besides
-    a pass over every cell when the model is read."""
+    a pass over every cell when the model is read. A READ of such a column
+    is typed instead (issue #248): the row context's T[c] (_exec_plan),
+    RELATED, LOOKUPVALUE, VALUES, SELECTEDVALUE, MIN / MAX, MINX / MAXX --
+    from the model-wide set of these columns (_currency_tcols)."""
     typed = 0
     for tname, names in (columns or {}).items():
         tbl = tables.get(tname)
@@ -136,6 +764,9 @@ def mark_currency_columns(tables: dict, columns: dict) -> int:
         if found:
             tbl['currency_columns'] = found | tbl.get('currency_columns', frozenset())
             typed += len(found)
+    if typed:
+        global _CURRENCY_MARK_EPOCH
+        _CURRENCY_MARK_EPOCH += 1
     return typed
 
 
@@ -169,6 +800,334 @@ _ROW_TRANSITION_FNS = frozenset({
     'OPENINGBALANCEQUARTER', 'CLOSINGBALANCEQUARTER', 'OPENINGBALANCEYEAR', 'CLOSINGBALANCEYEAR',
     'FIRSTNONBLANK', 'LASTNONBLANK', 'FIRSTNONBLANKVALUE', 'LASTNONBLANKVALUE', 'RELATEDTABLE',
 })
+
+# Iterators: functions that evaluate an expression once per row of a table
+# (FILTER's condition, SUMX's expression, ADDCOLUMNS' columns, ...). An error
+# raised in one of their rows and not caught inside that row is no error an
+# IFERROR / ISERROR outside the iteration can take (#267): Power
+# BI Desktop 2.152 (build_b255b.py, follow-up to issue #249) fails the query
+# for IFERROR(SUMX(TM, MOD(TM[n], TM[d])), -1) (r9), IF(ISERROR(SUMX(TM,
+# MOD(...))), 1, 0) (r11), IFERROR over SUMX(TS, VALUE(TS[s])) (r12),
+# SUMX(VALUES(TM[d]), MOD(7, TM[d])) (r13), COUNTROWS(FILTER(TM, MOD(...) =
+# 1)) (r14), SUMX(ADDCOLUMNS(TM, "q", MOD(...)), [q]) (r15), SUMX(TM, [m_mod])
+# (r16), a CALCULATE boolean filter (r18), FILTER over GENERATESERIES (r24) and
+# B255's r5; also SUMX(VALUES(TM[z]), IFERROR(CALCULATE(SUMX(TM, MOD(TM[n],
+# TM[d]))), 100)) (r19), where the IFERROR sits in an outer row. Inside the row
+# it catches: SUMX(TM, IFERROR(MOD(TM[n], TM[d]), 0)) is 2 under IFERROR(...,
+# -1) (r21; B255 r1-r4, r6, r8). A value the iteration returns is judged as
+# before: IFERROR(SUMX(TM, TM[n] / TM[d]), -1) is -1 (r22, Infinity).
+# The mark is set where the exception leaves the iterator's call
+# (DAXEngine._exec_plan), so an error in an argument evaluated once is marked
+# too -- TOPN's N is (build_b255c.py r27: IFERROR(COUNTROWS(TOPN(MOD(1,
+# [m_zero]), TM, TM[n])), -1) fails), as are SAMPLE's N, CONCATENATEX's
+# orderBy (build_b255d.py r31, r32) and a SUMMARIZECOLUMNS filter table
+# (r34: IFERROR(COUNTROWS(SUMMARIZECOLUMNS(TM[d], TREATAS({MOD(1, [m_zero])},
+# TM[d]), "v", COUNTROWS(TM))), -1) fails) -- except CONCATENATEX's delimiter
+# (r28 -1), RANKX's value (build_b255d.py r29: IFERROR(RANKX(ALL(TM), TM[n],
+# MOD(1, [m_zero])), -1) is -1) and PERCENTILEX's k (r30), which IFERROR
+# catches (DAXEngine._eval_once_arg). SAMPLE, LINESTX and the window
+# functions evaluate expressions per row of their relation as well, and
+# SUMMARIZECOLUMNS per group: IFERROR(COUNTROWS(SUMMARIZECOLUMNS(TM[d], "v",
+# [m_and_d])), -1) fails (r26).
+_ROW_ITERATOR_FNS = frozenset({
+    'SUMX', 'AVERAGEX', 'MINX', 'MAXX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'MEDIANX', 'GEOMEANX',
+    'PERCENTILEX.INC', 'PERCENTILEX.EXC', 'STDEVX.S', 'STDEVX.P', 'VARX.S', 'VARX.P',
+    'CONCATENATEX', 'RANKX', 'FILTER', 'ADDCOLUMNS', 'SELECTCOLUMNS', 'GENERATE', 'GENERATEALL',
+    'SUMMARIZE', 'GROUPBY', 'TOPN', 'FIRSTNONBLANK', 'LASTNONBLANK', 'FIRSTNONBLANKVALUE',
+    'LASTNONBLANKVALUE', 'SAMPLE', 'LINESTX', 'ROWNUMBER', 'RANK', 'INDEX', 'OFFSET', 'WINDOW',
+    'SUMMARIZECOLUMNS',
+})
+
+
+def _mark_row_error(exc: BaseException) -> None:
+    """Mark an error that leaves an iteration's row (_ROW_ITERATOR_FNS) as
+    one IFERROR / ISERROR do not catch (DAXEngine._eval_catching). A
+    deadline abort keeps its own handling."""
+    if getattr(exc, "_pbix_deadline", False):
+        return
+    try:
+        setattr(exc, "_dax_uncatchable", True)
+    except (AttributeError, TypeError):
+        pass
+
+
+# ---- what an expression depends on (issue #249) ---------------------------
+# Functions whose arguments are no row-context reads: a column inside them is
+# aggregated, listed or filtered, not read from the current row (Microsoft
+# Learn: a CALCULATE boolean filter "can contain an aggregation function that
+# returns a scalar value"; Power BI Desktop 2.152, build_b255b.py k12:
+# CALCULATE(CALCULATE(COUNTROWS(TC), TC[n] <= MAX(TC[d])), TC[d] = 2) is 1 --
+# TC[d] inside MAX is no column of the boolean filter).
+_ROWREF_SKIP_FNS = frozenset({
+    'SUM', 'SUMX', 'AVERAGE', 'AVERAGEX', 'MIN', 'MINX', 'MAX', 'MAXX', 'COUNT', 'COUNTX',
+    'COUNTA', 'COUNTAX', 'COUNTROWS', 'COUNTBLANK', 'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK',
+    'MEDIAN', 'MEDIANX', 'PRODUCT', 'PRODUCTX', 'STDEV.S', 'STDEV.P', 'STDEVX.S', 'STDEVX.P',
+    'VAR.S', 'VAR.P', 'VARX.S', 'VARX.P', 'MAXA', 'MINA', 'AVERAGEA', 'GEOMEANX',
+    'PERCENTILEX.INC', 'PERCENTILEX.EXC', 'SELECTEDVALUE', 'HASONEVALUE', 'HASONEFILTER',
+    'ISFILTERED', 'ISCROSSFILTERED', 'ISINSCOPE', 'VALUES', 'DISTINCT', 'ALL', 'ALLSELECTED',
+    'ALLNOBLANKROW', 'ALLEXCEPT', 'ALLCROSSFILTERED', 'REMOVEFILTERS', 'KEEPFILTERS', 'FILTER',
+    'CALCULATE', 'CALCULATETABLE', 'RELATEDTABLE', 'FIRSTNONBLANK', 'LASTNONBLANK',
+    'FIRSTNONBLANKVALUE', 'LASTNONBLANKVALUE', 'FIRSTDATE', 'LASTDATE', 'CONCATENATEX', 'RANKX',
+    'TOPN', 'ADDCOLUMNS', 'SELECTCOLUMNS', 'SUMMARIZE', 'SUMMARIZECOLUMNS', 'GROUPBY', 'GENERATE',
+    'GENERATEALL', 'CROSSJOIN', 'UNION', 'INTERSECT', 'EXCEPT', 'TREATAS',
+})
+# Arguments that read no filter at all: ALL(T) is every row of T whatever the
+# context (B255's m_zero, COUNTROWS(ALL(TM)) - 4, is 0 in every context).
+_FILTER_FREE_FNS = frozenset({'ALL', 'ALLNOBLANKROW', 'REMOVEFILTERS', 'ALLCROSSFILTERED'})
+# Calls that turn the current row into filters, as a measure reference does.
+_TRANSITION_CALLS = frozenset({'CALCULATE', 'CALCULATETABLE', 'RELATEDTABLE'})
+# Words that are no table and no VAR.
+_DEP_KEYWORDS = frozenset({'IN', 'VAR', 'RETURN', 'NOT', 'AND', 'OR', 'TRUE', 'FALSE', 'ASC',
+                           'DESC', 'DAY', 'MONTH', 'QUARTER', 'YEAR'})
+_DEP_TOKEN_RE = re.compile(
+    r"""\s+|"(?:[^"]|"")*"|'(?:[^']|'')*'\s*\[(?:[^\]]|\]\])*\]|'(?:[^']|'')*'"""
+    r"""|[^\W\d][\w.]*\s*\[(?:[^\]]|\]\])*\]|\[(?:[^\]]|\]\])*\]|[^\W\d][\w.]*\s*\("""
+    r"""|[^\W\d][\w.]*|[()]|.""", re.S)
+_DEP_LOCAL: dict = {}
+_DEP_LOCAL_MAX = 200_000
+
+
+class _LocalDeps(tuple):
+    """What one DAX text reads, before the model resolves the names
+    (_local_deps): ``(row_qual, row_bare, in_qual, in_bare, idents, trans)``
+    -- Table[Column] and [Name] references outside any _ROWREF_SKIP_FNS call
+    (read from the row, or measures), the same inside such calls (aggregated:
+    the filter context), identifiers and quoted names that are no call (a
+    table, or a VAR), and whether a CALCULATE-like call transitions the row.
+    Nothing inside a _FILTER_FREE_FNS call counts."""
+    __slots__ = ()
+
+
+def _unbracket(name: str) -> str:
+    return name.replace(']]', ']').strip()
+
+
+def _model_table_fast(ctx, name: str) -> str:
+    """``ctx.model_table(name)``, asked only when ``name`` is not already
+    the model's spelling (issue #226: a name spelled as the model spells it
+    is never looked up again)."""
+    if name in ctx.tables:
+        return name
+    out: str = ctx.model_table(name)
+    return out
+
+
+def _local_deps(text: str) -> _LocalDeps:
+    """The references of ``text`` (see _LocalDeps), memoized by text."""
+    hit: Optional[_LocalDeps] = _DEP_LOCAL.get(text)
+    if hit is not None:
+        return hit
+    row_qual: list = []
+    row_bare: list = []
+    in_qual: list = []
+    in_bare: list = []
+    idents: list = []
+    trans = False
+    stack: list = []          # enclosing call names ('' for a bare paren)
+    free = 0                  # how many enclosing calls read no filter
+    skip = 0                  # how many enclosing calls aggregate
+    src = _strip_line_comments(text)
+    for m in _DEP_TOKEN_RE.finditer(src):
+        t = m.group(0)
+        c0 = t[0]
+        if c0.isspace() or c0 == '"':
+            continue
+        if t == '(':
+            stack.append('')
+            continue
+        if t == ')':
+            if stack:
+                name = stack.pop()
+                if name in _FILTER_FREE_FNS:
+                    free -= 1
+                if name in _ROWREF_SKIP_FNS:
+                    skip -= 1
+            continue
+        if t.endswith('('):
+            name = t[:-1].strip().upper()
+            stack.append(name)
+            if name in _FILTER_FREE_FNS:
+                free += 1
+            if name in _ROWREF_SKIP_FNS:
+                skip += 1
+            if name in _TRANSITION_CALLS and not free:
+                trans = True
+            continue
+        if free:
+            continue
+        if t.endswith(']'):
+            if c0 == '[':
+                (in_bare if skip else row_bare).append(_unbracket(t[1:-1]))
+                continue
+            tpart, _, cpart = t.partition('[')
+            tpart = tpart.strip()
+            if tpart.startswith("'"):
+                tpart = tpart[1:-1].replace("''", "'")
+            (in_qual if skip else row_qual).append((tpart, _unbracket(cpart[:-1])))
+            continue
+        if c0 == "'":
+            idents.append(t[1:-1].replace("''", "'"))
+            continue
+        if c0.isalpha() or c0 == '_':
+            idents.append(t)
+    out = _LocalDeps((tuple(dict.fromkeys(row_qual)), tuple(dict.fromkeys(row_bare)),
+                      tuple(dict.fromkeys(in_qual)), tuple(dict.fromkeys(in_bare)),
+                      tuple(dict.fromkeys(idents)), trans))
+    if len(_DEP_LOCAL) > _DEP_LOCAL_MAX:
+        _DEP_LOCAL.clear()
+    _DEP_LOCAL[text] = out
+    return out
+
+
+# A logical operator's operands read nothing that can change (constants,
+# measures over ALL): it stops at the deciding side wherever it is evaluated.
+_NO_DEPS: tuple = (False, False, frozenset(), ())
+# FILTER condition -> its top-level conjuncts (DAXEngine._top_conjuncts).
+_CONJUNCT_CACHE: dict = {}
+# AND() / OR() argument text -> its operands (DAXEngine._logic_args).
+_LOGIC_ARGS: dict = {}
+# The first characters a branch written BLANK() can have (DAXEngine.
+# _BLANK_LITERAL_RE, #276): a cheap test before the pattern.
+_BLANK_HEADS = frozenset(('B', 'b', '('))
+# A CALCULATE filter argument that is a FILTER call (its row errors are judged
+# by CALCULATE, #265).
+_FILTER_CALL_RE = re.compile(r"(?is)^\s*FILTER\s*\(")
+# ERROR's argument: a text literal. Power BI Desktop 2.152 refuses ERROR(5) as
+# it refuses ERROR("a" & "b") (build_b255c.py y13; #268).
+_TEXT_LITERAL_RE = re.compile(r'(?s)^"(?:[^"]|"")*"$')
+_ERROR_ARG_CACHE: dict = {}
+# Power BI Desktop's refusal of ERROR(<not a constant>) (#268).
+_ERROR_CONST_MSG = "Function 'ERROR' expects argument number 1 to be a constant."
+# Power BI Desktop's refusal of DIVIDE(<n>, <d>, <not a constant number>)
+# (#270).
+_DIVIDE_ALT_MSG = ("The alternate result to return on division by zero must be a constant "
+                   "numeric value.")
+
+
+def _calls_error_with_nonconstant(text: str) -> bool:
+    """Does ``text`` call ERROR with an argument that is not a text literal
+    (#268)? Memoized by text."""
+    hit = _ERROR_ARG_CACHE.get(text)
+    if hit is not None:
+        return bool(hit)
+    found = False
+    if 'ERROR' in text.upper():
+        src = _strip_line_comments(text)
+        for m in _DEP_TOKEN_RE.finditer(src):
+            t = m.group(0)
+            if t.endswith('(') and t[:-1].strip().upper() == 'ERROR':
+                args = DAXEngine._extract_args_scan(src[m.end() - 1:])
+                if args is not None and not _TEXT_LITERAL_RE.match(args[1:-1].strip()):
+                    found = True
+                    break
+    if len(_ERROR_ARG_CACHE) > 50_000:
+        _ERROR_ARG_CACHE.clear()
+    _ERROR_ARG_CACHE[text] = found
+    return found
+
+
+# The calls that write a typed literal, which DIVIDE takes as its alternate
+# result (_constant_alternate, #270).
+_TYPED_LITERAL_FNS = frozenset(('TRUE', 'FALSE', 'BLANK', 'DATE', 'TIME', 'CURRENCY'))
+_CALL_HEAD_RE = re.compile(r'^([A-Za-z_][\w.]*)\s*\(')
+# a number literal, written 2, 2.5, .5 or 1E3
+_NUM_LITERAL_RE = re.compile(r'^(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$')
+
+
+def _peel_parens(text: str) -> str:
+    """``text`` without parentheses around the whole of it."""
+    s = text.strip()
+    while s and s[0] == '(' and DAXEngine._wraps_whole(s):
+        s = s[1:-1].strip()
+    return s
+
+
+@lru_cache(maxsize=20_000)
+def _constant_alternate(text: str) -> Optional[tuple]:
+    """The bare names DIVIDE's alternate result ``text`` reads when it is
+    taken as a constant -- a name is a VAR, whose own expression must be a
+    constant, or a table, which DAXEngine._fn_divide refuses -- else None
+    (#270).
+
+    A constant is what Power BI Desktop 2.152 takes: a literal (DIVIDE(3,
+    0, "7") is "7", build_b139.py; .5, build_b255d.py y26; (-3), y25), a
+    call that writes a typed literal -- TRUE() and DATE(2020, 1, 1)
+    (build_b255c.py y17, y18), TIME(6, 0, 0) (build_b255d.py y22),
+    CURRENCY(2.5) (build_b254b.py c_divide) -- or a VAR bound to one
+    (build_b255c.py y11: VAR k = -1). It refuses an alternate that reads the
+    model: MOD(1, [m_zero]) and MOD(TM[n], TM[d]) (build_b255b.py y4, y3),
+    a measure (build_b255c.py y10), COUNTROWS(TM) (y16), a VAR bound to a
+    measure (build_b255d.py y23); a call of another function, INT(2.5)
+    (y15); and any expression over constants: 1 + 1 (y20), -CURRENCY(2)
+    (y21), "7" & "" (y24), INT(2.5) + 0 (y27). A sign belongs to a number
+    literal only."""
+    s = _peel_parens(_strip_line_comments(text))
+    if not s:
+        return None
+    signed = False
+    while s and s[0] in '+-':
+        signed = True
+        s = _peel_parens(s[1:])
+    if _NUM_LITERAL_RE.match(s):
+        return ()
+    if signed:
+        return None                      # -CURRENCY(2) (y21)
+    if _TEXT_LITERAL_RE.match(s):
+        return ()
+    if _IDENT_RE.match(s):
+        return () if s.upper() in ('TRUE', 'FALSE') else (s,)
+    m = _CALL_HEAD_RE.match(s)
+    if (m is None or m.group(1).upper() not in _TYPED_LITERAL_FNS
+            or not DAXEngine._wraps_whole(s[m.end() - 1:])):
+        return None                      # INT(2.5) (y15), 1 + 1 (y20), "7" & "" (y24)
+    names: list = []
+    for m2 in _DEP_TOKEN_RE.finditer(s[m.end() - 1:]):
+        tok = m2.group(0)
+        if tok.endswith(']') or tok[0] == "'":
+            return None                  # a column, a measure, a quoted table
+        if tok.endswith('(') or tok[0].isspace() or tok[0] == '"':
+            continue
+        if (tok[0].isalpha() or tok[0] == '_') and tok.upper() not in _DEP_KEYWORDS:
+            names.append(tok)
+    return tuple(names)
+
+
+_DIVIDE_ALT_CACHE: dict = {}
+
+
+def _divide_alternate_refused(text: str) -> bool:
+    """Does ``text`` call DIVIDE with an alternate result that is no
+    constant, whatever its names are (_constant_alternate)? Power BI
+    Desktop 2.152 refuses the query before running it, reached or not
+    (#270; build_b255d.py y19: IF([m_zero] = 1, DIVIDE(1, 1,
+    MOD(1, [m_zero])), 0) with the branch never taken). Memoized by text."""
+    hit = _DIVIDE_ALT_CACHE.get(text)
+    if hit is not None:
+        return bool(hit)
+    found = False
+    if 'DIVIDE' in text.upper():
+        src = _strip_line_comments(text)
+        for m in _DEP_TOKEN_RE.finditer(src):
+            t = m.group(0)
+            if t.endswith('(') and t[:-1].strip().upper() == 'DIVIDE':
+                args = DAXEngine._extract_args_scan(src[m.end() - 1:])
+                if args is None:
+                    continue
+                parts = DAXEngine._split_toplevel_scan(args[1:-1], ',')
+                if len(parts) > 2 and _constant_alternate(parts[2]) is None:
+                    found = True
+                    break
+    if len(_DIVIDE_ALT_CACHE) > 50_000:
+        _DIVIDE_ALT_CACHE.clear()
+    _DIVIDE_ALT_CACHE[text] = found
+    return found
+
+
+# Power BI Desktop's refusal of a measure in a CALCULATE boolean filter
+# (DAXEngine._boolean_filter_table, #271).
+_PLACEHOLDER_FILTER_MSG = ("A function 'PLACEHOLDER' has been used in a True/False expression "
+                           "that is used as a table filter expression. This is not allowed.")
+
 
 # Calls that AGGREGATE over the context inside a FILTER predicate -- these keep
 # the filter-context path and must NOT be row-substituted. RELATED /
@@ -226,6 +1185,13 @@ def _dax_serial(dt: datetime) -> float:
     return us / 86_400_000_000
 
 
+def _from_dax_serial(x: float) -> datetime:
+    """The date-time of DAX serial ``x`` (days since 1899-12-30, the time of
+    day as the fraction), to the microsecond -- GENERATESERIES over dates
+    and times (#332)."""
+    return _DAX_EPOCH_DT + timedelta(days=x)
+
+
 def _as_number(v):
     """Best-effort numeric coercion; None when the value isn't numeric.
 
@@ -258,19 +1224,18 @@ def _as_number(v):
 
 
 def _sum_numbers(values):
-    """The sum SUM, AVERAGE, AVERAGEA and AVERAGEX take of their numbers.
+    """The sum SUM and AVERAGE take of the numbers of a column that is no
+    table's column (a table variable's, say) -- the only sums left to it.
 
-    Correctly rounded (math.fsum) whatever the order and the Python version
-    (issue #246). The builtin sum() used before is compensated (Neumaier)
-    from Python 3.12 and plain on 3.10 / 3.11, so one model gave different
-    totals on the supported interpreters. Against Power BI Desktop 2.152's
-    answers on the census's real models (112 measures whose totals the rules
-    tell apart), the correctly rounded sum matches 65 to Desktop's 15
-    digits, sum() on 3.13 64 and a left-to-right fold 56: on a large Double
-    column Desktop's storage engine adds very nearly exactly, in an order
-    still to be measured (#243). On a few rows it adds left to right
-    (build_b210.py: ten rows of 0.1 sum to 0.9999999999999999), as SUMX
-    here does (#228).
+    A model table's column adds as Power BI Desktop's storage engine adds
+    it, along the column's storage layout (DAXEngine._se_column_total,
+    issue #243: build_b210.py's ten rows of 0.1 sum to 0.9999999999999999,
+    which this correctly rounded sum made 1), and the values the formula
+    engine computes -- AVERAGEX over a dimension's members -- add left to
+    right in the iteration's order (_fe_sum). This keeps 0.9.147's rule
+    (issue #246) where nothing measured says otherwise: correctly rounded
+    (math.fsum), the same on every Python version (the builtin sum() is
+    compensated from Python 3.12).
 
     Ints alone stay an exact int. A list of _Currency values alone --
     CURRENCY() results, sums of a Currency column -- adds exactly
@@ -285,11 +1250,28 @@ def _sum_numbers(values):
     if kinds <= {int, bool}:
         return sum(values)
     if kinds == {_Currency}:
-        return _currency_total(values)
+        return _currency_total_typed(values)
     try:
         return math.fsum(values)
     except (ValueError, OverflowError):
         return sum(values)
+
+
+def _fe_sum(values):
+    """The sum the formula engine takes of values it computed itself:
+    left to right in their order, one IEEE addition each, as SUMX adds them.
+    Power BI Desktop 2.152 (build_b243b.py gb_avgx_emp, gb_sumx_emp): the
+    members' values of AVERAGEX(ALLSELECTED(DimEmployee[EmployeeKey]), [MTD
+    Total Sales]) add in DimEmployee's order, the blank member last
+    (#342). Ints stay exact; _Currency values alone add exactly
+    (#241). 0 for no values."""
+    if not values:
+        return 0
+    if type(values) is not list:
+        values = list(values)
+    if set(map(type, values)) == {_Currency}:
+        return _currency_total(values)
+    return _se_scan.seq_sum(values)
 
 
 # ---- Column aggregates per filter context (issue #231) -----------------------
@@ -299,8 +1281,10 @@ def _sum_numbers(values):
 # decides them (DAXEngine._column_aggregate).
 
 def _agg_sum(values):
-    # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0. The values
-    # are added correctly rounded (_sum_numbers, issue #246).
+    # SUM over no rows is BLANK in DAX (so ISBLANK fires), not 0. A table's
+    # column adds as Desktop's storage engine adds it (DAXEngine.
+    # _aggregate_scan, issue #243); values that are no table's column reach
+    # this and add correctly rounded (_sum_numbers, issue #246).
     nums = [v for v in values if isinstance(v, (int, float))]
     return _sum_numbers(nums) if nums else None
 
@@ -317,15 +1301,16 @@ def _agg_average(values):
     # COUNTROWS, COUNTBLANK, DISTINCTCOUNT, MIN, COUNTX, AVERAGEX, SUMX, MINX
     # and MEDIANX all came back BLANK. A 0 is the worst kind of wrong here: it
     # reads as a measured zero, and it is what ISBLANK() is testing for. The
-    # sum is SUM's (_sum_numbers, issue #246).
+    # sum is SUM's (_agg_sum; a table's column: DAXEngine._aggregate_scan).
     nums = [v for v in values if isinstance(v, (int, float))]
     return _sum_numbers(nums) / len(nums) if nums else None
 
 
 def _agg_average_currency(values):
-    # a Fixed Decimal column: the exact total over the count (issue #241)
+    # a Fixed Decimal column: the exact total over the count (issue #241),
+    # a Currency rounded half away from zero (_cur_avg, issue #248)
     nums = [v for v in values if isinstance(v, (int, float))]
-    return _currency_total(nums) / len(nums) if nums else None
+    return _cur_avg(_wrap64(sum(map(round, map(_CURRENCY_SCALE, nums)))), len(nums)) if nums else None
 
 
 def _agg_count(values):
@@ -506,15 +1491,22 @@ class _RangePartials:
 
     ``mode`` tells what the totals can answer. 'int': every number is an int
     (or a bool, which SUM adds as one), so a window's total is the difference
-    of two prefix sums, exactly. 'float': every number is a finite float;
-    each is an integer times a power of two, so over the smallest such power
-    among them (``scale``) their totals are exact integers, a window's total
-    is a difference of two prefix sums, and dividing it by the power once
-    rounds it correctly: SUM's own total (_sum_numbers, math.fsum, issue
-    #246), for any window. 'currency': a Fixed Decimal column (issue #241),
-    every number held as its count of 1/10,000, as _currency_total adds
-    them. 'none': no numbers. Anything else ('mixed' int and float,
-    'nonfinite') answers counts only.
+    of two prefix sums, exactly. 'currency': a Fixed Decimal column (issue
+    #241), every number held as its count of 1/10,000, as _currency_total
+    adds them. 'value': a value-encoded column, its stored integers added
+    exactly and divided by its Magnitude once, as the scan does (issue
+    #243). 'float': finite numbers that add EXACTLY in any order -- each is
+    an integer times a power of two, and over the smallest such power among
+    them (``scale``) their magnitudes add up to 2**53 at most, so every
+    partial sum the scan makes is exact and a window's total is a difference
+    of two prefix sums. 'kernel': any other finite numbers, whose total
+    depends on the order Desktop's storage engine adds them in
+    (se_scan.scan_sum, issue #243): the window's total is that scan's,
+    replayed over ``terms`` -- the kept rows' pieces, chunks and runs in
+    storage order (``se``: (pieces, kept rows' storage positions, grouped,
+    encoding, Magnitude)) -- without the propagation and the gather each
+    scan pays. 'none': no numbers. 'nonfinite', and Doubles without ``se``,
+    answer counts only.
 
     ``pos`` and ``vals`` are the kept rows' positions and values, in row
     order. The work is done by C loops (map, compress, Counter, accumulate),
@@ -523,9 +1515,10 @@ class _RangePartials:
     loop doing all of it per row cost 3 s over 267k fact rows."""
 
     __slots__ = ('keys', 'mode', 'nonblank', 'nums', 'sums', 'scale',
-                 'nonblank_blank', 'nums_blank', 'sums_blank', 'nkey')
+                 'nonblank_blank', 'nums_blank', 'sums_blank', 'nkey', 'terms', 'mag')
 
-    def __init__(self, keys: list, pos: list, vals: list, nkey: int = 0, currency: bool = False):
+    def __init__(self, keys: list, pos: list, vals: list, nkey: int = 0, currency: bool = False,
+                 se: Optional[tuple] = None):
         # the axis's keys, shared with it
         self.keys = keys
         n = len(keys)
@@ -548,22 +1541,35 @@ class _RangePartials:
         self.sums: Optional[list] = None
         self.scale = 0
         self.sums_blank: Any = 0
+        self.terms: Optional[list] = None
+        self.mag = 1.0
         if num_types and not all(map(math.isfinite, num_vals)):
             self.mode = 'nonfinite'
         elif currency and num_types:
             # a Fixed Decimal column: counts of 1/10,000, added exactly (#241)
             self.mode = 'currency'
             self._exact(n, num_pos, map(round, map(_CURRENCY_SCALE, num_vals)))
-        elif floats and ints:
-            self.mode = 'mixed'
+        elif floats and se is not None and se[3] == 'value':
+            # a value-encoded column: its integers, divided once (#243)
+            self.mode = 'value'
+            self.mag = se[4]
+            self._exact(n, num_pos, map(round, map(float(se[4]).__mul__, num_vals)))
         elif floats:
-            # each finite Double is num / 2**d (as_integer_ratio); over the
+            # each finite number is num / 2**d (as_integer_ratio); over the
             # largest d among them every number is an exact integer
             ratios = [v.as_integer_ratio() for v in num_vals]
             shift = max(den.bit_length() for _n, den in ratios) - 1
-            self.mode = 'float'
-            self.scale = shift
-            self._exact(n, num_pos, (num << (shift - den.bit_length() + 1) for num, den in ratios))
+            scaled = [num << (shift - den.bit_length() + 1) for num, den in ratios]
+            if sum(map(abs, scaled)) <= 1 << 53:
+                # every partial sum exact: the order does not matter (#243)
+                self.mode = 'float'
+                self.scale = shift
+                self._exact(n, num_pos, scaled)
+            elif se is not None:
+                self.mode = 'kernel'
+                self.terms = self._kernel_terms(pos, vals, se)
+            else:
+                self.mode = 'mixed'
         elif ints:
             self.mode = 'int'
             per: list = [0] * n
@@ -578,6 +1584,109 @@ class _RangePartials:
         else:
             self.mode = 'none'
         self.nkey = nkey
+
+    @staticmethod
+    def _kernel_terms(pos: list, vals: list, se: tuple) -> list:
+        """The scan of se_scan.scan_sum over the kept rows, as terms to replay
+        for any window (``answer``), in storage order: ``('s',)`` a new
+        segment; ``('r', value, axis positions sorted, rows at -1)`` an RLE
+        piece, adding value x (its rows in the window); ``('c', values, axis
+        positions, full fold, least and greatest position, any at -1)`` a
+        chunk, folded over its rows in the window; ``('g', values, axis
+        positions)`` a piece of several groups of a grouped scan, its rows in
+        the window added one by one."""
+        pieces, kept, grouped, _enc, _mag = se
+        starts = pieces.starts
+        n = pieces.n
+        npieces = len(starts)
+        own_rle = pieces.own_rle
+        grp_rle = pieces.grp_rle if grouped else None
+        seg = pieces.seg
+        B = _se_scan.SE_CHUNK
+        num = (int, float)
+        terms: list = []
+        cur = -1
+        j = 0
+        m = len(kept)
+        while j < m:
+            p = kept[j]
+            pi = bisect.bisect_right(starts, p) - 1
+            a = starts[pi]
+            z = starts[pi + 1] if pi + 1 < npieces else n
+            hi = bisect.bisect_left(kept, z, j)
+            if seg[pi] != cur:
+                cur = seg[pi]
+                terms.append(('s',))
+            if grp_rle is not None and not grp_rle[pi]:
+                sel = [(v, ap) for v, ap in zip(vals[j:hi], pos[j:hi]) if isinstance(v, num)]
+                if sel:
+                    terms.append(('g', [v for v, _a in sel], [ap for _v, ap in sel]))
+            elif own_rle[pi]:
+                v = vals[j]
+                if isinstance(v, num):
+                    aps = sorted(ap for x, ap in zip(vals[j:hi], pos[j:hi]) if isinstance(x, num))
+                    terms.append(('r', v, aps, bisect.bisect_left(aps, 0)))
+            else:
+                q = j
+                while q < hi:
+                    cend = a + ((kept[q] - a) // B + 1) * B
+                    r = hi if cend >= z else bisect.bisect_left(kept, cend, q, hi)
+                    sel = [(v, ap) for v, ap in zip(vals[q:r], pos[q:r]) if isinstance(v, num)]
+                    if sel:
+                        cv = [v for v, _a in sel]
+                        ca = [ap for _v, ap in sel]
+                        nonneg = [x for x in ca if x >= 0]
+                        terms.append(('c', cv, ca, _se_scan.seq_sum(cv),
+                                      min(nonneg) if nonneg else 0, max(nonneg) if nonneg else -1,
+                                      len(nonneg) != len(ca)))
+                    q = r
+            j = hi
+        return terms
+
+    def _kernel_total(self, lo: int, hi: int, blank: bool) -> Any:
+        """The scan's total over the window positions lo..hi-1 (and -1 when
+        ``blank``): ``terms`` replayed (_kernel_terms)."""
+        acc: Any = 0
+        parts: list = []
+        have = False
+        and_, or_ = operator.and_, operator.or_
+        for t in self.terms or ():
+            tag = t[0]
+            if tag == 's':
+                if have:
+                    parts.append(acc)
+                acc = 0
+                have = False
+            elif tag == 'r':
+                aps = t[2]
+                k = bisect.bisect_left(aps, hi) - bisect.bisect_left(aps, lo) + (t[3] if blank else 0)
+                if k:
+                    acc += t[1] * k
+                    have = True
+            else:
+                cv, ca = t[1], t[2]
+                if tag == 'c':
+                    if lo <= t[4] and t[5] < hi and (blank or not t[6]):
+                        acc += t[3]
+                        have = True
+                        continue
+                    if (t[5] < lo or t[4] >= hi) and not (blank and t[6]):
+                        continue
+                mask: Any = map(and_, map(lo.__le__, ca), map(hi.__gt__, ca))
+                if blank:
+                    mask = map(or_, mask, map((-1).__eq__, ca))
+                sel = list(compress(cv, mask))
+                if sel:
+                    if tag == 'c':
+                        acc += _se_scan.seq_sum(sel)
+                    else:
+                        acc = _se_scan.seq_sum(itertools.chain((acc,), sel))
+                    have = True
+        if have:
+            parts.append(acc)
+        if not parts:
+            return None
+        return parts[0] if len(parts) == 1 else _se_scan.seq_sum(parts)
 
     def _exact(self, n: int, num_pos: list, ints) -> None:
         """Prefix totals of exact integers ``ints`` over the positions."""
@@ -601,11 +1710,14 @@ class _RangePartials:
     def __len__(self) -> int:
         # the model cache's bound weighs an entry by its items (issue #229),
         # the items of the base filter set its key holds included
-        return len(self.nonblank) + len(self.nums) + len(self.sums or ()) + self.nkey
+        terms = 0
+        if self.terms:
+            terms = len(self.terms) + sum(len(t[2]) for t in self.terms if len(t) > 2)
+        return len(self.nonblank) + len(self.nums) + len(self.sums or ()) + self.nkey + terms
 
     def answer(self, kind: str, lo: int, hi: int, blank: bool) -> Any:
         """``kind`` over the positions lo..hi-1, and position -1 when
-        ``blank``; _MISSING when the totals cannot give it exactly."""
+        ``blank``; _MISSING when the totals cannot give the scan's answer."""
         if hi < lo:
             hi = lo
         if kind in ('COUNT', 'COUNTA'):
@@ -614,13 +1726,23 @@ class _RangePartials:
         count = self.nums[hi] - self.nums[lo] + (self.nums_blank if blank else 0)
         if not count:
             return None
+        if self.mode == 'kernel':
+            total: Any = self._kernel_total(lo, hi, blank)
+            if total is None:
+                return _MISSING
+            return total if kind == 'SUM' else total / count
         if self.sums is None:
             return _MISSING
-        total: Any = self.sums[hi] - self.sums[lo] + (self.sums_blank if blank else 0)
+        total = self.sums[hi] - self.sums[lo] + (self.sums_blank if blank else 0)
         if self.mode == 'float':
-            total = total / (1 << self.scale)        # int / int: rounded once
+            total = total / (1 << self.scale)        # int / int: exact here
+        elif self.mode == 'value':
+            total = total / self.mag                 # rounded once (#243)
         elif self.mode == 'currency':
-            total = _Currency(total / 10000)
+            # the exact count, wrapped; AVERAGE a Currency rounded half away
+            # from zero (_cur_avg, issue #248)
+            total = _wrap64(total)
+            return _cur_make(total) if kind == 'SUM' else _cur_avg(total, count)
         return total if kind == 'SUM' else total / count
 
 
@@ -888,7 +2010,14 @@ def _fmt_unquote(text: str) -> str:
     return text.replace('"', "")
 
 
-def _format_number(val: float, fmt: str, group_sep: str = ",",
+# FORMAT's rounding context: wide enough for any Double's digits, so a value
+# past 28 digits does not raise (FORMAT(1E19, "0.000000000") raised
+# decimal.InvalidOperation; #316)
+_FMT_WIDE_CTX = decimal.Context(prec=1000, rounding=decimal.ROUND_HALF_UP,
+                                Emax=decimal.MAX_EMAX, Emin=decimal.MIN_EMIN)
+
+
+def _format_number(val, fmt: str, group_sep: str = ",",
                    dec_sep: str = "."):
     """FORMAT() for a numeric custom format string. None = not understood.
 
@@ -912,7 +2041,25 @@ def _format_number(val: float, fmt: str, group_sep: str = ",",
     named = _NAMED_FORMATS.get(fmt.strip().lower())
     if named is not None:
         if named == '':
-            return _dax_number_str(val)
+            if isinstance(val, decimal.Decimal):
+                # a Currency's exact digits (Power BI Desktop 2.152,
+                # build_b254.py m_fmt: FORMAT(CURRENCY(123456789012.3456),
+                # "General Number") is 123456789012.3456; #306)
+                out = _cur_text(_cur_make(int(val.scaleb(4, _CUR_DEC_CTX))))
+            elif type(val) is int:
+                # an Int64's exact digits (build_b248c.py g_text2:
+                # FORMAT(123456789012345678, "General Number") is
+                # 123456789012345678, it was 1.23456789012346E+17;
+                # #315), past 2**53 too (build_b257c.py
+                # f_general: RIGHT(FORMAT(9007199254740993, "General
+                # Number"), 3) is 993; #334)
+                out = str(val)
+            else:
+                out = _dax_number_str(float(val))
+            # in the culture's decimal separator (g_text2:
+            # FORMAT(CURRENCY(1234.5678), "General Number", "de-DE") is
+            # 1234,5678, it was 1234.5678; #306)
+            return out.replace('.', dec_sep) if dec_sep != '.' else out
         fmt = named
     # `;` inside a quoted literal is text, not a section break.
     sections = _fmt_split_sections(fmt)
@@ -953,8 +2100,22 @@ def _format_number(val: float, fmt: str, group_sep: str = ",",
     # HALF AWAY FROM ZERO, not Python's banker's rounding. Desktop:
     #   FORMAT(1234.5, "#,##0") -> 1,235   (banker's would give 1,234)
     #   FORMAT(0.125,  "0.00")  -> 0.13    (banker's would give 0.12)
-    rounded = decimal.Decimal(repr(abs(val))).quantize(
-        decimal.Decimal(1).scaleb(-max_dec), rounding=decimal.ROUND_HALF_UP)
+    # A Double is its 15 significant digits first, as Desktop shows one
+    # (Power BI Desktop 2.152, build_b254b.py h_fmt_big: FORMAT(0.1 + 0.2,
+    # "0.00000000000000000000") is 0.30000000000000000000, FORMAT(1 / 3, ...)
+    # 0.33333333333333300000, FORMAT(-214891469123651.7205, "0.000000000")
+    # -214891469123652.000000000; build_b254.py o_column); an Int64 and a
+    # Currency (an exact Decimal) are their exact digits
+    # (FORMAT(123456789012345678, "0") is 123456789012345678). The repr's
+    # 17 digits were printed (#315).
+    if isinstance(val, float):
+        if not math.isfinite(val):
+            return None
+        dval = _DAX_NUM_CTX.create_decimal(repr(abs(val)))
+    else:
+        dval = abs(decimal.Decimal(val))
+    rounded = dval.quantize(decimal.Decimal(1).scaleb(-max_dec), rounding=decimal.ROUND_HALF_UP,
+                              context=_FMT_WIDE_CTX)
     if not rounded and val:
         # A value that ROUNDS to zero is formatted as zero: no sign, no negative
         # section, and the zero section when there is one. Desktop 2.157:
@@ -1028,6 +2189,34 @@ class _ScalarColumnsError(_DAXEvaluationError):
     catch it (build_b176.py, issue #179)."""
 
 
+# The value types Power BI Desktop names in a comparison's type error.
+_CMP_TYPE_NAMES = {bool: 'True/False', int: 'Integer', float: 'Number', _Currency: 'Currency'}
+
+
+def _bool_number_clash(a, b, fn: Optional[str] = None) -> None:
+    """Raise when one of two values compared is TRUE / FALSE and the other
+    a number: Power BI Desktop 2.152 compares neither way
+    (#279). IF(2 = 2 = 2, 1, 0) -- (2 = 2) = 2 -- fails with
+    "DAX comparison operations do not support comparing values of type
+    True/False with values of type Integer. Consider using the VALUE or
+    FORMAT function to convert one of the values." (build_b255d.py d5; its
+    Norwegian in English; build_b133.py true_eq_1), and IF(1 = 1 IN
+    {TRUE()}, 1, 0) with "Function CONTAINSROW does not support ..." (d11).
+    The engine compared TRUE as 1. A BLANK side is no clash (it takes the
+    other side's zero); text against a number is left as it was."""
+    ta, tb = type(a), type(b)
+    if (ta is bool) is (tb is bool):
+        return
+    other = tb if ta is bool else ta
+    if other is not int and other is not float and other is not _Currency:
+        return
+    head = ("Function " + fn + " does") if fn else "DAX comparison operations do"
+    raise _DAXEvaluationError(
+        head + " not support comparing values of type True/False with values of type "
+        + _CMP_TYPE_NAMES[other]
+        + ". Consider using the VALUE or FORMAT function to convert one of the values.")
+
+
 def _table_as_scalar(v):
     """Raise for a table where a value is needed (_scalarize left it): several
     columns cannot be a value at all (_ScalarColumnsError); several rows fail
@@ -1069,6 +2258,11 @@ def _concat_str(v):
         _table_as_scalar(v)     # several rows or columns: no text (#179)
     if isinstance(v, bool):
         return 'TRUE' if v else 'FALSE'
+    if type(v) is _Currency:
+        # its exact digits (Power BI Desktop 2.152, build_b254.py m_fmt:
+        # CURRENCY(123456789012.3456) & "" is 123456789012.3456; issue #248,
+        # #306)
+        return _cur_text(v)
     if isinstance(v, float):
         return _dax_number_str(v)
     if isinstance(v, (datetime, date)):
@@ -1083,6 +2277,227 @@ def _round_half_away(v) -> int:
     (#110): 2.5 is 3, -0.4 is 0, -0.6 is -1."""
     return int(decimal.Decimal(repr(float(v))).quantize(
         decimal.Decimal(1), rounding=decimal.ROUND_HALF_UP))
+
+
+def _int_literal(raw: str) -> int:
+    """A DATATABLE INTEGER literal: a whole number exactly -- int() keeps
+    9007199254740993, where int(float()) made it 9007199254740992 (Power BI
+    Desktop 2.152, build_b257b.py z53_datatable_int: MAXX(DATATABLE("v",
+    INTEGER, {{9007199254740993}}), [v]) - 9007199254740992 is 1;
+    #334) -- and any other number as int(float()), as before."""
+    s = raw.strip()
+    try:
+        return int(s)
+    except ValueError:
+        return int(float(s))
+
+
+# Wide enough for any quantize of a 15-digit decimal to a sensible place.
+_DEC_WIDE_CTX = decimal.Context(prec=60)
+_QUANT_EXPS: dict = {}
+
+
+def _quant_exp(digits: int) -> decimal.Decimal:
+    """1E-digits, the quantize exponent of ROUND / ROUNDUP / ROUNDDOWN /
+    TRUNC to ``digits`` places, built once per place (scaleb costs a third
+    of a microsecond a call)."""
+    e = _QUANT_EXPS.get(digits)
+    if e is None:
+        e = decimal.Decimal(1).scaleb(-digits)
+        if len(_QUANT_EXPS) < 256:
+            _QUANT_EXPS[digits] = e
+    return e
+
+
+def _dec15(v) -> decimal.Decimal:
+    """The number ``v`` as ROUND, ROUNDUP, ROUNDDOWN, TRUNC, CEILING and FLOOR
+    read it: its Double, as a decimal of at most 15 significant digits -- the
+    15-digit rounding of the Double's exact binary value, not of its shortest
+    spelling. It is the decimal Microsoft's .NET documents for a Double
+    converted to Decimal ("a maximum of 15 significant digits"). Power BI
+    Desktop 2.152 (build_b257d.py; #333) answers
+    ROUND(1.000000000000025, 14) with 1.00000000000003 (j_dec15_tie_a: the
+    Double is 1.0000000000000250910..., its spelling rounded half even gave
+    ...002) and ROUND(0.1234567890123455, 15) with 0.123456789012345
+    (j_dec15_tie_b: the Double is 0.1234567890123454969..., its spelling
+    gave ...346). An exact tie at the 16th digit (an Int64-valued Double such
+    as 1234567890123445) is taken to even; Desktop has not answered one.
+    Also measured (#333):
+
+    * past 2**53 (build_b257b.py z53_*): each of TRUNC(9007199254740993),
+      ROUNDDOWN(.., 0), ROUNDUP(.., 0), ROUND(.., 0), CEILING(.., 1) and
+      FLOOR(.., 1), less 9007199254740992, is -2 -- the Int64 is the Double
+      9007199254740992, which is 9.00719925474099E+15 in 15 digits -- where
+      MROUND, QUOTIENT and INT, which work in Doubles, give 0;
+    * at every magnitude (build_b257c.py j_*): TRUNC(0.29, 2) and
+      FLOOR(0.29, 0.01) are 0.29 (the Double 0.29 is 0.28999999999999998,
+      and its product with 100 or quotient by 0.01 28.999999999999996),
+      ROUNDUP(2.0000000001, 0) is 3 (a 1e-9 tolerance made it 2),
+      ROUND(1.0049999999999997, 2) 1.01 (1.005 in 15 digits; its own
+      spelling gives 1), ROUND(1 / 3, 16) 0.333333333333333,
+      ROUNDUP(0.1 + 0.2, 16) 0.3, and TRUNC(1234567890123456) -
+      1234567890123450 is 10 -- an Int64 of 16 digits, below 2**53, is
+      rounded to 15 (cutting would give 0, the exact digits 6)."""
+    return _DAX_NUM_CTX.create_decimal_from_float(v if type(v) is float else float(v))
+
+
+# 10.0 ** i and 10 ** i for i = 0 .. 22 (the Doubles are exact)
+_POW10_F = tuple(10.0 ** i for i in range(23))
+_POW10_I = tuple(10 ** i for i in range(23))
+# below this an Int64 has at most 15 digits and is its own 15-digit decimal
+_E15 = 10 ** 15
+
+
+def _dec15_quantize(val, digits: int, rounding) -> Optional[decimal.Decimal]:
+    """``val``'s 15-digit decimal (_dec15) at ``digits`` decimals, rounded
+    with ``rounding``; None for a NaN, an infinity or a place too far for
+    the decimal to hold."""
+    try:
+        return _DAX_NUM_CTX.create_decimal_from_float(val if type(val) is float else float(val)).quantize(
+            _quant_exp(digits), rounding=rounding, context=_DEC_WIDE_CTX)
+    except (decimal.InvalidOperation, ValueError, OverflowError):
+        return None
+
+
+def _round_dec15_half(val, digits: int):
+    """ROUND of an Int64 or a Double ``val`` (no Currency) at ``digits``
+    decimals, half away from zero, on its 15-digit decimal (_dec15,
+    #333). An Int64 stays an Int64 at any digits, a Double a
+    Double (see _round_dec15_directed); a NaN or an infinity is returned as
+    it is. A Double whose product with 10 ** digits has no half within
+    3e-14 of it is rounded on that product, which rounds as the decimal
+    does (see _round_dec15_directed); an Int64 below 10**15 is its own
+    decimal."""
+    tv = type(val)
+    if tv is float:
+        if 0 <= digits <= 15:
+            # (false for a NaN or an infinity, and past 1.7e13, as there)
+            scale = _POW10_F[digits]
+            s = abs(val) * scale
+            f = s % 1.0
+            if abs(f - 0.5) > s * 3e-14 + 4e-16:
+                out = (s - f + 1.0 if f > 0.5 else s - f) / scale
+                return -out if val < 0.0 else (out if val else val)
+    elif tv is int and -_E15 < val < _E15:
+        if digits >= 0:
+            return val
+        if digits >= -15:
+            unit = _POW10_I[-digits]
+            return _div_half_away(val, unit) * unit
+        return 0
+    q = _dec15_quantize(val, digits, decimal.ROUND_HALF_UP)
+    if q is None:
+        return val          # NaN / infinity: nothing to round
+    return int(q) if tv is int else float(q)
+
+
+def _round_dec15_directed(val, digits: int, up: bool):
+    """ROUNDUP (``up``) / ROUNDDOWN / TRUNC of an Int64 or a Double ``val``
+    (no Currency) at ``digits`` decimals, away from / toward zero, on its
+    15-digit decimal (_dec15, #333). An Int64 stays an Int64
+    at any digits (Power BI Desktop 2.152, build_b257c.py j_type_roundup_int,
+    j_type_trunc_int: ROUNDUP(5, 0) and TRUNC(5) are Int64s, and
+    build_b257d.py j_type_round_int2, j_type_roundup_int1,
+    j_type_trunc_int1: ROUND(5, 2), ROUNDUP(5, 1) and TRUNC(5, 1) too, where
+    we answered Doubles), a Double a Double (build_b254b.py f_fns:
+    ROUNDUP(1.5, 0) is the Double 2, TRUNC(-1.5) the Double -1). A NaN or an
+    infinity is returned as it is.
+
+    The decimal path costs a microsecond, so a Double that the Double product
+    with 10 ** digits proves is rounded the same way is rounded there: the
+    15-digit decimal is within 5.3e-15 of the Double, relatively, and the
+    product within 1.2e-16, so when no whole number lies within 3e-14 of
+    the product the two round alike, and the whole number over the exact
+    10 ** digits is the decimal's Double (IEEE division rounds correctly).
+    A whole Double below 10**15 is its own decimal."""
+    t = type(val)
+    if t is float:
+        if 0 <= digits <= 15:
+            # (false for a NaN or an infinity, whose remainder is NaN, and
+            # past 1.7e13, where the margin passes 1/2)
+            scale = _POW10_F[digits]
+            s = abs(val) * scale
+            f = s % 1.0
+            d = s * 3e-14 + 4e-16
+            if d < f < 1.0 - d:
+                out = (s - f + 1.0 if up else s - f) / scale
+                return out if val >= 0 else -out
+            if f == 0.0 and digits == 0 and s < 1e15:
+                return val
+    elif t is int and -_E15 < val < _E15:
+        if digits >= 0:
+            return val
+        if digits >= -15:
+            unit = _POW10_I[-digits]
+            a = val if val >= 0 else -val
+            mag = -(-a // unit) * unit if up else a // unit * unit
+            return mag if val >= 0 else -mag
+    q = _dec15_quantize(val, digits, decimal.ROUND_UP if up else decimal.ROUND_DOWN)
+    if q is None:
+        return val
+    return int(q) if t is int else float(q)
+
+
+def _round_dec15_multiple(val, sig, up: bool):
+    """CEILING (``up``) / FLOOR: ``val`` / ``sig`` rounded toward +infinity
+    / -infinity on the two numbers' 15-digit decimals (_dec15,
+    #333; Int64s or Doubles, no Currency, ``sig`` not 0),
+    times ``sig`` in the significance's own type: a Double multiple is the
+    Double product n * sig. Power BI Desktop 2.152: CEILING(9007199254740993,
+    1) and FLOOR(.., 1) are 9007199254740990 (build_b257b.py z53_ceiling,
+    z53_floor; we answered the Int64), FLOOR(0.29, 0.01) is 0.29
+    (build_b257c.py j_floor_029; the Double quotient 28.999999999999996 made
+    it 0.28), and CEILING(0.25, 0.1) is 0.1 * 3, 0.30000000000000004, not
+    0.3 (build_b257d.py j_ceiling_prod; we multiplied the decimals).
+
+    The result is an Int64 when ``sig`` is one, else a Double:
+    CEILING(5, 2) and CEILING(2.5, 1) are Int64s (j_type_ceiling_int,
+    j_type_ceiling_dbl), CEILING(5, 0.5) a Double (build_b257d.py
+    j_type_ceiling_dsig).
+
+    A Double quotient that is not within 3e-14 (relatively) of a whole
+    number rounds as the decimals' does (see _round_dec15_directed). A
+    significance past 10**15, which its 15-digit decimal is not, takes the
+    decimal path. A NaN or an infinity falls back to the Double arithmetic
+    (math.ceil / math.floor raise on them, as before)."""
+    # (the margin test is false for a NaN or an infinity, whose remainder is
+    # NaN, and for a quotient past 1.7e13, whose margin passes 1/2; the
+    # remainder of a negative quotient is within 1.2e-16 of the true one,
+    # and q - f within 2.3e-16 of floor(q), so round() reads it)
+    ts = type(sig)
+    if ts is float:
+        if -1e15 < sig < 1e15:
+            q = val / sig
+            f = q % 1.0
+            d = (q if q >= 0.0 else -q) * 3e-14 + 4e-16
+            if d < f < 1.0 - d:
+                return (round(q - f) + 1 if up else round(q - f)) * sig
+    elif ts is int and -_E15 < sig < _E15:
+        tv = type(val)
+        if tv is int and -_E15 < val < _E15:
+            return (-((-val) // sig) if up else val // sig) * sig
+        if tv is float:
+            q = val / sig
+            f = q % 1.0
+            d = (q if q >= 0.0 else -q) * 3e-14 + 4e-16
+            if d < f < 1.0 - d:
+                return (round(q - f) + 1 if up else round(q - f)) * sig
+            if f == 0.0 and val.is_integer() and -1e15 < val < 1e15:
+                v = int(val)        # a whole Double below 10**15 is its own decimal
+                return (-((-v) // sig) if up else v // sig) * sig
+    n: Optional[decimal.Decimal]
+    try:
+        n = _DEC_WIDE_CTX.divide(_dec15(val), _dec15(sig)).to_integral_value(
+            rounding=decimal.ROUND_CEILING if up else decimal.ROUND_FLOOR, context=_DEC_WIDE_CTX)
+    except (decimal.InvalidOperation, ValueError, OverflowError, ZeroDivisionError):
+        n = None
+    if n is None or not n.is_finite():
+        return (math.ceil if up else math.floor)(val / sig) * sig
+    if ts is int:
+        m = int(n) * sig
+        if -9223372036854775808 <= m <= 9223372036854775807:
+            return m
+    return (float(n) or 0.0) * sig     # a whole 0 is +0, as on the Double path
 
 
 _CASE_TABLES: dict = {}
@@ -1552,6 +2967,7 @@ _P_FUNC = 14      # FUNC(args), name + args text precomputed
 _P_TAIL = 15      # bare table name / final BLANK
 _P_IN = 16        # <scalar> IN <set>; may return None -> fall through
 _P_TABLECTOR = 17  # { a, b, c } -> one-column table, column named Value
+_P_POW = 48       # a ^ b ^ ... with precomputed parts (#314)
 
 _PLAN_CACHE: dict = {}
 
@@ -1569,6 +2985,9 @@ _TCOL_RE = re.compile(r"(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]$")
 # multi-column call and only the base column of `T[C].[Part]`.
 _WHOLE_TCOL_RE = re.compile(
     r"^\s*(?:'([^'\[\]]+)'|([^\W\d][\w .]*))\s*\[([^\]]+)\]\s*$")
+# _fn_calculate's place-holder for its ``_dates`` argument among the filter
+# arguments: no DAX text spells it.
+_TI_DATES_ARG = '\x00ti-dates'
 # CALCULATE's modifier arguments (issue #87), and the subset that REMOVES filters.
 _CALC_MODIFIER_RE = re.compile(
     r"(?is)^\s*(?:ALL|ALLSELECTED|ALLEXCEPT|ALLNOBLANKROW|ALLCROSSFILTERED|"
@@ -1587,13 +3006,6 @@ _PUSHDOWN_AGG_RE = re.compile(
     + r")\s*\[(?P<c3>[^\]]+)\]\s*\)"
     r"|COUNTROWS\s*\(\s*(?P<t4>" + _PD_TABLE + r")\s*\)"
     r")\s*$")
-_CALC_PRED_RE = re.compile(
-    r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]\s*(<>|>=|<=|>|<|=)\s*(.+)$", re.S)
-# Literal-first CALCULATE predicate: ``2024 = T[Year]`` (issue #39). The left
-# side may not contain brackets, so a column-vs-column or measure comparison
-# never matches; the column ref is anchored at the end.
-_CALC_PRED_REV_RE = re.compile(
-    r"^([^\[\]]+?)\s*(<>|>=|<=|>|<|=)\s*'?([^'\[\]]+?)'?\s*\[([^\]]+)\]$", re.S)
 _VAR_KW_RE = re.compile(r'\bVAR\b', re.IGNORECASE)
 _VAR_START_RE = re.compile(r'VAR\b', re.IGNORECASE)   # .match: at the start
 _RETURN_KW_RE = re.compile(r'\bRETURN\b', re.IGNORECASE)
@@ -1616,6 +3028,130 @@ def _skip_literal(text: str, i: int) -> int:
             return j + 1
         j += 1
     return n
+
+
+_SE_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+# a bare [column] and nothing else (DAXEngine._se_iter_plan)
+_SE_BARE_REF_RE = re.compile(r"^\[[^\[\]]+\]$")
+
+
+def _se_items(text: str) -> list:
+    """The parts of a DAX expression the storage-engine analyses read, in
+    order, at the text's own level: ``('call', NAME, args text)`` for a
+    function call (its arguments not looked into), ``('ref', table or None,
+    name)`` for ``T[c]``, ``'T'[c]`` and a bare ``[c]``. Strings and
+    everything else are skipped (issue #243)."""
+    out: list = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            i = _skip_literal(text, i)
+            continue
+        if ch == "'" or ch == '[':
+            j = _skip_literal(text, i)
+            if ch == '[':
+                out.append(('ref', None, text[i + 1:j - 1].replace(']]', ']').strip()))
+                i = j
+                continue
+            table = text[i + 1:j - 1].replace("''", "'")
+            k = j
+            while k < n and text[k].isspace():
+                k += 1
+            if k < n and text[k] == '[':
+                e = _skip_literal(text, k)
+                out.append(('ref', table, text[k + 1:e - 1].replace(']]', ']').strip()))
+                i = e
+            else:
+                out.append(('table', table, ''))
+                i = j
+            continue
+        if ch.isalpha() or ch == '_':
+            if i > 0 and (text[i - 1].isalnum() or text[i - 1] == '_'):
+                i += 1
+                continue
+            m = _SE_IDENT_RE.match(text, i)
+            j = m.end() if m else i + 1
+            word = text[i:j]
+            k = j
+            while k < n and text[k].isspace():
+                k += 1
+            if k < n and text[k] == '(':
+                depth = 0
+                e = k
+                while e < n:
+                    c = text[e]
+                    if c in '"\'[':
+                        e = _skip_literal(text, e)
+                        continue
+                    if c == '(':
+                        depth += 1
+                    elif c == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    e += 1
+                out.append(('call', word.upper(), text[k + 1:e]))
+                i = e + 1
+                continue
+            if k < n and text[k] == '[':
+                e = _skip_literal(text, k)
+                out.append(('ref', word, text[k + 1:e - 1].replace(']]', ']').strip()))
+                i = e
+                continue
+            out.append(('word', word.upper(), ''))
+            i = j
+            continue
+        i += 1
+    return out
+
+
+# What a SUMX / AVERAGEX expression may call and still be evaluated by the
+# storage engine over the pieces of the columns it reads (Power BI Desktop
+# 2.152, build_b243b.py: x_mul, x_div, x_addc, x_add, x_upsq, x_3col and an IF,
+# x_if, all match the pieces; issue #243): functions of the row's own values,
+# no context, no aggregation, no randomness.
+_SE_ROW_FUNCS = frozenset({
+    'IF', 'SWITCH', 'AND', 'OR', 'NOT', 'ISBLANK', 'BLANK', 'TRUE', 'FALSE', 'ABS', 'ROUND',
+    'ROUNDUP', 'ROUNDDOWN', 'INT', 'TRUNC', 'MOD', 'POWER', 'SQRT', 'EXP', 'LN', 'LOG', 'LOG10',
+    'SIGN', 'DIVIDE', 'COALESCE', 'CEILING', 'FLOOR', 'MROUND', 'IFERROR', 'QUOTIENT'})
+# Inside an IF branch, SUMX / AVERAGEX over VALUES & co. of one column add in
+# its data-ID order, BLANK first (DAXEngine._fe_fold_order, #345;
+# build_b243c.py pm_avgx, build_b243d.py i_*): an IF or SWITCH whose condition
+# reads the data (DAXEngine._branch_counts). A switch, so a scorer can tell
+# the rules apart.
+_FE_ORDER_IN_IF = True
+# The measure memo's mark for a reference evaluated inside an IF branch, where
+# an iteration it reaches adds in another order (DAXEngine.evaluate_measure).
+_IF_BRANCH_KEY = ('if-branch',)
+# A scope's entry for the columns MIN / MAX read, under the key table +
+# _SE_MINMAX: scanned with the rest only where the scan has a filter -- with
+# none a column statistic answers them (DAXEngine._se_fused; Power BI Desktop
+# 2.152, build_b243c.py f_min / f_max, build_b243d.py f_min_f / f_max_f;
+# #339).
+_SE_MINMAX = '\x00minmax'
+# The calls whose arguments the fusion analysis does not look into: they
+# iterate, change the filters or return tables, so what they aggregate is
+# another scan (DAXEngine._se_scope_walk). SELECTEDVALUE is not one: its
+# alternate result is scanned with the rest (Power BI Desktop 2.152,
+# build_b243c.py s_sel_alt, s_sel_meas; #339); COUNT and COUNTA
+# read their column in the scan (f_count; build_b243d.py f_counta), MIN and MAX
+# under a filter (_SE_MINMAX).
+_SE_OPAQUE_CALLS = frozenset({
+    'CALCULATETABLE', 'FILTER', 'VALUES', 'DISTINCT', 'ALL', 'ALLSELECTED', 'ALLEXCEPT',
+    'ALLNOBLANKROW', 'ALLCROSSFILTERED', 'REMOVEFILTERS', 'KEEPFILTERS', 'SUMMARIZE',
+    'SUMMARIZECOLUMNS', 'ADDCOLUMNS', 'SELECTCOLUMNS', 'GROUPBY', 'GENERATE', 'GENERATEALL',
+    'TOPN', 'TOPNSKIP', 'CROSSJOIN', 'UNION', 'INTERSECT', 'EXCEPT', 'TREATAS', 'RELATEDTABLE',
+    'MAXX', 'MINX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'MEDIANX', 'RANKX', 'CONCATENATEX',
+    'PERCENTILEX.INC', 'PERCENTILEX.EXC', 'STDEVX.S', 'STDEVX.P', 'VARX.S', 'VARX.P',
+    'GEOMEANX', 'FIRSTNONBLANK', 'LASTNONBLANK', 'FIRSTNONBLANKVALUE', 'LASTNONBLANKVALUE',
+    'TOTALYTD', 'TOTALQTD', 'TOTALMTD', 'OPENINGBALANCEMONTH', 'OPENINGBALANCEQUARTER',
+    'OPENINGBALANCEYEAR', 'CLOSINGBALANCEMONTH', 'CLOSINGBALANCEQUARTER', 'CLOSINGBALANCEYEAR',
+    'EARLIER', 'EARLIEST', 'RELATED', 'LOOKUPVALUE', 'ROW', 'DATATABLE', 'GENERATESERIES',
+    'INDEX', 'OFFSET', 'WINDOW', 'COUNTROWS', 'COUNTBLANK', 'MIN', 'MAX',
+    'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK', 'MEDIAN', 'PRODUCT',
+    'HASONEVALUE', 'ISFILTERED', 'ISCROSSFILTERED', 'ISINSCOPE', 'USERELATIONSHIP',
+    'CROSSFILTER', 'SAMPLE', 'DETAILROWS', 'SELECTEDMEASURE'})
 
 
 def _var_block_keywords(text: str) -> list:
@@ -1901,12 +3437,11 @@ def _analyze_expr(raw):
     if in_parts:
         steps.append((_P_IN, in_parts))
 
-    for op in ('==', '<>', '>=', '<=', '>', '<', '='):
-        if len(DAXEngine._split_operators_scan(expr, op)) == 2:
-            # Conditional: a comparison with a non-comparable side evaluates
-            # to None at runtime and falls through to the next-tighter level.
-            steps.append((_P_CMP, expr))
-            break
+    if DAXEngine._cmp_split(expr):
+        # Conditional: a comparison with a non-comparable side evaluates
+        # to None at runtime and falls through to the next-tighter level.
+        # A chain groups left to right (_cmp_split, #274).
+        steps.append((_P_CMP, expr))
 
     if '&' in expr:
         parts = DAXEngine._split_toplevel_scan(expr, '&')
@@ -1914,20 +3449,26 @@ def _analyze_expr(raw):
             steps.append((_P_CONCAT, tuple(p.strip() for p in parts)))
             return tuple(steps)
 
-    for op in ('+', '-'):
-        parts = DAXEngine._split_operators_scan(expr, op)
-        if len(parts) > 1:
-            steps.append((_P_BINARY, (op, tuple(p.strip() for p in parts))))
-            return tuple(steps)
-    for op in ('*', '/'):
-        parts = DAXEngine._split_operators_scan(expr, op)
-        if len(parts) > 1:
+    for ops in (('+', '-'), ('*', '/')):
+        split = DAXEngine._left_assoc_split(expr, ops)
+        if split is not None:
+            op, parts = split
             steps.append((_P_BINARY, (op, tuple(p.strip() for p in parts))))
             return tuple(steps)
 
     if expr.startswith('-'):
         steps.append((_P_NEG, expr[1:].strip()))
         return tuple(steps)
+
+    # ^ binds tighter than the sign and than * and /, and to the right:
+    # Power BI Desktop 2.152 (build_b254b.py h_pow, #314):
+    # -2 ^ 2 is -4, 2 * 3 ^ 2 is 18, 2 ^ 3 ^ 2 is 512. Not split here, a
+    # bare 2 ^ 3 fell to the tail (BLANK) and f(x) ^ y to the call f(x).
+    if '^' in expr:
+        parts = DAXEngine._split_operators_scan(expr, '^')
+        if len(parts) > 1:
+            steps.append((_P_POW, tuple(p.strip() for p in parts)))
+            return tuple(steps)
 
     fm = _FUNC_CALL_RE.match(expr)
     if fm:
@@ -2140,6 +3681,13 @@ def _index_spellings_uncached(v, numeric: bool = True) -> tuple:
 # 9007199254740992.0.
 _FLOAT_EXACT_INTS = 2 ** 53
 
+# The most rows GENERATESERIES materializes; a longer series is refused with
+# an error, never cut short (#329: it stopped at 1,000,000 rows
+# without a word, where Power BI Desktop 2.152 counts COUNTROWS(GENERATESERIES(
+# 1, 1200000)) 1,200,000). A row costs about 270 bytes, so this bounds one
+# series near 1.4 GB.
+_GENERATESERIES_MAX_ROWS = 5_000_000
+
 
 def _exact_int(v, fv: float) -> Optional[int]:
     """The integer ``v`` is -- an int, or a text that spells one -- when its
@@ -2211,6 +3759,25 @@ def _date_part_key(v):
         dt = _as_datetime(v)
         d = dt.date() if dt is not None else None
     return _DP_PREFIX + d.isoformat() if d is not None else None
+
+
+def _distinct_join_cells(rows: list, idx: int) -> list:
+    """The distinct cells of column idx, each once, told apart by type as well
+    as value (1, 1.0 and True are one set key but not one join spelling).
+
+    A date part is slow to take (_date_part_key), and every one of a fact
+    table's DatePartOnly keys was taken: an inactive DatePartOnly relationship
+    joins by date part since issue #250, and finding that none of its 300,000
+    keys misses the calendar took 4 s, once per model, where its few thousand
+    distinct values take milliseconds."""
+    try:
+        vals = set(map(operator.itemgetter(idx), rows))
+    except TypeError:
+        return [r[idx] for r in rows]
+    if any(isinstance(v, (int, float, decimal.Decimal)) for v in vals):
+        # numbers of different types may have met in one set key
+        return [v for _t, v in {(type(r[idx]), r[idx]) for r in rows}]
+    return list(vals)
 
 
 def _key_in(v, allowed) -> bool:
@@ -2570,10 +4137,38 @@ def _value_keys(v, dateish: bool = True) -> tuple:
     one day are two values, and a date is midnight. With ``dateish`` (a
     column that keeps dates as text) a string that is wholly an ISO date or
     date-time is also its moment.
+
+    The first key is the value's identity (DISTINCT, tuples and joins read
+    it alone). Past 2**53 a number has a second key, for an Int64 that
+    meets a Double, which compares as a Double (#325; Power
+    BI Desktop 2.152, build_b257.py: TK[K] = 9007199254740992.0 keeps the
+    Int64 cells 2**53 and 2**53 + 1, TK[K] IN {9007199254740992.0,
+    9007199254740996.0} 2**53, 2**53 + 1, 2**53 + 3 and 2**53 + 4, and the
+    Double column TD[D] searched with the Int64 9007199254740993 finds its
+    2**53.0): an Int64 cell whose Double is another number is also
+    ('i2d', that Double), which only a Double filter value asks for, and a
+    whole Double cell past 2**53 is also ('dbl', itself), which only an
+    Int64 filter value asks for (_filter_value_keys_uncached). Two Int64
+    values, or two Doubles, still meet by the first key alone, exactly.
     """
+    # an int / float first, by exact type (a bool is neither): one cell per
+    # call when a column's index is built, so the common case costs least
+    tv = type(v)
+    if tv is int:
+        if -9007199254740992 <= v <= 9007199254740992:     # +-2**53, a constant
+            return (('num', v),)
+        try:
+            f = float(v)
+        except OverflowError:
+            return (('num', v),)
+        return (('num', v), ('i2d', f)) if f != v else (('num', v),)
+    if tv is float:
+        if -9007199254740992.0 < v < 9007199254740992.0 or not v.is_integer():
+            return (('num', v),)
+        return (('num', v), ('dbl', v))
     if v is None:
         return (_BLANK_KEY,)
-    if isinstance(v, bool):
+    if tv is bool:
         return (('bool', v),)
     if isinstance(v, (int, float)):
         return (('num', v),)
@@ -2621,6 +4216,12 @@ def _filter_value_keys(v) -> frozenset:
 
 def _filter_value_keys_uncached(v) -> frozenset:
     keys = set(_value_keys(v))
+    if len(keys) > 1 and type(v) in (int, float):
+        # a CELL's second key ('i2d' / 'dbl') is for the other kind of value
+        # to ask for: an Int64 value asking for 'i2d' would select every Int64
+        # cell that shares its Double (2**54 + 1 and 2**54 + 2), where two
+        # Int64 values compare exactly (#325, #240)
+        keys = {k for k in keys if k[0] == 'num'}
     if isinstance(v, str):
         s = v.strip()
         if v == 'None':
@@ -2640,10 +4241,21 @@ def _filter_value_keys_uncached(v) -> frozenset:
         keys.add(('text', 'true' if v else 'false'))
     elif isinstance(v, int):
         keys.add(('text', str(v)))       # its own digits, past 2**53 too (#240)
+        if type(v) is int and not -_FLOAT_EXACT_INTS <= v <= _FLOAT_EXACT_INTS:
+            # the Double cells it meets as a Double (#325, _value_keys)
+            try:
+                fv = float(v)
+            except OverflowError:
+                fv = math.inf
+            if fv != v and math.isfinite(fv):
+                keys.add(('dbl', fv))
     elif isinstance(v, (float, decimal.Decimal)):
         fv = float(v)
         if math.isfinite(fv):
             keys.add(('text', str(int(fv)) if fv.is_integer() else repr(fv)))
+            if type(v) is float and fv.is_integer() and abs(fv) >= _FLOAT_EXACT_INTS:
+                # the Int64 cells whose Double it is (#325, _value_keys)
+                keys.add(('i2d', fv))
     return frozenset(keys)
 
 
@@ -2775,12 +4387,24 @@ def _text_key(s: str) -> tuple:
 def _order_key(v) -> tuple:
     """A value's place in DAX's sort order, for TOPN, SAMPLE, CONCATENATEX's
     ordering and the like: BLANK first, then numbers, dates and TRUE / FALSE
-    by value, then text in the model's collation (issues #157, #158)."""
+    by value, then text in the model's collation (issues #157, #158).
+
+    A number keeps its EXACT value: Python orders an int against an int, and
+    an int against a float, by their exact values. Keyed by float(v), two
+    Int64 values that share a Double -- 9007199254740993 and its neighbour
+    9007199254740992 -- tied. Power BI Desktop 2.152 orders them apart
+    (build_b257.py, issue #252): over TK[K] = 2**53 - 1 .. 2**53 + 4 (a .. f)
+    TOPN(1, TK, TK[K], DESC) is f alone (we answered e and f), TOPN(4, ...)
+    c d e f (we: b c d e f), SAMPLE(4, TK, TK[K], ASC, TK[L], DESC) a c d f
+    (we: a b d e) and CONCATENATEX(TKR, TKR[L], "", TKR[K], ASC) abcdef (we:
+    acbdfe). A Decimal is its float, as before."""
     if v is None:
         return (0, 0.0, _EMPTY_TEXT_KEY)
     if isinstance(v, bool):
-        return (1, float(v), _EMPTY_TEXT_KEY)
-    if isinstance(v, (int, float, decimal.Decimal)):
+        return (1, int(v), _EMPTY_TEXT_KEY)
+    if isinstance(v, (int, float)):
+        return (1, v, _EMPTY_TEXT_KEY)
+    if isinstance(v, decimal.Decimal):
         return (1, float(v), _EMPTY_TEXT_KEY)
     if isinstance(v, (datetime, date)):
         return (1, _dax_serial(v if isinstance(v, datetime) else datetime(v.year, v.month, v.day)),
@@ -2788,10 +4412,445 @@ def _order_key(v) -> tuple:
     return (2, 0.0, _text_key(v if isinstance(v, str) else str(v)))
 
 
+_KEY_NUM = operator.itemgetter(1)
+
+
+def _meet_key_column(col: list) -> list:
+    """One orderBy's _order_key tuples (``col``, one per row; SAMPLE's carry
+    one more item) with its Int64 numbers made Doubles when they meet a
+    Double past 2**53, else ``col`` itself.
+
+    DAX types an expression statically: one whose values mix Int64 and
+    Double is a Double expression. Power BI Desktop 2.152 (build_b257b.py
+    if_unify_top): TOPN(1, TC, IF(TC[L] = "c", TC[K], TC[K] + 0.0), DESC)
+    over TC[K] = 2**53 (b), 2**53 + 1 (c) is b and c, tied as the Double
+    2**53 (#325). The engine's IF keeps each branch's own type,
+    so its keys mixed the Int64 2**53 + 1 and the Double 2**53.0, and the
+    exact order (issue #252) returned c alone, while RANKX (_rankx_keys)
+    tied them. Keys of Int64 values alone stay exact (build_b257.py t1_desc
+    f, r_skip 6,5,4,3,2,1). Only an Int64 past 2**53 changes when it becomes
+    a Double, so a column without one is returned as it is; dates count as
+    Doubles (_order_key keys them by their serial)."""
+    types = set(map(type, map(_KEY_NUM, col)))
+    if int not in types or float not in types:
+        return col
+    big = dbl = False
+    for k in col:
+        if k[0] == 1:                   # a number, date or TRUE / FALSE
+            v = k[1]
+            tv = type(v)
+            if tv is int:
+                if not -9007199254740992 <= v <= 9007199254740992:
+                    big = True
+            elif tv is float:
+                dbl = True
+    if not (big and dbl):
+        return col
+    try:
+        return [(1, float(k[1])) + k[2:] if k[0] == 1 and type(k[1]) is int else k
+                for k in col]
+    except OverflowError:               # an int past the Double range
+        return col
+
+
+def _meet_order_keys(keys: list) -> list:
+    """Rows' order keys -- one tuple of _order_key values per row, one per
+    orderBy -- with each orderBy's keys met as _meet_key_column meets them;
+    ``keys`` itself when none changes. TOPN, TOPNSKIP and CONCATENATEX."""
+    if not keys:
+        return keys
+    for k in range(len(keys[0])):
+        get = operator.itemgetter(k)
+        types = set(map(type, map(_KEY_NUM, map(get, keys))))
+        if int not in types or float not in types:
+            continue                    # one C pass: the common case
+        col = list(map(get, keys))
+        met = _meet_key_column(col)
+        if met is not col:
+            keys = [kt[:k] + (m,) + kt[k + 1:] for kt, m in zip(keys, met)]
+    return keys
+
+
+def _order_sorted(values: list) -> list:
+    """``values`` in DAX's sort order (_order_key), an Int64 past 2**53 met
+    with the Doubles among them (_meet_key_column): FIRSTNONBLANK and the
+    like over a column's values."""
+    keys = _meet_key_column(list(map(_order_key, values)))
+    return [values[i] for i in sorted(range(len(values)), key=keys.__getitem__)]
+
+
+def _num_meet(a, b) -> tuple:
+    """Two values as DAX compares them when one is an Int64 and the other a
+    Double: the Int64 becomes a Double -- rounded to the nearest one -- and
+    the two compare as Doubles; any other pair is returned as it is (two
+    Int64 values compare exactly, issue #240). Power BI Desktop 2.152
+    (build_b257.py, #325): 9007199254740993 =
+    9007199254740992.0 is TRUE, 9007199254740993 > 9007199254740992.0 FALSE,
+    MAX(9007199254740993, 9007199254740992.0) the Double. A bool is no Int64
+    here (type(x) is int), and a Currency (a float subclass) is left alone:
+    every Currency value is far inside 2**53, where the two readings agree."""
+    ta, tb = type(a), type(b)
+    try:
+        if ta is int and tb is float:
+            return float(a), b
+        if tb is int and ta is float:
+            return a, float(b)
+    except OverflowError:       # an int past the Double range: compared as it is
+        pass
+    return a, b
+
+
+def _int_as_double(v):
+    """An Int64 ``v`` as the Double it meets another Double as (_num_meet);
+    any other value as it is."""
+    if type(v) is int:
+        try:
+            return float(v)
+        except OverflowError:
+            return v
+    return v
+
+
+def _treatas_int64(v):
+    """A TREATAS value put on an Int64 column (DAXEngine._treatas_converter,
+    #336): a Double or a Currency rounded half away from zero
+    (_round_half_away: 1.6 is 2, 2.5 is 3, 2**53.0 the Int64 2**53); TRUE
+    and FALSE 1 and 0; a text its decimal number rounded half to EVEN, as a
+    text becomes a Currency (_cur_from_text); any other value as it is.
+
+    Power BI Desktop 2.152 (build_b257c.py) over TS[G] = 1, 1, 2, 3:
+    TREATAS({TRUE()}, TS[G]) keeps the two rows of 1 (t_true_int "pq") and
+    TREATAS({"2.5"}, TS[G]) the row of 2 (t_text_int "r"), where TREATAS(
+    {2.5}, TS[G]) keeps 3 (build_b257b.py tr_25); we kept nothing for
+    either. "2.5" alone does not tell half even from cutting; half even is
+    how Desktop turns text into a Currency (TREATAS({"0.00015"}, TC[v]) is
+    0.0002, t_text_cur_15). Power BI Desktop 2.152 settles it
+    (build_b257d.py): "1.5" keeps the row of 2 (t_text_int_15 "r", cutting
+    would keep 1), "2.7" the row of 3 (t_text_int_27 "s"), the text
+    "9007199254740993" the Int64 itself, not its Double (t_text_big "c"),
+    and FALSE the row of 0 (t_false_int "z").
+
+    Text that is no number is an error: TREATAS({"abc"}, TS[G]) fails with
+    (in Norwegian) "Cannot convert value 'abc' of type Text to type
+    Integer." (t_text_bad; we kept no row). Whether IFERROR catches it is
+    not measured; it is an ordinary error here."""
+    tv = type(v)
+    if tv is bool:
+        return int(v)
+    if isinstance(v, float) and math.isfinite(v):
+        return _round_half_away(v)
+    if tv is str:
+        try:
+            d = decimal.Decimal(v.strip())
+        except (decimal.InvalidOperation, ValueError):
+            raise _DAXEvaluationError(f"Cannot convert value '{v}' of type Text to type Integer.") from None
+        if not d.is_finite() or d.adjusted() > 18:
+            return v
+        return int(d.to_integral_value(rounding=decimal.ROUND_HALF_EVEN, context=_CUR_DEC_CTX))
+    return v
+
+
+def _treatas_double(v):
+    """A TREATAS value put on a Double column (DAXEngine._treatas_converter,
+    #336): an Int64 its Double (_int_as_double), TRUE and
+    FALSE 1.0 and 0.0, any other value as it is (a text meets the column's
+    Doubles as a number does: TREATAS({"0.5"}, TD[D]) keeps 0.5, Power BI
+    Desktop 2.152, build_b257d.py t_text_dbl "x"). Desktop's TREATAS({TRUE()},
+    TD[D]) over 0.5, 1.5 and 1.0 keeps 1.0 (t_true_dbl "e"; we kept
+    nothing)."""
+    if type(v) is bool:
+        return float(v)
+    return _int_as_double(v)
+
+
+def _treatas_currency(v):
+    """A TREATAS value put on a Currency column (DAXEngine._treatas_converter,
+    #336), as the column's float: a Double rounded to a whole
+    count of 1/10,000 half away from zero from its Double product with
+    10,000 (0.09995 * 10000.0 is 999.5 in Double, so 1000 counts: Power BI
+    Desktop 2.152, build_b254b.py d_treatas cell 7, where the exact binary
+    value 999.49999... would give 999); an Int64 its value; a text its
+    decimal number, rounded half to even as CURRENCY(<text>) rounds
+    (build_b254.py r_cur_text; only "0.1" is measured here, d_treatas_text);
+    TRUE and FALSE 1 and 0 (build_b257d.py t_true_cur: TREATAS({TRUE()},
+    TCU[v]) keeps the row of 1, where we kept nothing). Any other value, or
+    one past the range, as it is."""
+    if type(v) is bool:
+        return float(v)
+    if type(v) is int:
+        return float(v) if -922337203685477 <= v <= 922337203685477 else v
+    if isinstance(v, float):
+        if not math.isfinite(v) or abs(v) >= 922337203685477.5807:
+            return v
+        q = abs(v) * 10000.0
+        f = math.floor(q)
+        n = f + 1 if q - f >= 0.5 else f
+        return (n if v >= 0 else -n) / 10000
+    if isinstance(v, str):
+        try:
+            d = decimal.Decimal(v.strip())
+        except decimal.InvalidOperation:
+            return v
+        if not d.is_finite() or d.adjusted() > 15:
+            return v
+        n = int(d.scaleb(4).to_integral_value(rounding=decimal.ROUND_HALF_EVEN))
+        return n / 10000 if abs(n) <= 9223372036854775807 else v
+    return v
+
+
+def _meet_number_rows(rows_a: list, rows_b: list) -> tuple:
+    """Two tables' rows of cells (sequences, by column position), with each
+    column that holds Int64 values on one side or the other and Doubles on
+    one side or the other read as Doubles (_int_as_double): a table's column
+    has ONE type, and an Int64 column compared with a Double column compares
+    as Doubles (#325). Rows are copied only where a cell
+    changes."""
+    width = max((len(r) for r in itertools.chain(rows_a, rows_b)), default=0)
+    kinds: list = [set() for _ in range(width)]
+    for r in itertools.chain(rows_a, rows_b):
+        for i, v in enumerate(r):
+            kinds[i].add(type(v))
+    mixed = [i for i, k in enumerate(kinds) if int in k and float in k]
+    if not mixed:
+        return rows_a, rows_b
+
+    def conv(rows):
+        out = []
+        for r in rows:
+            if any(i < len(r) and type(r[i]) is int for i in mixed):
+                r = list(r)
+                for i in mixed:
+                    if i < len(r):
+                        r[i] = _int_as_double(r[i])
+                r = tuple(r)
+            out.append(r)
+        return out
+    return conv(rows_a), conv(rows_b)
+
+
+class _StaticRows(list):
+    """An EMPTY table that still knows its columns' number types, by
+    position: ``num_kinds`` holds int (Int64), float (Double), _Currency or
+    None per column. A column's type in DAX is static -- UNION(SELECTCOLUMNS(
+    TC, "v", TC[K]), SELECTCOLUMNS(FILTER(TD, FALSE()), "v", TD[D])) is a
+    Double column though the Double side has no rows (Power BI Desktop
+    2.152, build_b257b.py ub_empty_distinct 1, ub_empty_max 0, ub_empty_top
+    "bc"; #326) -- and the engine reads it off the values, so
+    an empty SELECTCOLUMNS hands its columns' types on here
+    (_fn_selectcolumns, _static_columns), and ADDCOLUMNS over one adds its
+    new columns' (_fn_addcolumns: build_b257c.py u_addcols_empty, an empty
+    ADDCOLUMNS(SELECTCOLUMNS(FILTER(TD, FALSE()), "v", TD[D]), "w", 1)
+    side makes v a Double column); _fn_union reads them."""
+    __slots__ = ('num_kinds',)
+    num_kinds: tuple
+
+
+def _union_column_type(kinds, static) -> Optional[type]:
+    """The type a table column whose values are of the types ``kinds`` (and
+    whose empty sides are statically ``static``, a type or None) is made one
+    of, when it mixes number types: float (Double) when a Double meets an
+    Int64 or a Currency, _Currency when a Currency meets an Int64, else None
+    (no change). Power BI Desktop 2.152: UNION of an Int64 and a Double
+    column is Double (#326, build_b257.py), of an Int64 and a
+    Currency column Currency (build_b257c.py u_int_cur: MAXX(UNION(
+    SELECTCOLUMNS(TS, "v", TS[G]), SELECTCOLUMNS(TC, "v", TC[v])), [v]) is a
+    Currency; we answered the Int64 3). A Currency beside a Double is a
+    Double as IF's branches are (_unify_num_types; not measured for UNION)."""
+    has_d = float in kinds or static is float
+    has_c = _Currency in kinds or static is _Currency
+    has_i = int in kinds or static is int
+    if has_d and (has_i or has_c):
+        return float
+    if has_c and has_i:
+        return _Currency
+    return None
+
+
+# the value types _to_column_type converts
+_UNIFY_FROM = frozenset({int, _Currency})
+
+
+def _to_column_type(v, target):
+    """The number ``v`` as a value of a column of type ``target``
+    (_union_column_type); anything else as it is."""
+    t = type(v)
+    if t is target:
+        return v
+    if target is float:
+        if t is int:
+            return _int_as_double(v)
+        if t is _Currency:
+            return float(v)
+    elif target is _Currency and t is int:
+        return _cur_from_value(v)
+    return v
+
+
+def _unify_number_columns(rows: list, static: Optional[tuple] = None) -> list:
+    """A table whose column holds both Int64 and Double values is a Double
+    column: its Int64 values become Doubles (_int_as_double). Power BI
+    Desktop 2.152 (build_b257.py, #326): UNION(SELECTCOLUMNS(
+    FILTER(TK, TK[L] IN {"b", "c"}), "v", TK[K], "l", TK[L]), SELECTCOLUMNS(
+    TD, "v", TD[D], "l", TD[M])) ties b, c and x (2**53, 2**53 + 1 and
+    2**53.0): TOPN(2, U, [v], DESC) is b c x y, COUNTROWS(DISTINCT(...)) of
+    [v] 2 (we answered 3); MAXX({9007199254740993, 9007199254740992.0},
+    [Value]) is 2**53 and COUNTROWS(DISTINCT({9007199254740993,
+    9007199254740992.0})) 1. A table of Int64 values alone stays exact
+    (MAXX({9007199254740992, 9007199254740993}, [Value]) - 2**53 is 1).
+
+    Columns are matched by position, as UNION matches them (each row's
+    cells as DAXEngine._cell_keys reads them; a row it does not read --
+    CROSSJOIN parts, GENERATE rows -- is left as it is). ``static`` is an
+    empty side's column types (_StaticRows.num_kinds): a Double there makes
+    the column Double whatever the other side holds. A Currency column
+    beside an Int64 one is Currency, beside a Double one Double
+    (_union_column_type). Rows are copied only where a value changes, never
+    written in place: they may be a model's.
+
+    A Currency cell made a Double is named in the row's ``__dbl__``, so that
+    a read by name no longer takes it back to its table's Fixed Decimal
+    column (_cur_lineage): Power BI Desktop 2.152's MINX(UNION(SELECTCOLUMNS(
+    TC, "v", TC[v]), SELECTCOLUMNS(TD, "v", TD[D])), [v]) is a Double
+    (build_b257d.py u_cur_dbl_min), where the smallest value, a row of TC,
+    read as TC[v] and was a Currency."""
+    if not rows:
+        return rows
+    if static is None or not (float in static or _Currency in static):
+        # the common case, a table without two kinds of number anywhere,
+        # is told by the types of every value in C, before any row is read
+        try:
+            present = set(map(type, itertools.chain.from_iterable(map(dict.values, rows))))
+        except TypeError:           # a row that is no dict
+            present = {int, float}
+        if not ({int, float} <= present or (_Currency in present and (int in present or float in present))):
+            return rows
+    cells = DAXEngine._rows_cells(rows)
+    width = max(map(len, cells), default=0)
+    kinds: list = [set() for _ in range(width)]
+    for c in cells:
+        for i, v in enumerate(c):
+            kinds[i].add(type(v))
+    mixed: dict = {}
+    for i, k in enumerate(kinds):
+        target = _union_column_type(k, static[i] if static is not None and i < len(static) else None)
+        if target is not None:
+            mixed[i] = target
+    if not mixed:
+        return rows
+    out = []
+    for r, c in zip(rows, cells):
+        if not isinstance(r, dict) or not any(
+                i < len(c) and type(c[i]) is not t and type(c[i]) in _UNIFY_FROM for i, t in mixed.items()):
+            out.append(r)
+            continue
+        keys = DAXEngine._cell_keys(r)
+        if keys is None or len(keys) != len(c):
+            out.append(r)
+            continue
+        new = type(r)(r)
+        col = r.get('__column__')
+        tup = list(r['__tuple__']) if '__tuple__' in r else None
+        for i, t in mixed.items():
+            if i >= len(keys) or type(c[i]) is t or type(c[i]) not in _UNIFY_FROM:
+                continue
+            fv = _to_column_type(c[i], t)
+            if fv is c[i]:
+                continue
+            k = keys[i]
+            new[k] = fv
+            if type(c[i]) is _Currency and t is float:
+                new['__dbl__'] = new.get('__dbl__', frozenset()) | {col if k == '__value__' else k}
+            if k == '__value__':
+                if col is not None and col in r and r[col] == c[i]:
+                    new[col] = fv
+            elif col == k and '__value__' in r and r['__value__'] == c[i]:
+                new['__value__'] = fv
+            if tup is not None and k.startswith('Value') and k[5:].isdigit() \
+                    and 0 < int(k[5:]) <= len(tup):
+                tup[int(k[5:]) - 1] = fv
+        if tup is not None:
+            new['__tuple__'] = tuple(tup)
+        out.append(new)
+    return out
+
+
+def _unify_number_values(vals: list) -> list:
+    """A list of scalars as ONE column of a table constructor: with both
+    Int64 and Double values, the Int64 values are Doubles
+    (_unify_number_columns). Power BI Desktop 2.152 (build_b257b.py
+    in_mixed_ctor, #326): 9007199254740993 IN
+    {9007199254740992, 5.0} is TRUE, and CALCULATE(..., TK[K] IN
+    {9007199254740992, 5.0}) keeps 2**53 and 2**53 + 1 (c_in_mixed)."""
+    kinds = set(map(type, vals))
+    if int in kinds and float in kinds:
+        return list(map(_int_as_double, vals))
+    return vals
+
+
 _EMPTY_TEXT_KEY = _collation.sort_key("")
 
 _ASC_ORDER_WORDS = frozenset({'ASC', '1', 'TRUE', 'TRUE()'})
 _DESC_ORDER_WORDS = frozenset({'DESC', '0', 'FALSE', 'FALSE()'})
+
+# the functions whose ORDER arguments DAXEngine._order_pairs reads, and where
+# in their arguments the orderBy / order pairs start
+_ORDER_PAIR_FNS = {'TOPN': 2, 'TOPNSKIP': 3, 'SAMPLE': 2, 'CONCATENATEX': 3}
+_ORDER_PAIR_CALL_RE = re.compile(r"(?i)\b(?:TOPN|TOPNSKIP|SAMPLE|CONCATENATEX)\s*\(")
+
+
+@lru_cache(maxsize=4096)
+def _order_definition_error(expr: str) -> Optional[str]:
+    """The refusal of the first TOPN, TOPNSKIP, SAMPLE or CONCATENATEX call
+    in a MEASURE's expression whose ORDER argument Power BI Desktop refuses
+    (DAXEngine._order_pairs: an order that is none of ASC / 1 / TRUE /
+    TRUE() / DESC / 0 / FALSE / FALSE()), or None.
+
+    Desktop refuses such a measure wherever the call is: IF(FALSE(),
+    CONCATENATEX(TS, TS[L], "", TS[L], 2), "ok") fails with "Unexpected value
+    for ORDER argument in CONCATENATEX function. ..." although the branch is
+    never taken (Power BI Desktop 2.152, build_b257d.py e_cx_if_false; we
+    answered "ok"), as ORDERBY's refusal does (_orderby_definition_error).
+    The text is checked, not evaluated, so the check is per measure
+    expression; literals, brackets and comments are skipped as there. The
+    refusal stays one IFERROR cannot catch (_uncatchable; build_b257c.py
+    e_cx_iferror, e_topn_iferror, build_b257d.py e_topnskip_iferror), also
+    through a reference to the measure, where Desktop has not answered."""
+    if not _ORDER_PAIR_CALL_RE.search(expr):
+        return None
+    s = _strip_line_comments(expr)
+    n, i = len(s), 0
+    prev = ''
+    while i < n:
+        ch = s[i]
+        if ch == '"' or ch == "'" or ch == '[':
+            i = _skip_literal(s, i)
+            prev = ch
+            continue
+        if ch.isalpha() or ch == '_':
+            j = i + 1
+            while j < n and (s[j].isalnum() or s[j] in '._'):
+                j += 1
+            name = s[i:j].upper()
+            start = _ORDER_PAIR_FNS.get(name)
+            if start is not None and not (prev.isalnum() or prev in '_.'):
+                k = j
+                while k < n and s[k].isspace():
+                    k += 1
+                call = DAXEngine._extract_args_scan(s[k:]) if k < n and s[k] == '(' else None
+                if call is not None:
+                    items = _split_call_args(call[1:-1])
+                    try:
+                        DAXEngine._order_pairs(name, items[start:], name != 'CONCATENATEX')
+                    except _DAXEvaluationError as exc:
+                        return exc.message
+                    i, prev = k + 1, '('        # its arguments are scanned too
+                    continue
+            i, prev = j, s[j - 1]
+            continue
+        if not ch.isspace():
+            prev = ch
+        i += 1
+    return None
 
 
 def _row_count_arg(n, total: int) -> int:
@@ -3005,14 +5064,27 @@ def _dax_equal(a, b) -> bool:
     return any(k in ka for k in _filter_value_keys(b))
 
 
+# The comparison operators of DAXEngine._eval_comparison, by spelling.
+_CMP_OPS = {'==': operator.eq, '=': operator.eq, '<>': operator.ne, '>=': operator.ge,
+            '<=': operator.le, '>': operator.gt, '<': operator.lt}
+
+
 def _compare(cell, op: str, target) -> bool:
     """Compare a cell against a target — numerically when both are numbers, by
     date when both parse as dates, else as text, case-insensitively (#107). A
     BLANK side compares as the other side's zero (see _blank_zero_of): BLANK = 0
-    and BLANK < 1 are TRUE. Two numbers compare by their exact values, as
+    and BLANK < 1 are TRUE. Two Int64 values compare by their exact values, as
     _eval_comparison compares them: _as_number's float() rounds an Int64 past
     2**53 onto its neighbour, so 9007199254740993 IN {9007199254740992} held
-    (issue #240)."""
+    (issue #240). An Int64 that meets a Double compares as a Double, as
+    Power BI Desktop 2.152 compares them (build_b257.py, #325):
+    9007199254740993 IN {9007199254740992.0} is TRUE, and over TK[K] =
+    2**53 - 1 .. 2**53 + 4 the filter TK[K] = 9007199254740992.0 keeps 2**53
+    and 2**53 + 1, TK[K] > 9007199254740992.0 only 2**53 + 2 and up
+    (build_b257b.py c_gt_id); a Double column TD[D] filtered by the Int64
+    9007199254740993 keeps its 2**53.0 (c_dcol_eq_i). The scalar IN, the
+    column predicates (make_value_matcher) and the inequality index's
+    residual cells all compare here."""
     if target is None and cell is not None:
         target = _blank_zero_of(cell)
     elif cell is None and target is not None:
@@ -3020,6 +5092,13 @@ def _compare(cell, op: str, target) -> bool:
     tc, tt = type(cell), type(target)
     if (tc is int or tc is float) and (tt is int or tt is float):
         a, b = cell, target
+        # within +-2**53 an int is its own Double: only a larger one converts
+        if tc is not tt:
+            if tc is int:
+                if not -9007199254740992 <= cell <= 9007199254740992:
+                    a = _int_as_double(cell)
+            elif not -9007199254740992 <= target <= 9007199254740992:
+                b = _int_as_double(target)
     elif (a_num := _as_number(cell)) is not None and (b_num := _as_number(target)) is not None:
         a, b = a_num, b_num
     else:
@@ -3369,15 +5448,32 @@ _STRUCTURAL_FILTER_KINDS = frozenset({
     '__tables_ref__', 'vmap', 'tmap', 'dpmap', 'key-aliases', 'non-owners',
     'dp-keys', 'unmatched', 'blank-row-tables', 'every-cell-valued',
     '__related_idx__', '__bare_columns__', 'text-col', 'inset-aliases',
+    # 0.9.148: a column's number type, Int64 or Double (#336)
+    'num-kind',
     # 0.9.147: a column's datetime-ness and the shield analysis (#232), the
     # one-side buckets and the sorted values of the propagation (#230), the
     # running totals' owners and axis (#231) -- one per column or relationship
     'is-datetime', 'shield-memo', 'hop-buckets', 'ineq-order', 'range-owners', 'range-axis',
+    # 0.9.148: the column through which one table's filters reach another
+    # (DAXContext._se_join_column, #243) -- one per pair of tables
+    'se-join',
+    # 0.9.148: which tables active relationships join, per relationship set
+    # (RELATED's structural test, #284)
+    'related-reach',
+    # 0.9.148: a column's number type (Int64 / Double) for IF's result type
+    # (#248) -- one per column
+    'col-numtype',
 })
 # Containers the engine keeps filling after storing them, each bounded on its
 # own: the union memo bounds what it holds (_index_union), and so do the
 # propagation's memos (_BoundedMemo, #230).
 _HELD_FILTER_KINDS = frozenset({'__index_unions__', 'xtf-src', 'xtf-rows', 'ineq'})
+# IF's / SWITCH's / COALESCE's text -> how their branches unify: one memo per
+# kind, a slot of the model's filter cache (_FilterIndexCache.unify_if ...,
+# DAXEngine._unify_entry), and how many texts each holds before it starts over
+_UNIFY_MEMO_SLOTS = {'IF': 'unify_if', 'SWITCH': 'unify_switch', 'COALESCE': 'unify_coalesce'}
+_UNIFY_MEMO_MAX = 4096
+_EMPTY_MEMO: dict = {}            # never written: a cache of no model has no memo
 _PLAIN_FILTER_KINDS = _STRUCTURAL_FILTER_KINDS | _HELD_FILTER_KINDS
 # One dimension member's related rows and their signatures: as many as the
 # model has join values, and reused by every group of a query (see
@@ -3533,7 +5629,8 @@ class _FilterIndexCache(dict):
     registry and every id(tbl) in the keys.
     """
     __slots__ = ('tables', 'limit', 'weight', 'member_cap', 'evicted', 'check_in',
-                 '_keys', '_weights', '_members', '_lock')
+                 '_keys', '_weights', '_members', '_lock', 'cur_tcols', 'cur_epoch',
+                 'unify_if', 'unify_switch', 'unify_coalesce')
 
     def __init__(self, tables=None, size: Optional[tuple] = None):
         super().__init__()
@@ -3541,6 +5638,15 @@ class _FilterIndexCache(dict):
             size = _tables_size(tables) if tables is not None else (0, 0)
         rows, cells = size
         self.tables = tables
+        # the model's Fixed Decimal columns as of mark_currency_columns' epoch
+        # (_currency_tcols): a slot, as every DAXContext reads it when built
+        self.cur_tcols: frozenset = frozenset()
+        self.cur_epoch = -1
+        # IF's / SWITCH's / COALESCE's text -> how their branches unify
+        # (DAXEngine._unify_entry): slots, read once per row of an iteration
+        self.unify_if: dict = {}
+        self.unify_switch: dict = {}
+        self.unify_coalesce: dict = {}
         if tables is not None:
             dict.__setitem__(self, '__tables_ref__', tables)
         self.limit = min(_FILTER_CACHE_MAX_WEIGHT,
@@ -3645,6 +5751,9 @@ class _FilterIndexCache(dict):
             self._weights.clear()
             self._members.clear()
             self.weight = 0
+            self.unify_if.clear()
+            self.unify_switch.clear()
+            self.unify_coalesce.clear()
             if self.tables is not None:
                 dict.__setitem__(self, '__tables_ref__', self.tables)
 
@@ -3807,7 +5916,10 @@ def _relationship_indexes(relationships: list) -> tuple:
     own entry.
 
     Returns (rel_index, rel_dir, rel_adj, one_side_of, rels_sig, expand_adj,
-    date_part_joins).
+    date_part_joins). The first four and expand_adj describe the ACTIVE
+    relationships; date_part_joins holds the DatePartOnly joins of every
+    relationship of the list, active or not (issue #250), so it is the same
+    for every list USERELATIONSHIP / CROSSFILTER derive from a model's.
     """
     hit = _REL_INDEX_CACHE.get(id(relationships))
     if hit is not None and hit[0] is relationships:
@@ -3904,14 +6016,23 @@ def _relationship_indexes(relationships: list) -> tuple:
         rels_sig = None
     # The joins that compare DATE PARTS (JoinOnDateBehavior = 2, DatePartOnly),
     # both orientations, as (table, column, other table, other column) --
-    # Power BI writes it for auto date/time (issue #126).
+    # Power BI writes it for auto date/time (issue #126). Those of EVERY
+    # relationship, active or not (issue #250): the join is the relationship's
+    # own (its R$ index), a column pair has one relationship at most, and
+    # USERELATIONSHIP / CROSSFILTER change only which relationship is active
+    # and how it filters. Taken from the active ones only, the set followed the
+    # list: USERELATIONSHIP over an inactive DatePartOnly relationship joined
+    # by value in a context with_relationships made and by date part in one
+    # rebuilt from its list, and the memos keyed by the relationship
+    # signature handed one reading to the other. Power BI Desktop 2.152
+    # (build_b256.py): CALCULATE([ShipSum], Cal[Date] = DATE(2024, 1, 2)) is
+    # 24 in every CALCULATE shape (0.9.147: 16 in some, 24 in others), and
+    # COUNTROWS(VALUES(Cal2[Date])) is 5 -- the inactive DatePartOnly G[Ship],
+    # whose date parts all match, gives Cal2 no blank row (0.9.147: 6;
+    # #281).
     date_part: set = set()
     for rel in relationships:
-        jod = rel.get('JoinOnDateBehavior')
-        if jod is None and any(str(rel.get(k) or '').startswith('LocalDateTable_')
-                               for k in ('ToTable', 'FromTable')):
-            jod = 2     # not given: Desktop writes DatePartOnly on every auto date/time join
-        if rel.get('IsActive') and jod == 2:
+        if _joins_date_parts(rel):
             ft, fc = rel.get('FromTable', ''), rel.get('FromColumn', '')
             tt, tc = rel.get('ToTable', ''), rel.get('ToColumn', '')
             date_part.add((ft, fc, tt, tc))
@@ -3922,6 +6043,47 @@ def _relationship_indexes(relationships: list) -> tuple:
         if len(_REL_INDEX_CACHE) >= _REL_INDEX_CACHE_MAX:
             _REL_INDEX_CACHE.pop(next(iter(_REL_INDEX_CACHE)), None)
         _REL_INDEX_CACHE[id(relationships)] = (relationships, out)
+    return out
+
+
+def _joins_date_parts(rel: dict) -> bool:
+    """Does relationship ``rel`` compare its keys' DATE PARTS -- its
+    JoinOnDateBehavior is DatePartOnly (2), or, not given, it joins an auto
+    date/time LocalDateTable, for which Desktop always writes DatePartOnly?"""
+    jod = rel.get('JoinOnDateBehavior')
+    if jod is None and any(str(rel.get(k) or '').startswith('LocalDateTable_')
+                           for k in ('ToTable', 'FromTable')):
+        return True
+    return jod == 2
+
+
+_JOIN_COLUMNS_CACHE: dict = {}
+
+
+def _join_columns(relationships: list, table: str) -> frozenset:
+    """``{'table.column', ...}``: the columns a relationship of the list
+    (active or not) joins ``table`` on from its many side -- its one side's
+    columns, both sides' of a one-to-one relationship. A row transition's
+    expansion enters ``table`` through one of them
+    (DAXContext._expansion_origins). Kept per list (held, so its id is not
+    reused) and table."""
+    hit = _JOIN_COLUMNS_CACHE.get(id(relationships))
+    if hit is None or hit[0] is not relationships:
+        with _CACHE_LOCK:
+            if len(_JOIN_COLUMNS_CACHE) >= _REL_INDEX_CACHE_MAX:
+                _JOIN_COLUMNS_CACHE.pop(next(iter(_JOIN_COLUMNS_CACHE)), None)
+            hit = _JOIN_COLUMNS_CACHE[id(relationships)] = (relationships, {})
+    per: dict = hit[1]
+    out = per.get(table)
+    if out is None:
+        cols = set()
+        for r in relationships or ():
+            if r.get('ToTable') == table and r.get('ToColumn'):
+                cols.add(f"{table}.{r.get('ToColumn')}")
+            if (r.get('FromTable') == table and r.get('FromColumn')
+                    and (r.get('FromCardinality') or 2) == 1 and (r.get('ToCardinality') or 1) == 1):
+                cols.add(f"{table}.{r.get('FromColumn')}")
+        out = per[table] = frozenset(cols)
     return out
 
 
@@ -4123,13 +6285,27 @@ class _LazyVar:
     """A VAR, evaluated the first time it is used, in the filter context and
     with the variables it was defined with. Desktop 2.152 (build_b134.py,
     issue #134): VAR x = ERROR("boom") RETURN 5 is 5, IF(FALSE(), x, 6) is 6,
-    and VAR x = SUM(T[v]) RETURN CALCULATE(x, T[c] = "a") is the whole 60."""
-    __slots__ = ('expr', 'ctx', 'scope', 'state', 'value')
+    and VAR x = SUM(T[v]) RETURN CALCULATE(x, T[c] = "a") is the whole 60.
 
-    def __init__(self, expr: str, ctx, scope: dict):
+    ``if_branch``: how many IF branches the definition is inside. The value
+    is evaluated as there, wherever it is first used: an iteration inside
+    an IF branch adds in another order (DAXEngine._fe_fold_order,
+    #345), and VAR x = SUMX(VALUES(...), ...) RETURN
+    IF(1 = 1, x) + x * 0 used to give x the order of whichever use came
+    first."""
+    __slots__ = ('expr', 'ctx', 'scope', 'state', 'value', 'rowread', 'if_branch', 'eager')
+
+    def __init__(self, expr: str, ctx, scope: dict, if_branch: int = 0):
         self.expr, self.ctx, self.scope = expr, ctx, scope
         self.state = 0           # 0 pending, 1 running, 2 done, 3 failed
         self.value: Any = None
+        # does the expression read a row where it is defined
+        # (DAXEngine._lazy_var_reads_row, issue #249); None until asked
+        self.rowread: Optional[bool] = None
+        self.if_branch = if_branch
+        # DAXEngine._logic_eager of the expression where it is defined, per
+        # its ``rows`` flag (index 1 / 0); None until asked (issue #249)
+        self.eager: Optional[list] = None
 
     def force(self, engine) -> Any:
         if self.state == 2:
@@ -4141,7 +6317,9 @@ class _LazyVar:
             raise DAXEvaluationError(f"Variable expression '{self.expr[:60]}' refers to itself")
         self.state = 1
         prev = engine._current_var_scope
+        prev_if = engine._if_branch
         engine._current_var_scope = self.scope
+        engine._if_branch = self.if_branch
         try:
             self.value = engine._eval_expr(self.expr, self.ctx, self.scope)
             self.state = 2
@@ -4155,6 +6333,7 @@ class _LazyVar:
             raise err from exc
         finally:
             engine._current_var_scope = prev
+            engine._if_branch = prev_if
 
 
 class GroupByValues(list):
@@ -4208,11 +6387,237 @@ class RowContextPredicate(dict):
     shadow: Optional[list] = None
 
 
+class _SeRowsValues(list):
+    """A filter_context In-set that a CALCULATE table filter FILTER(T,
+    <condition>) wrote on one of T's own columns, whose condition reads
+    ``se_cut`` of T (its columns, and the join column of what it reads
+    through RELATED). A storage-engine scan of T reads those columns for
+    it, not each column the rows' values filter (DAXContext.
+    se_scan_columns, #344). Power BI Desktop 2.152
+    (build_b243c.py, Agents FactSales): CALCULATE(SUM(SalesAmount),
+    FILTER(FactSales, RELATED(DimStore[StoreKey]) <> 0)) - 729782919 is
+    0.215399503707886, cut at FactSales[StoreKey]'s runs alone
+    (r_filter_related_calc = af_dimstore), where every column of FactSales
+    gave 0.2154003381729126. Any other change to the filter (KEEPFILTERS,
+    a second argument on the column) makes a plain one again, which cuts
+    at its column as before."""
+    se_table: str = ''
+    se_cut: frozenset = frozenset()
+
+
+class _SeRowsSpec(dict):
+    """_SeRowsValues for the filter on the combinations of T's columns the
+    same table filter writes (DAXEngine._whole_rows_combos)."""
+    se_table: str = ''
+    se_cut: frozenset = frozenset()
+
+
+def _se_rows_tagged(value, table: str, cut: frozenset):
+    """``value`` (a list, or a combinations dict) tagged as written by a
+    table filter whose condition reads ``cut`` of ``table``."""
+    tagged = _SeRowsValues(value) if isinstance(value, list) else _SeRowsSpec(value)
+    tagged.se_table = table
+    tagged.se_cut = cut
+    return tagged
+
+
 def _row_value(vals: list, shadow: Optional[list]) -> RowContextValues:
     """A row transition's filter value, carrying the iteration's rows."""
     tagged = RowContextValues(vals)
     tagged.shadow = shadow
     return tagged
+
+
+# ---- the window functions' refusals (issue #247) ---------------------------
+# Power BI Desktop 2.152's messages (its Norwegian UI's, translated; batteries
+# build_b247.py, build_b253.py and build_b253b.py).
+_WIN_DUP_MSG = "The relation parameter of {fn} may have duplicate rows. This is not allowed."
+_WIN_MB_DUP_MSG = ("Despite MatchBy columns being specified, duplicate rows occur in the "
+                   "relation parameter of {fn}. This is not allowed.")
+_WIN_BUILT_MSG = ("The relation parameter of {fn} contains only columns added by DAX table "
+                  "functions. This is not supported.")
+_WIN_RN_TIE_MSG = "Duplicate rows detected in the relation parameter of the ROWNUMBER function."
+# Desktop's own English text (build_b257d.py e_orderby_text; #330),
+# as TOPN's, SAMPLE's and CONCATENATEX's (DAXEngine._order_pairs)
+_WIN_ORDER_ARG_MSG = ("Unexpected value for ORDER argument in ORDERBY function. Use "
+                      "0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order.")
+_WIN_PART_BUILT_MSG = ("The function PARTITIONBY cannot be used with columns added by DAX table "
+                       "functions.")
+
+
+class _WindowError(_DAXEvaluationError):
+    """An error of OFFSET / INDEX / WINDOW / ROWNUMBER / RANK or of their
+    ORDERBY / PARTITIONBY. Power BI Desktop 2.152 fails the whole query with
+    it, also from a measure the query only references, and names that measure
+    (build_b253.py o_m2m, rn_mb_reg, z_sumx_empty, ...): ``_dax_propagate``
+    makes DAXEngine.evaluate_measure pass it on instead of degrading the
+    reference to BLANK.
+
+    IFERROR / ISERROR around the function itself catch none of them
+    (``_dax_uncatchable``; build_b253b.py f_ife_dup_inline, f_ife_order_inline,
+    f_ife_mb, f_ife_built, f_ife_rn_inline, f_iserr_rn_inline). Around a
+    REFERENCE to a measure that fails so, they catch the duplicate-rows
+    refusal (build_b253.py z_iferror -1, z_iserror 1), the ORDER argument
+    (build_b253b.py f_ife_order_ref "caught") and the space form ORDERBY(T[c]
+    DESC) (build_b253c.py a_ife_space_ref "caught"), but not ROWNUMBER's tie
+    (z_rn_iferror, f_ife_rn_perrow fail), the MATCHBY duplicates
+    (build_b253c.py a_ife_mb_ref, a_iserr_mb_ref fail) nor the built columns
+    (a_ife_built_ref fails: "The relation parameter of ROWNUMBER contains only
+    columns added by DAX table functions"). ``ref_catchable`` says which: the
+    measure reference clears ``_dax_uncatchable`` for it. PARTITIONBY over
+    table-function columns, which Desktop reports the way it reports the ORDER
+    argument (a definition error naming no measure; build_b253c.py
+    c_gs_idx_part), is caught through a reference as that one is
+    (build_b253d.py a_part_ife_ref "caught")."""
+    _dax_propagate = True
+
+    def __init__(self, message: str, ref_catchable: bool):
+        super().__init__(message)
+        self._dax_uncatchable = True
+        self._win_ref_catchable = ref_catchable
+
+
+_ORDERBY_CALL_RE = re.compile(r"(?i)\bORDERBY\s*\(")
+
+
+def _split_call_args(text: str) -> list:
+    """A call's argument text split at its top-level commas, a comma inside
+    a "string", a 'quoted name' or a [name] staying in its argument
+    (_skip_literal): ORDERBY(S[Sales, Net], DESC) is two arguments."""
+    parts: list = []
+    depth, start, i, n = 0, 0, 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"' or ch == "'" or ch == '[':
+            i = _skip_literal(text, i)
+            continue
+        if ch == '(' or ch == '{':
+            depth += 1
+        elif ch == ')' or ch == '}':
+            depth -= 1
+        elif ch == ',' and depth == 0:
+            parts.append(text[start:i])
+            start = i + 1
+        i += 1
+    parts.append(text[start:])
+    return parts
+
+
+@lru_cache(maxsize=4096)
+def _orderby_definition_error(expr: str) -> Optional[str]:
+    """The message of the first ORDERBY call in a MEASURE's expression whose
+    order arguments Power BI Desktop refuses (DAXEngine._win_orderby_items:
+    an order that is none of ASC / 1 / TRUE / TRUE() / DESC / 0 / FALSE /
+    FALSE(), or the space form ORDERBY(T[c] DESC)), or None.
+
+    Desktop refuses such a measure wherever the call is: IF(FALSE(),
+    CONCATENATEX(INDEX(1, ALL(S[Cat], S[V]), ORDERBY(S[V], S[Cat])), S[Cat]),
+    "ok") fails with "Unexpected value for ORDER argument in ORDERBY
+    function. ..." although the branch is never taken (build_b253c.py
+    a_order_untaken; #259); the engine checked the order where
+    the call ran and answered "ok". The message names no measure, as a
+    definition error does, and IFERROR around a reference to the measure
+    catches it (build_b253b.py f_ife_order_ref "caught", build_b253c.py
+    a_ife_space_ref "caught"), so the check is per measure expression, as
+    _related_without_row's. Literals and brackets are skipped, also where
+    the arguments are split (_split_call_args), so a column named
+    [Sales, Net] fails no measure here. Comments are stripped first
+    (_strip_line_comments), as for the measure's evaluation: scanned with
+    its comments, ORDERBY(S[V], DESC -- latest first) read "DESC -- latest
+    first" as its order and ORDERBY(S[V] -- asc) as the space form, so either
+    measure failed, even in a branch never taken."""
+    if not _ORDERBY_CALL_RE.search(expr):
+        return None
+    s = _strip_line_comments(expr)
+    n, i = len(s), 0
+    prev = ''
+    while i < n:
+        ch = s[i]
+        if ch == '"' or ch == "'" or ch == '[':
+            i = _skip_literal(s, i)
+            prev = ch
+            continue
+        if ch.isalpha() or ch == '_':
+            j = i + 1
+            while j < n and (s[j].isalnum() or s[j] in '._'):
+                j += 1
+            if s[i:j].upper() == 'ORDERBY' and not (prev.isalnum() or prev in '_.'):
+                k = j
+                while k < n and s[k].isspace():
+                    k += 1
+                call = DAXEngine._extract_args_scan(s[k:]) if k < n and s[k] == '(' else None
+                if call is not None:
+                    items = _split_call_args(call[1:-1])
+                    try:
+                        DAXEngine._win_orderby_items(items)
+                    except _WindowError as exc:
+                        return exc.message
+                    i, prev = k + 1, '('        # its arguments are scanned too
+                    continue
+            i, prev = j, s[j - 1]
+            continue
+        if not ch.isspace():
+            prev = ch
+        i += 1
+    return None
+
+
+_PARTITIONBY_CALL_RE = re.compile(r"(?i)\bPARTITIONBY\s*\(")
+
+
+@lru_cache(maxsize=4096)
+def _has_partitionby(expr: str) -> bool:
+    """Does ``expr`` hold a PARTITIONBY call (DAXEngine.
+    _partitionby_definition_error)?"""
+    return _PARTITIONBY_CALL_RE.search(expr) is not None
+
+
+# A window relation's static shape (DAXEngine._win_rel_shape):
+#   kind   'keyed' (a model table with a key), 'set' (proven duplicate-free by
+#          its algebra), 'bag' (may have duplicate rows), 'series' / 'calendar'
+#          (GENERATESERIES / CALENDAR, whose kind depends on the function);
+#   built  every column added by a table function (True), or not (False), or
+#          unknown (None);
+#   key    the columns Desktop appends to ORDERBY to break its ties: a tuple
+#          of (table or None, column), 'cells' (every column of the row), or ().
+_WinShape = collections.namedtuple('_WinShape', 'kind built key')
+
+_REL_KEYS_CACHE: dict = {}
+
+
+def _relation_keys(relationships) -> dict:
+    """table -> its key columns, in relationship order: the ToColumn of a
+    relationship whose ToCardinality is one and the FromColumn of one whose
+    FromCardinality is one, active or not, never a many-to-many side. Power
+    BI Desktop 2.152 (build_b253.py, issue #247) proves a model table
+    duplicate-free by such a column only: i_inactive 'a' and o_inactive ',a,b'
+    (an inactive relationship), i_11_a 'p' and i_11_b 'r' (both sides of a
+    1:1), while i_m2m_a / i_m2m_b / o_m2m (many-to-many) and i_all_fact (the
+    many side) are refused, and so is S, whose rows are all distinct but which
+    no relationship keys (i_s, i_all_s). Built once per relationship list, as
+    _relationship_indexes is."""
+    if not relationships:
+        return {}
+    hit = _REL_KEYS_CACHE.get(id(relationships))
+    if hit is not None and hit[0] is relationships:
+        cached: dict = hit[1]
+        return cached
+    keys: dict = {}
+    for rel in relationships:
+        fcard = rel.get('FromCardinality') or 2
+        tcard = rel.get('ToCardinality') or 1
+        if fcard == 2 and tcard == 2:
+            continue
+        for side, card in (('To', tcard), ('From', fcard)):
+            if card != 1:
+                continue
+            t, c = rel.get(side + 'Table'), rel.get(side + 'Column')
+            if t and c and c not in keys.setdefault(t, []):
+                keys[t].append(c)
+    if len(_REL_KEYS_CACHE) >= 16:
+        _REL_KEYS_CACHE.clear()
+    _REL_KEYS_CACHE[id(relationships)] = (relationships, keys)
+    return keys
 
 
 # _row_cell's answer when the expression is not the row's own cell.
@@ -4230,6 +6635,35 @@ class _ColumnsRow(dict):
     "Revenue", Orders[Revenue])) is FALSE (build_b115b.py, issue #115);
     SUMX(ALL(Orders2[Region], Orders2[Qty]), CALCULATE(COUNTROWS(Dim))) is 15
     though Orders2 has only those two columns (build_b117.py, issue #152)."""
+
+
+class _TreatasTable(list):
+    """TREATAS used as a table (DAXEngine._fn_treatas): the rows of its
+    target columns, with ``marker``, the filter CALCULATE applies
+    (DAXEngine._treatas_filter)."""
+    __slots__ = ('marker',)
+    marker: Any
+
+
+def _treatas_marker(res):
+    """The filter of a TREATAS result ``res``: a _TreatasTable's marker, or
+    ``res`` itself."""
+    return res.marker if isinstance(res, _TreatasTable) else res
+
+
+def _row_of_columns(row: dict) -> bool:
+    """Is ``row`` a row of a table of COLUMNS rather than a row of its
+    ``__table__``? A _ColumnsRow always is. A plain row tagged with
+    ``__column__`` is one when it does not carry that column itself: VALUES /
+    DISTINCT / ALL of a column, and the other one-column tables, carry only
+    ``__table__`` / ``__column__`` / ``__value__``. RELATEDTABLE's rows are
+    whole rows of the table that also name its first column, which they
+    carry (as do FILTER / ADDCOLUMNS over them), so RELATED reads them as
+    rows of the table (#298; the first draft refused them)."""
+    if isinstance(row, _ColumnsRow):
+        return True
+    col = row.get('__column__')
+    return col is not None and col not in row
 
 
 def _row_parts(row: dict) -> tuple:
@@ -4260,15 +6694,62 @@ def _generate_outer(row) -> dict:
     return type(row)(row) if isinstance(row, dict) else {}
 
 
-def _generate_inner(item: dict) -> dict:
+def _generate_inner(item: dict, prefix: str = '_inner_') -> dict:
     """GENERATE's inner row as the keys it adds to the outer row, prefixed
-    ``_inner_``. A row of columns whose ``__column__`` is no column of it
-    (SELECTCOLUMNS over a single-column table) carries that column as
-    lineage only, which its prefixed copy cannot tell; DAXEngine._row_cells
-    would read it as a column, so it stays out (issue #234)."""
-    if isinstance(item, _ColumnsRow) and item.get('__column__') not in item:
-        return {f"_inner_{k}": v for k, v in item.items() if k != '__column__' and k != '__value__'}
-    return {f"_inner_{k}": v for k, v in item.items()}
+    ``prefix`` (``_inner_``, deeper on an outer row that holds an inner row
+    already, _inner_prefix). A row of columns whose ``__column__`` is no
+    column of it (SELECTCOLUMNS over a single-column table) carries that
+    column as lineage only, which its prefixed copy cannot tell;
+    DAXEngine._row_cells would read it as a column, so it stays out (issue
+    #234). A row of columns is marked ``__columns__``: its context
+    transition filters nothing here (DAXEngine._generate_row_filters)."""
+    if isinstance(item, _ColumnsRow):
+        if item.get('__column__') not in item:
+            out = {prefix + k: v for k, v in item.items() if k != '__column__' and k != '__value__'}
+        else:
+            out = {prefix + k: v for k, v in item.items()}
+        out[prefix + '__columns__'] = True
+    else:
+        out = {prefix + k: v for k, v in item.items()}
+    # every level has its table key, '' for a row of none, so a reader
+    # walking the levels (_joined_cell, _row_context_cell) finds each one
+    out.setdefault(prefix + '__table__', '')
+    return out
+
+
+def _inner_prefix(outer: dict) -> str:
+    """The prefix of the keys GENERATE's inner row adds to ``outer``:
+    ``_inner_``, one level deeper for each inner row the outer row holds
+    already. GENERATE(GENERATE(D, FILTER(E, ..)), FILTER(T, ..)) wrote T's
+    row over E's, so E[q] of it leaked a (table, column) marker
+    (#303)."""
+    p = '_inner_'
+    while any(k.startswith(p) for k in outer):
+        p += '_inner_'
+    return p
+
+
+def _blank_like(row) -> dict:
+    """A row of ``row``'s layout with every cell BLANK, marked
+    ``__blank_row__`` (its context transition filters every column to
+    BLANK, DAXEngine._row_filters): GENERATEALL's inner row for an outer row
+    that no inner row joined (#300)."""
+    out: dict = type(row)(row) if isinstance(row, dict) else {}
+    for k in list(out):
+        base = k
+        while base.startswith('_inner_'):
+            base = base[7:]
+        if base == '__value__' or base[:2] != '__':
+            out[k] = None
+        elif base == '__tuple__':
+            out[k] = tuple(None for _ in out[k] or ())
+        elif base == '__parts__':
+            out[k] = [_blank_like(p) for p in out[k] or ()]
+        elif base == '__joined__':
+            out[k] = tuple({'__table__': p.get('__table__'), '__blank_right__': True}
+                           for p in out[k] or () if isinstance(p, dict))
+    out['__blank_row__'] = True
+    return out
 
 
 class _SigDict(dict):
@@ -4282,12 +6763,16 @@ class _ExpansionValues(RowContextValues):
     """A row transition's filter on a column of the row's EXPANDED table
     beyond the row's own table (issue #115). ``origin`` is the iterated table
     and ``anchor_key`` its join column toward this one. While a filter on
-    ``anchor_key`` keeps the row's value (``anchor_sig``), it selects the
-    related rows already, so this filter adds nothing on ``origin`` and is
-    not propagated back to it (_get_cross_table_filters_uncached)."""
+    ``anchor_key`` keeps the row's value (``anchor_sig``) and the
+    relationships are the ones the expansion was built through
+    (``rels_sig``), it selects the related rows already, so this filter adds
+    nothing on ``origin`` and is not propagated back to it
+    (_get_cross_table_filters_uncached). Under other relationships it is
+    (#286): see DAXContext._expansion_implied."""
     origin: str = ''
     anchor_key: str = ''
     anchor_sig: Any = None
+    rels_sig: Any = None
 
 
 def _iteration_tagged(v) -> bool:
@@ -4315,6 +6800,10 @@ class DAXContext:
     # the first (_row_expansion): a context is built for every iterated row,
     # and few host an iteration.
     _rx_slots: list
+    # An ADDCOLUMNS row's scope of aggregations scanned together, which the
+    # transitions of its extension columns take (DAXEngine._fn_addcolumns,
+    # #339); set on that row's context only.
+    _se_row_scope: Optional[dict] = None
 
     def __init__(self, tables: dict, measures: dict, date_table: Optional[str] = None,
                  date_column: Optional[str] = None, filter_context: Optional[dict] = None,
@@ -4408,6 +6897,10 @@ class DAXContext:
         # to see the un-transitioned filter context, exactly like Desktop.
         # CALCULATE and evaluate_measure clear it (they ARE the transition).
         self._outer_ctx: Optional['DAXContext'] = None
+        # The aggregations Desktop's storage engine scans together with the
+        # ones evaluated here, as ``(owner context, {table: columns})``
+        # (DAXEngine._se_scope, issue #339); None: none known.
+        self._se_fuse: Optional[tuple] = None
         self._measure_cache: dict = {}
         # measure-cache key -> what that evaluation reported besides its
         # value, replayed on a memo hit: the unsupported functions it hit (a
@@ -4429,6 +6922,19 @@ class DAXContext:
         (self._rel_index, self._rel_dir, self._rel_adj, self._one_side_of,
          self._rels_sig, self._expand_adj,
          self._date_part_joins) = _relationship_indexes(self.relationships)
+        # {(table, column)} of the model's Fixed Decimal columns: a float read
+        # from one in a row context is typed _Currency (issue #248). Empty --
+        # one truth test per read -- on a model without them. The model's
+        # cache holds it in a slot, read inline: a context is built for every
+        # iterated row, the call to _currency_tcols cost each a third of a
+        # microsecond and a dict entry of the cache about as much (with_filters,
+        # 8.0 -> 8.4 us); the two slot reads cost some 60 ns. A plain instance
+        # attribute, as every attribute the evaluator reads per row (a
+        # descriptor on the class slowed every read of it), set last so the
+        # attributes before it keep their places in the instance's dict.
+        _fc: _FilterIndexCache = self._filter_idx_cache  # type: ignore[assignment]
+        self._cur_tcols: frozenset = (_fc.cur_tcols if _fc.cur_epoch == _CURRENCY_MARK_EPOCH
+                                      else _currency_tcols(tables, _fc))
 
     # ---- DAX's blank (unknown) row -------------------------------------------
     # When a relationship joins a row whose key matches no row of the one side
@@ -4460,6 +6966,16 @@ class DAXContext:
         1:1: in F -> A 1:1 B, F's orphan rows read A's and B's columns as
         BLANK, so B's blank row is the one they group under (no Desktop
         measurement reaches this case; it is the expanded table's reading).
+
+        Each relationship's keys are compared by its own join, active or not:
+        by date part for a DatePartOnly one (_date_part_joins holds those of
+        every relationship, issue #250). Power BI Desktop 2.152
+        (build_b256.py): the inactive DatePartOnly G[Ship] -> Cal2[Date], whose
+        ships all fall on calendar days but four at a time of day, gives Cal2
+        no blank row -- COUNTROWS(VALUES(Cal2[Date])) is 5, with or without
+        USERELATIONSHIP (0.9.147 compared them by value: 6; #281)
+        -- while the inactive by-value H[Ship], whose timed ships match no
+        Cal3 row, gives Cal3 one (h_rows 5 over 4 days).
 
         Memoized on the model-wide cache per relationship set (a structural
         entry): finding them scans a relationship's many side at most once,
@@ -4614,8 +7130,8 @@ class DAXContext:
         if mi < 0:
             return False
         if (many_table, many_col, one_table, one_col) in self._date_part_joins:
-            dp_keys = self._date_part_key_set(one_table, one_col)
-            return any(not _key_in(r[mi], _DatePartKeys(dp_keys)) for r in mtbl['rows'])
+            allowed = _DatePartKeys(self._date_part_key_set(one_table, one_col))
+            return any(not _key_in(v, allowed) for v in _distinct_join_cells(mtbl['rows'], mi))
         keys = self._key_aliases(one_table, one_col)
         return any(_jstr(r[mi]) not in keys for r in mtbl['rows'])
 
@@ -4627,14 +7143,20 @@ class DAXContext:
         mtbl = self.tables.get(many_table)
         if not mtbl:
             return frozenset({'None'})
-        key = (id(mtbl), 'unmatched', many_idx, one_table, one_col)
+        # Whether the join compares date parts is in the key: two relationship
+        # lists over one tables mapping may join the pair differently, and the
+        # spellings of one are no answer for the other (issue #250 -- in a
+        # USERELATIONSHIP context that kept the old joins, the exact spellings
+        # hid the date part of a ship past the calendar from Cal's blank row).
+        many_col = mtbl['columns'][many_idx] if many_idx < len(mtbl['columns']) else None
+        dp = (many_table, many_col, one_table, one_col) in self._date_part_joins
+        key = (id(mtbl), 'unmatched', many_idx, one_table, one_col, dp)
         hit = self._filter_idx_cache.get(key)
         if hit is None:
-            many_col = mtbl['columns'][many_idx] if many_idx < len(mtbl['columns']) else None
-            if (many_table, many_col, one_table, one_col) in self._date_part_joins:
+            if dp:
                 keys = self._date_part_key_set(one_table, one_col)
-                out = {(_date_part_key(r[many_idx]) or _jstr(r[many_idx]))
-                       if r[many_idx] is not None else 'None' for r in mtbl['rows']}
+                out = {(_date_part_key(v) or _jstr(v)) if v is not None else 'None'
+                       for v in _distinct_join_cells(mtbl['rows'], many_idx)}
             else:
                 keys = self._key_aliases(one_table, one_col)
                 out = {_jstr(r[many_idx]) for r in mtbl['rows']}
@@ -5048,6 +7570,7 @@ class DAXContext:
                 for k, vs in raw.items():
                     w = _ExpansionValues(vs)
                     w.shadow, w.origin, w.anchor_key, w.anchor_sig = shadow, t, anchor_key, anchor_sig
+                    w.rels_sig = self._rels_sig
                     w._sig = sigd[k]  # type: ignore[attr-defined]
                     sub[k] = w
                 sub.sigd = tagged
@@ -5242,6 +7765,111 @@ class DAXContext:
                 snap[k] = self._filter_sig_exact(v)
         return snap
 
+    def _expansion_implied(self, values: '_ExpansionValues', fc: dict) -> bool:
+        """Does the row's own filter on its iterated table imply what its
+        expansion filter ``values`` would select there, coming back? While
+        the filter on the row's join column keeps the row's value and the
+        relationships are those the expansion was built through: the way back
+        is the way out.
+
+        Not under a USERELATIONSHIP / CROSSFILTER set the CALCULATE switched
+        to (#286). The expansion stays a filter on the related
+        columns, and the relationship now active carries it to the iterated
+        table like any filter there. Power BI Desktop 2.152 (build_b256b.py,
+        F[Order] active, F[Ship] inactive): SUMX(F, CALCULATE(SUM(F[v]),
+        USERELATIONSHIP(F[Ship], Cal[Date]))) is 8192 -- each row's Cal day
+        through F[Order] meets the row through F[Ship] only for row 13,
+        shipped the day it was ordered (r_ur_sum; r_ur_count 1, r_ur_xb_sum
+        8192), where skipping it gave every row: 16383 and 14."""
+        return bool(values.rels_sig == self._rels_sig
+                    and self._filter_sig(fc.get(values.anchor_key)) == values.anchor_sig)
+
+    def _expansion_origins(self, table_name: str, fc: dict) -> frozenset:
+        """The iterated tables a row transition's expansion holds table_name
+        for (its _ExpansionValues there). Such a row's own filters on its
+        table do not reach table_name through a relationship
+        (#285): the transition is ONE filter, on the row's
+        expanded table, and it already says which rows of table_name the row
+        stands for. Taken back out -- REMOVEFILTERS(table_name), a date filter
+        clearing it (#78) -- the rest of it is a filter on the iterated table
+        and reaches table_name as any filter does.
+
+        Power BI Desktop 2.152 (build_b256.py / build_b256b.py; F[Order]
+        active, F[Ship] inactive DatePartOnly): SUMX(F, CALCULATE(SUM(Cal[Bit]),
+        USERELATIONSHIP(F[Ship], Cal[Date]), CROSSFILTER(F[Ship], Cal[Date],
+        Both))) is 172, each row's order day (d_both_rowctx, r_ur_xb_inline,
+        r_ur_xb_outer, r_filter_ur_xb; COUNTROWS(Cal) summed over the rows
+        is 12, d_both_rowctx_count), where carrying the row through F[Ship] as well
+        left only row 13's day: 16 (and 1). With REMOVEFILTERS(Cal) it is 251,
+        each row's ship day (r_ur_xb_rmcal). In the other direction the
+        expansion does reach the iterated table (#286,
+        _expansion_implied).
+
+        The expansion holds table_name only while it still filters a column
+        a relationship joins table_name on, and while the iterated table's
+        own filters are still the row's (#285). Desktop
+        (build_b256c.py), each SUMX(F, CALCULATE(SUM(Cal[Bit]),
+        USERELATIONSHIP(F[Ship], Cal[Date]), CROSSFILTER(F[Ship], Cal[Date],
+        Both), ..)): with REMOVEFILTERS(Cal[Date]) it is 16 -- the row reaches
+        Cal through F[Ship] and meets the order day's Cal[Bit] and Cal[Year]
+        for row 13 alone (t_rm_date; the engine 172) -- while
+        REMOVEFILTERS(Cal[Bit]) and REMOVEFILTERS(P) leave 172 (t_rm_bit,
+        t_rm_p); with F[pk] = 1 or KEEPFILTERS(F[pk] = 1) it is BLANK, the
+        whole F filter reaching Cal (t_pk_inside, t_keep_pk; the engine 114
+        and 104, F[pk] = 1 alone reaching it).
+
+        Nor while the CALCULATE writes a filter on another part of the
+        expansion (#285): every filter on a table the row's
+        expansion reaches must still be that expansion's. Desktop
+        (build_b256d.py), the same SUMX(F, CALCULATE(SUM(Cal[Bit]), ..)):
+        with P[x] = 1 it is BLANK (t_p_written; the engine 114), with
+        Cal[Bit] >= 1 or KEEPFILTERS(Cal[Bit] >= 1) it is 16, row 13 alone
+        (t_cal_bit_written, t_keep_bit; the engine 172 and 172) -- while
+        REMOVEFILTERS of such a column leaves the rest of the expansion
+        holding (t_rm_bit, t_rm_p 172)."""
+        if not fc or _ExpansionValues not in set(map(type, fc.values())):
+            return frozenset()
+        joins = _join_columns(self.relationships, table_name)
+        origins = {v.origin for k, v in fc.items() if type(v) is _ExpansionValues and k in joins}
+        if not origins:
+            return frozenset()
+        # the tables each origin's expansion holds (origin by table)
+        parts: dict = {}
+        for k, v in fc.items():
+            if type(v) is _ExpansionValues and v.origin in origins:
+                t = k.partition('.')[0]
+                got = parts.get(t)
+                if got is None:
+                    parts[t] = {v.origin}
+                else:
+                    got.add(v.origin)
+        for k, v in fc.items():
+            t = k.partition('.')[0]
+            if t in origins:
+                if type(v) is not RowContextValues:
+                    origins.discard(t)
+            else:
+                held = parts.get(t)
+                if held and not (type(v) is _ExpansionValues and v.origin in held):
+                    # a filter written on a part of the expansion
+                    origins.difference_update(held)
+            if not origins:
+                break
+        return frozenset(origins)
+
+    @staticmethod
+    def _same_transition(values: Any, src: str, origins: frozenset) -> bool:
+        """Is ``values``, a filter on table ``src``, part of the row
+        transition of one of ``origins`` (_expansion_origins): the row's own
+        filter on its table, or the row's expansion onto another of its
+        related tables? Desktop carries neither to a table the expansion
+        holds: the P part of an F row's transition reaching Cal through F
+        and a bidirectional F[Ship] left 156 of d_both_rowctx's 172."""
+        t = type(values)
+        if t is RowContextValues:
+            return src in origins
+        return t is _ExpansionValues and values.origin in origins
+
     def _get_cross_table_filters(self, table_name: str) -> list:
         """
         Get ALL cross-table filters that apply to a target table.
@@ -5298,10 +7926,11 @@ class DAXContext:
             # model can name different ones -- calc_tables builds its own with
             # an auto-detected date table. COUNTROWS(G) under Cal[Year] = 2024
             # is 7 with date table Cal and 14 with Y; on 0.9.145 whichever
-            # ran first answered both (issue #218).
+            # ran first answered both (issue #218). The DatePartOnly joins
+            # too, as _source_memo_key holds them (issue #250).
             ck = (id(tbl), 'xtf', self._filters_sig(),
                 tuple(sorted((self._no_prop_keys.get(table_name) or {}).items())),
-                self._rels_sig, self.date_table, self.date_column)
+                self._rels_sig, self.date_table, self.date_column, self._date_part_joins)
         except TypeError:
             ck = None
         if ck is not None:
@@ -5328,6 +7957,7 @@ class DAXContext:
         # than blanking the whole table) is what lets a filter created LATER in
         # a nested CALCULATE still reach this table, which is what Desktop does.
         _suppressed = self._no_prop_keys.get(table_name) or {}
+        src_origins = self._expansion_origins(table_name, self.filter_context)
         for fk, values in self.filter_context.items():
             # Suppress only if this key still holds the SAME filter ALL cleared.
             # Re-filtering the column inside a nested CALCULATE makes a NEW
@@ -5338,8 +7968,7 @@ class DAXContext:
             if fk in _suppressed and _suppressed[fk] == self._filter_sig_exact(values):
                 continue
             if (type(values) is _ExpansionValues and values.origin == table_name
-                    and self._filter_sig(self.filter_context.get(values.anchor_key))
-                    == values.anchor_sig):
+                    and self._expansion_implied(values, self.filter_context)):
                 # A row transition's filter on the row's dimension, back on
                 # the iterated table: the row's own join value selects those
                 # rows already (issue #115 -- skipping it keeps an iteration
@@ -5348,6 +7977,8 @@ class DAXContext:
             parts = fk.split('.', 1)
             if len(parts) == 2:
                 src_table, src_col = parts
+                if src_origins and self._same_transition(values, src_table, src_origins):
+                    continue    # the row's own filters, held by its expansion
                 if src_table != table_name:  # Only cross-table filters
                     if src_table not in table_filters:
                         table_filters[src_table] = []
@@ -5465,15 +8096,18 @@ class DAXContext:
         sigd = self._filters_sigd()
         by_src: dict = {}
         _suppressed = snaps.get(table_name)
+        src_origins = self._expansion_origins(table_name, fc)
         for fk, values in fc.items():
-            # the ALL() snapshot and the row-expansion skip, as in
+            # the ALL() snapshot and the row-expansion skips, as in
             # _get_cross_table_filters_uncached
             if _suppressed and fk in _suppressed and _suppressed[fk] == self._filter_sig_exact(values):
                 continue
             if (type(values) is _ExpansionValues and values.origin == table_name
-                    and self._filter_sig(fc.get(values.anchor_key)) == values.anchor_sig):
+                    and self._expansion_implied(values, fc)):
                 continue
             src, dot, col = fk.partition('.')
+            if src_origins and self._same_transition(values, src, src_origins):
+                continue
             if dot and src != table_name:
                 entry: Optional[tuple] = by_src.get(src)
                 if entry is None:
@@ -5505,9 +8139,10 @@ class DAXContext:
                          src_tbl: dict, sig_part) -> Optional[tuple]:
         """The memo key of one source table's cross filter on table_name
         (see the section comment above), or None: not memoized. The
-        DatePartOnly joins are in it although the relationships' signature
-        implies them, since a USERELATIONSHIP / CROSSFILTER context
-        (with_relationships) takes the signature of its own list."""
+        relationships' signature implies the DatePartOnly joins since every
+        context takes those of its own list, the relationships active or not
+        (issue #250); they stay in the key so that a caller pairing a list
+        with joins of its own cannot share an entry."""
         if sig_part is None or self._rels_sig is None:
             return None
         return (table_name, id(tbl), src_table, id(src_tbl), sig_part, self._rels_sig,
@@ -5992,10 +8627,20 @@ class DAXContext:
         """One filter's part of the filter-set signature: its values
         (_filter_sig_exact; a row transition's value carries them) and its
         tag, as a grouping or an iteration's filter answers ISINSCOPE and
-        ALLSELECTED differently from a plain one of the same values."""
+        ALLSELECTED differently from a plain one of the same values.
+
+        A table filter's tag (_SeRowsValues / _SeRowsSpec) also carries the
+        table and the columns its condition reads: two FILTER table filters
+        that keep the same rows cut a scan at different columns
+        (#344), and keyed by their values alone they shared the
+        aggregate and measure memos, so the first to run answered for both."""
+        t = type(v)
+        if t is _SeRowsValues or t is _SeRowsSpec:
+            return (cls._filter_sig_exact(v),
+                    (t.__name__, v.se_table, tuple(sorted(v.se_cut))))
         s = v.__dict__.get('_sig') if isinstance(v, RowContextValues) else None
         return (s if s is not None else cls._filter_sig_exact(v),
-                type(v).__name__ if type(v) not in (list, dict) else '')
+                t.__name__ if t not in (list, dict) else '')
 
     def _row_root(self) -> 'DAXContext':
         """The context the enclosing row contexts were opened in: the filter
@@ -6136,6 +8781,36 @@ class DAXContext:
                         for v in (r[col_idx] if col_idx < len(r) else None for r in rows)))
         out: bool = hit
         return out
+
+    def _number_kind(self, tbl: dict, col_idx: int):
+        """tbl's column col_idx as a number column: int for an Int64 column
+        (every cell an int or BLANK, one at least an int), float for a Double
+        one (floats and BLANK), else None (text, dates, booleans, a mix, and
+        a Fixed Decimal (Currency) column). A model's Int64 column loads as
+        int cells and its Double column as floats, whole values too (2**53
+        loads as 9007199254740992.0), so the cells tell the type -- except
+        Currency: the decoder loads its values as plain floats too, and only
+        the table's ``currency_columns`` (mark_currency_columns, #241) tell
+        it apart; read as a Double, an empty SELECTCOLUMNS of it turned a
+        UNION's Int64 values into Doubles. TREATAS converts its values to the
+        kind (a Currency column first, _currency_column), and an empty
+        SELECTCOLUMNS hands it on to UNION (#326,
+        #336). Memoized on the model-wide cache, one pass per
+        column."""
+        key = (id(tbl), 'num-kind', col_idx)
+        hit = self._filter_idx_cache.get(key, _MISSING)
+        if hit is _MISSING:
+            rows = tbl['rows']
+            currency = tbl.get('currency_columns')
+            cols = tbl.get('columns') or []
+            if currency and col_idx < len(cols) and cols[col_idx] in currency:
+                hit = None
+            else:
+                types = {type(r[col_idx]) if col_idx < len(r) else type(None) for r in rows}
+                types.discard(type(None))
+                hit = (int if types == {int} else float if types == {float} else None)
+            self._filter_idx_cache[key] = hit
+        return hit
 
     def _value_index_map(self, tbl: dict, col_idx: int) -> dict:
         """``{value-key: frozenset(row indices)}`` for one column, built once.
@@ -6750,6 +9425,174 @@ class DAXContext:
             return rows
         return [rows[i] for i in sorted(keep)]
 
+    def get_row_positions(self, table_name: str) -> Optional[list]:
+        """The indices of the rows get_filtered_rows and get_column_data
+        return, ascending -- their storage positions (issue #243) -- or None
+        for every row. In a row context, the row root's (as those two).
+        Memoized with get_column_data's values, per filter set."""
+        if self._outer_ctx is not None:
+            return self._row_root().get_row_positions(table_name)
+        ck = ('\0pos', table_name)
+        hit = self._column_data_cache.get(ck, _MISSING)
+        if hit is not _MISSING:
+            held: Optional[list] = hit
+            return held
+        tbl = self.tables.get(table_name)
+        if tbl is None:
+            tbl = self.tables.get(self.model_table(table_name))
+            table_name = self.model_table(table_name)
+        out: Optional[list] = None
+        if tbl:
+            keep = self._surviving_indices(table_name, tbl)
+            out = None if keep is None else sorted(keep)
+        self._column_data_cache[ck] = out
+        return out
+
+    def get_column_data_at(self, table_name: str, column_name: str) -> tuple:
+        """``(get_column_data(...), get_row_positions(table_name))``, the
+        filters applied once for both (issue #243): a storage-engine sum
+        needs the values with their positions, and computing them apart ran
+        the filter context's row sets twice for every member of an iteration
+        (SUMX(VALUES(T[k]), [S]))."""
+        if self._outer_ctx is not None:
+            return self._row_root().get_column_data_at(table_name, column_name)
+        cache = self._column_data_cache
+        vals: Optional[list] = cache.get((table_name, column_name))
+        ck = ('\0pos', table_name)
+        pos = cache.get(ck, _MISSING)
+        if vals is not None and pos is not _MISSING:
+            return vals, pos
+        if vals is not None or pos is not _MISSING:
+            # one of them is known: the other as always
+            if vals is None:
+                vals = self.get_column_data(table_name, column_name)
+            return vals, self.get_row_positions(table_name)
+        tbl = self.tables.get(table_name)
+        tname = table_name
+        if tbl is None:
+            tname = self.model_table(table_name)    # another case (#226)
+            tbl = self.tables.get(tname)
+        keep = self._surviving_indices(tname, tbl) if tbl else None
+        pos = None if keep is None else sorted(keep)
+        cache[ck] = pos
+        vals = []
+        if tbl:
+            col_idx = self._find_col_idx(tbl['columns'], column_name)
+            if col_idx >= 0:
+                rows = tbl['rows']
+                vals = ([row[col_idx] for row in rows] if pos is None
+                        else [rows[i][col_idx] for i in pos])
+        cache[(table_name, column_name)] = vals
+        return vals, pos
+
+    def se_scan_columns(self, table_name: str, tbl: dict) -> tuple:
+        """``(where, group)``: the columns of ``tbl`` a storage-engine scan of
+        it reads for this filter context (issue #243, pbix_mcp.dax.se_scan),
+        as two frozensets of names. A filter on one of its columns names that
+        column; a filter on another table that reaches it names its join
+        column toward that table (the last hop of the path). A filter an
+        iteration put there -- a query's grouping, an iterated row
+        (_iteration_tagged) -- is a GROUP BY of the scan, any other a WHERE.
+
+        Power BI Desktop 2.152 (build_b243b.py): CALCULATE(SUM(FactSales[
+        SalesAmount]), DimStore[StoreKey] <> 0) is cut at FactSales[StoreKey]'s
+        runs (af_dimstore 0.215399503707886), while the same sums per channel
+        of SUMMARIZECOLUMNS add as a grouped scan (gb_ch, gb_chname). The
+        filters an ALL() cleared and a row's filter back on its own table
+        are left out, as _cross_groups leaves them. Memoized per filter set
+        with get_column_data's values: each sum of the context asks."""
+        fc = self.filter_context
+        if not fc:
+            return _NO_COLUMNS, _NO_COLUMNS
+        ck = ('\0scan', table_name)
+        hit: Optional[tuple] = self._column_data_cache.get(ck)
+        if hit is not None:
+            return hit
+        out = self._se_scan_columns_uncached(table_name, tbl, fc)
+        self._column_data_cache[ck] = out
+        return out
+
+    def _se_scan_columns_uncached(self, table_name: str, tbl: dict, fc: dict) -> tuple:
+        where: set = set()
+        group: set = set()
+        cols = tbl.get('columns') or []
+        for k, v in fc.items():
+            if k.startswith(_TUPLE_FILTER_PREFIX):
+                if type(v) is _SeRowsSpec and v.se_table == table_name:
+                    # a table filter's rows: what its condition reads
+                    where.update(v.se_cut)
+                    continue
+                if isinstance(v, dict):
+                    for t, c in (tuple(x) for x in v.get('tuple_columns') or []):
+                        name = (self._se_own_column(cols, c) if t == table_name
+                                else self._se_join_column(table_name, tbl, t))
+                        if name is not None:
+                            where.add(name)
+                continue
+            t, dot, c = k.partition('.')
+            if dot and t == table_name:
+                if type(v) is _SeRowsValues and v.se_table == table_name:
+                    # a table filter's rows: what its condition reads
+                    # (_SeRowsValues, #344)
+                    where.update(v.se_cut)
+                    continue
+                name = self._se_own_column(cols, c)
+                if name is not None:
+                    (group if _iteration_tagged(v) else where).add(name)
+        for src, col_filters, _sig in self._cross_groups(table_name):
+            if src == table_name or not self._reaches(src, table_name):
+                continue
+            name = self._se_join_column(table_name, tbl, src)
+            if name is None:
+                continue
+            for _c, v in col_filters:
+                if type(v) is _SeRowsValues and v.se_table == table_name:
+                    # the expanded part of a table filter on this table
+                    where.update(v.se_cut)
+                    continue
+                (group if _iteration_tagged(v) else where).add(name)
+        return frozenset(where), frozenset(group)
+
+    def _se_own_column(self, cols: list, c: str) -> Optional[str]:
+        i = self._find_col_idx(cols, c)
+        return cols[i] if i >= 0 else None
+
+    def _se_join_column(self, table_name: str, tbl: dict, src: str) -> Optional[str]:
+        """The column of table_name through which a filter on table ``src``
+        reaches it, as _source_cross_filters_uncached propagates it: the
+        relationship's column on table_name, the date table's join (or the
+        fallback date column), or the last hop of the path. A fact about the
+        relationship set (structural cache kind 'se-join')."""
+        key = (id(tbl), 'se-join', table_name, src, self._rels_sig, self.date_table, self.date_column)
+        cache = self._filter_idx_cache
+        try:
+            hit = cache.get(key, _MISSING)
+        except TypeError:
+            return None
+        if hit is not _MISSING:
+            held: Optional[str] = hit
+            return held
+        out: Optional[str] = None
+        cols = tbl.get('columns') or []
+        rel = self._rel_dir.get((table_name, src))
+        if rel:
+            out = self._se_own_column(cols, rel['from_col'])
+        elif src == self.date_table:
+            rel = self._rel_index.get((table_name, self.date_table))
+            if rel:
+                out = self._se_own_column(cols, rel['from_col'])
+            if out is None:
+                for dcn in self._DATE_FALLBACK_COLUMNS:
+                    out = self._se_own_column(cols, dcn)
+                    if out is not None:
+                        break
+        else:
+            path = self._find_rel_path(src, table_name)
+            if path:
+                out = self._se_own_column(cols, path[-1][3])
+        cache[key] = out
+        return out
+
     def with_filters(self, extra_filters: dict) -> 'DAXContext':
         """Create a new context with additional filters applied."""
         new_filters = dict(self.filter_context)
@@ -6774,6 +9617,9 @@ class DAXContext:
         ctx._measure_cache = self._measure_cache
         ctx._measure_cache_unsupported = self._measure_cache_unsupported
         ctx._shield_cache = self._shield_cache
+        # what scans together stays known; it applies only while the filters
+        # are the owner's (DAXEngine._se_fused)
+        ctx._se_fuse = self._se_fuse
         ctx._sig_base = (self, self._filter_context,
                          extra_filters if type(extra_filters) is _SigDict else tuple(extra_filters), ())
         if self._has_tuple is False:
@@ -6790,12 +9636,17 @@ class DAXContext:
         tables and the ALL snapshots, so ISINSCOPE, ALLSELECTED and friends
         answered for a different query (issue #83). The measure memo is NOT
         shared: its key does not carry the relationships.
+
+        Every lookup of the new set is taken, its DatePartOnly joins included:
+        leaving those out kept the old set's, so the context joined
+        differently from one the constructor rebuilt from the same list
+        (issue #250).
         """
         ctx = self.with_filters({})
         fresh = DAXContext(self.tables, self.measures, self.date_table,
                            self.date_column, self.filter_context, relationships)
         for attr in ('relationships', '_rel_index', '_rel_dir', '_rel_adj',
-                     '_one_side_of', '_rels_sig', '_expand_adj'):
+                     '_one_side_of', '_rels_sig', '_expand_adj', '_date_part_joins'):
             setattr(ctx, attr, getattr(fresh, attr))
         ctx.date_tables = dict(self.date_tables)
         ctx._measure_cache = {}
@@ -6811,6 +9662,7 @@ class DAXContext:
                          tuple(k for k in self.filter_context if k not in new_filters))
         if self._has_tuple is False:
             ctx._has_tuple = False
+        ctx._se_fuse = self._se_fuse
         ctx._filter_idx_cache = self._filter_idx_cache
         ctx._no_propagate = set(self._no_propagate)
         ctx._no_prop_keys = dict(self._no_prop_keys)
@@ -6821,6 +9673,316 @@ class DAXContext:
         ctx.measure_tables = self.measure_tables
         ctx.model_columns = self.model_columns
         return ctx
+
+
+# The functions that evaluate some of their arguments in a row context of
+# their table argument, and the first such argument (_row_context_possible).
+_ROW_CONTEXT_ARGS = {
+    'SUMX': 1, 'AVERAGEX': 1, 'MINX': 1, 'MAXX': 1, 'COUNTX': 1, 'COUNTAX': 1, 'PRODUCTX': 1,
+    'CONCATENATEX': 1, 'MEDIANX': 1, 'GEOMEANX': 1, 'STDEVX.S': 1, 'STDEVX.P': 1, 'VARX.S': 1,
+    'VARX.P': 1, 'PERCENTILEX.INC': 1, 'PERCENTILEX.EXC': 1, 'RANKX': 1, 'FILTER': 1,
+    'ADDCOLUMNS': 1, 'SELECTCOLUMNS': 1, 'GENERATE': 1, 'GENERATEALL': 1, 'SUMMARIZE': 1,
+    'TOPN': 2, 'FIRSTNONBLANK': 1, 'LASTNONBLANK': 1, 'FIRSTNONBLANKVALUE': 1, 'LASTNONBLANKVALUE': 1,
+}
+
+
+def _row_context_possible(frames: list) -> bool:
+    """Might a row context be in force inside the calls ``frames``
+    (outermost first, each [name, argument index])? DAXEngine._static_refusal
+    refuses a RELATED where none can be (#284; build_b256b.py):
+    IF(FALSE(), SUMX(F, CALCULATE(RELATED(Cal[Bit]), USERELATIONSHIP(F[Ship],
+    Cal[Date]))), 1) is "The column 'Cal[Bit]' either doesn't exist or
+    doesn't have a relationship to any table available in the current
+    context." (rl_iffalse), although the branch is never taken -- a measure
+    starts with no row context, and CALCULATE's expression has none either
+    (the transition consumes the row; its filter arguments keep the outer
+    one). A measure merely REFERENCING such a measure in a branch not taken
+    is fine: IF(FALSE(), [RelBitUR], 1) is 1 (rl_iffalse_meas), so the check
+    is per measure expression.
+
+    Conservative: no row context only when every call around is one whose
+    row context is known -- CALCULATE / CALCULATETABLE, the iterators of
+    _ROW_CONTEXT_ARGS, and the pure scalar functions
+    (DAXEngine._SHIELD_PURE_FNS). Any other call might bring one."""
+    row = False
+    pure = DAXEngine._SHIELD_PURE_FNS
+    for name, argi in frames:
+        if name is None:
+            continue
+        if name == 'CALCULATE' or name == 'CALCULATETABLE':
+            if argi == 0:
+                row = False
+            continue
+        first = _ROW_CONTEXT_ARGS.get(name)
+        if first is not None:
+            if argi >= first:
+                row = True
+            continue
+        if name not in pure:
+            return True
+    return row
+
+
+# ---- the checks Desktop makes before evaluating a measure -------------------
+# Power BI Desktop 2.152 refuses a measure whose expression holds one of these
+# before evaluating any of it: IF(FALSE(), <it>, 1) fails too, and IFERROR /
+# ISERROR around it in the same expression do not catch it (build_b256b.py
+# rl_iffalse; build_b256c.py c_iffalse_*, c_iferr_*, b_iffalse, b_iferr,
+# c_iffalse_noactive). Through a REFERENCE to such a measure IFERROR catches
+# it: IFERROR([RelBitUR], -1) is -1 (c_iferr_related_meas), and so for each of
+# these checks (build_b256d.py a_ref_col, a_ref_conflict, a_ref_lfr,
+# a_ref_two_cf, a_ref_values_rel: -1). See DAXEngine._static_refusal.
+#
+# The iterators whose argument 1 is evaluated in a row context of their table
+# argument 0 (ADDCOLUMNS / SELECTCOLUMNS: every argument after the table; the
+# name strings hold no column), and TOPN, whose table is argument 1 -- the
+# shapes the static checks read a row context from (_static_row_kind).
+_STATIC_ROW_ARG1 = frozenset({
+    'SUMX', 'AVERAGEX', 'MINX', 'MAXX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'MEDIANX', 'GEOMEANX',
+    'STDEVX.S', 'STDEVX.P', 'VARX.S', 'VARX.P', 'CONCATENATEX', 'FILTER', 'RANKX',
+    'PERCENTILEX.INC', 'PERCENTILEX.EXC'})
+_STATIC_ROW_ARGS_ALL = frozenset({'ADDCOLUMNS', 'SELECTCOLUMNS'})
+# The frames whose arguments _static_sites keeps.
+_STATIC_KEEP_ARGS = _STATIC_ROW_ARG1 | _STATIC_ROW_ARGS_ALL | {'TOPN', 'CALCULATE', 'CALCULATETABLE'}
+_SINGLE_VALUE_MSG = ("A single value for column '{c}' in table '{t}' cannot be determined. This can "
+                     "happen when a measure formula refers to a column that contains many values "
+                     "without specifying an aggregation such as min, max, count, or sum to get a "
+                     "single result.")
+_RELATED_NO_REL_MSG = ("The column '{ref}' either doesn't exist or doesn't have a relationship to any "
+                       "table available in the current context.")
+
+
+def _bind_error(message: str) -> _DAXEvaluationError:
+    """An error Desktop reports before evaluating the measure whose
+    expression holds it: IFERROR / ISERROR in that expression cannot catch it
+    (``_dax_uncatchable``), around a reference to the measure they can
+    (``_dax_ref_catchable``: DAXEngine.evaluate_measure clears the first for
+    it when it leaves a referenced measure; build_b256c.py
+    c_iferr_related_meas)."""
+    exc = _DAXEvaluationError(message)
+    exc._dax_uncatchable = True  # type: ignore[attr-defined]
+    exc._dax_ref_catchable = True  # type: ignore[attr-defined]
+    return exc
+
+
+_VAR_NAME_DECL_RE = re.compile(r'\bVAR\s+([A-Za-z_][\w.]*)\s*=', re.IGNORECASE)
+
+
+@lru_cache(maxsize=4096)
+def _declared_var_names(expr: str) -> frozenset:
+    """The names (lower case) the VARs of ``expr`` declare, outside its
+    string literals; empty when it has no VAR."""
+    if not _VAR_KW_RE.search(expr):
+        return frozenset()
+    text = _STRING_LIT_RE.sub('""', expr)
+    return frozenset(m.group(1).lower() for m in _VAR_NAME_DECL_RE.finditer(text))
+
+
+@lru_cache(maxsize=4096)
+def _static_sites(expr: str) -> tuple:
+    """What DAXEngine._static_refusal checks in a measure's expression, read
+    from its text once: ``(sites, frame_args, calcs)``.
+
+    sites       ``(position, kind, table, column, frames)``: kind 'related'
+                for a RELATED call (table and column as written in its
+                argument), 'col' for a table-qualified column reference
+                ``T[c]`` / ``'T'[c]``, 'bare' for an unqualified ``[name]``
+                (table None: a measure or a column); ``frames`` the calls around it,
+                outermost first, as ``(NAME or None for ( / {, argument
+                index, frame id)``.
+    frame_args  ``{frame id: argument texts}`` of the calls in
+                _STATIC_KEEP_ARGS.
+    calcs       ``(position, frame id)`` of every CALCULATE / CALCULATETABLE."""
+    s, n, i = expr, len(expr), 0
+    frames: list = []          # [name, argument index, argument start, [argument texts], id]
+    sites: list = []
+    frame_args: dict = {}
+    calcs: list = []
+    next_id = 0
+
+    def bracket_end(k: int) -> int:
+        j = s.find(']', k + 1)
+        while j != -1 and j + 1 < n and s[j + 1] == ']':
+            j = s.find(']', j + 2)
+        return n if j == -1 else j
+
+    def snapshot() -> tuple:
+        return tuple((f[0], f[1], f[4]) for f in frames)
+
+    def col_site(pos: int, table: str, k: int) -> int:
+        e = bracket_end(k)
+        sites.append((pos, 'col', table, s[k + 1:e].replace(']]', ']').strip(), snapshot()))
+        return e + 1
+
+    while i < n:
+        ch = s[i]
+        if ch == '"':
+            j = i + 1
+            while j < n:
+                if s[j] == '"':
+                    if j + 1 < n and s[j + 1] == '"':
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if s[j] == "'":
+                    if j + 1 < n and s[j + 1] == "'":
+                        j += 2
+                        continue
+                    break
+                j += 1
+            name = s[i + 1:j].replace("''", "'")
+            k = j + 1
+            while k < n and s[k] in ' \t\r\n':
+                k += 1
+            if k < n and s[k] == '[':
+                i = col_site(i, name, k)
+            else:
+                i = j + 1
+            continue
+        if ch == '[':
+            e = bracket_end(i)
+            sites.append((i, 'bare', None, s[i + 1:e].replace(']]', ']').strip(), snapshot()))
+            i = e + 1
+            continue
+        if (ch == '/' or ch == '-') and s.startswith(ch * 2, i):
+            j = s.find('\n', i)
+            i = n if j == -1 else j + 1
+            continue
+        if ch == '/' and s.startswith('/*', i):
+            j = s.find('*/', i + 2)
+            i = n if j == -1 else j + 2
+            continue
+        if ch.isalpha() or ch == '_':
+            j = i + 1
+            while j < n and (s[j].isalnum() or s[j] in '._'):
+                j += 1
+            k = j
+            while k < n and s[k] in ' \t\r\n':
+                k += 1
+            if k < n and s[k] == '(':
+                name = s[i:j].upper()
+                if name == 'RELATED':
+                    m = re.match(r"\s*('(?:[^']|'')+'|[^\[\],()]+?)\s*\[([^\]]+)\]", s[k + 1:])
+                    if m:
+                        t = m.group(1).strip()
+                        if t.startswith("'"):
+                            t = t[1:-1].replace("''", "'")
+                        sites.append((i, 'related', t, m.group(2), snapshot()))
+                if name == 'CALCULATE' or name == 'CALCULATETABLE':
+                    calcs.append((i, next_id))
+                frames.append([name, 0, k + 1, [], next_id])
+                next_id += 1
+                i = k + 1
+                continue
+            if k < n and s[k] == '[' and not s[i].isdigit():
+                i = col_site(i, s[i:j], k)
+                continue
+            i = j
+            continue
+        if ch == '(' or ch == '{':
+            frames.append([None, 0, i + 1, [], next_id])
+            next_id += 1
+        elif ch == ')' or ch == '}':
+            if frames:
+                f = frames.pop()
+                f[3].append(s[f[2]:i])
+                if f[0] in _STATIC_KEEP_ARGS:
+                    frame_args[f[4]] = tuple(a.strip() for a in f[3])
+        elif ch == ',' and frames:
+            f = frames[-1]
+            f[3].append(s[f[2]:i])
+            f[1] += 1
+            f[2] = i + 1
+        i += 1
+    return tuple(sites), frame_args, tuple(calcs)
+
+
+def _whole_call(text: str) -> Optional[tuple]:
+    """``(FUNCTION, argument text)`` when ``text`` is one call from its name
+    to the parenthesis closing it, else None."""
+    m = re.match(r"^([A-Za-z_][\w.]*)\s*\(", text)
+    if not m or not text.endswith(')'):
+        return None
+    depth, i, n = 0, m.end() - 1, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"' or ch == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == ch:
+                    if j + 1 < n and text[j + 1] == ch:
+                        j += 2
+                        continue
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if ch == '[':
+            j = text.find(']', i + 1)
+            while j != -1 and j + 1 < n and text[j + 1] == ']':
+                j = text.find(']', j + 2)
+            if j == -1:
+                return None
+            i = j + 1
+            continue
+        if ch == '(':
+            depth += 1
+        elif ch == ')':
+            depth -= 1
+            if depth == 0:
+                return (m.group(1).upper(), text[m.end():i]) if i == n - 1 else None
+        i += 1
+    return None
+
+
+_REL_MODIFIER_RE = re.compile(r"(?is)^\s*(?:USERELATIONSHIP|CROSSFILTER)\s*\(")
+
+
+def _is_rel_modifier(arg: str) -> bool:
+    """Is a CALCULATE argument a USERELATIONSHIP / CROSSFILTER call?"""
+    return _REL_MODIFIER_RE.match(arg) is not None
+
+
+def _rel_modifiers_in_order(mods: list) -> list:
+    """One CALCULATE's modifiers in the order _fn_calculate applies them: in
+    the places the relationship modifiers are written, its CROSSFILTERs
+    before its USERELATIONSHIPs, the rest as written. A CROSSFILTER of the
+    call sets the relationship's direction for the whole call, so it takes
+    back an enclosing CALCULATE's CROSSFILTER(.., None) before a
+    USERELATIONSHIP of the call is judged against it
+    (#293; Power BI Desktop 2.152, build_b256c.py
+    n_none_ur_both: CALCULATE(CALCULATE(SUM(F[v]), USERELATIONSHIP(F[Ship],
+    Cal[Date]), CROSSFILTER(F[Ship], Cal[Date], Both)), CROSSFILTER(F[Ship],
+    Cal[Date], None), Cal[Date] = DATE(2024, 1, 2)) is 24, F[Ship]'s rows)."""
+    pos = [i for i, a in enumerate(mods) if _is_rel_modifier(a)]
+    if len(pos) < 2:
+        return list(mods)
+    rel = [mods[i] for i in pos]
+    xf = [a for a in rel if a.lstrip()[:11].upper() == 'CROSSFILTER']
+    rel = xf + [a for a in rel if a.lstrip()[:11].upper() != 'CROSSFILTER']
+    out = list(mods)
+    for i, a in zip(pos, rel):
+        out[i] = a
+    return out
+
+
+# The marks the relationship modifiers leave on a derived relationship list
+# (DAXEngine._UR_ON / _UR_OFF / _XF_NONE / _XF_WAS / _XF_UR), which a
+# relationship signature does not hold.
+_REL_MARKS = ('__ur_on', '__ur_off', '__xf_none', '__xf_was', '__xf_ur')
+
+
+def _rels_mark_sig(rels: list) -> tuple:
+    """The modifier marks on ``rels`` (_REL_MARKS), as a hashable value; ()
+    for a model's own list."""
+    return tuple((i, tuple(k for k in _REL_MARKS if r.get(k)))
+                 for i, r in enumerate(rels or ()) if any(r.get(k) for k in _REL_MARKS))
 
 
 class DAXEngine:
@@ -6879,6 +10041,21 @@ class DAXEngine:
         # Measure errors degraded to BLANK so far: IFERROR / ISERROR compare it
         # before and after their argument (issue #135).
         self._nested_errors = 0
+        # For the next _fn_filter call only: CALCULATE's collector of its
+        # FILTER argument's row errors, (list, argument) (#265),
+        # and an enclosing FILTER's column predicates to try first (#249).
+        self._filter_err_sink: tuple | None = None
+        self._filter_pre: tuple | None = None
+        # True while CALCULATE judges one argument's row errors against the
+        # others (_surviving_tuples): theirs are not judged there.
+        self._filter_errs_quiet = False
+        # (operands, model memo, _logic_deps' answer) of the last logical
+        # operator asked about: an iteration asks for the same one per row.
+        self._last_logic_deps: tuple = (None, None, None)
+        self._last_logic_split: tuple = (None, None, None)
+        # _logic_hoisted's filter question for the last operator asked:
+        # (parts, VAR scope, the context the iteration was opened in, answer)
+        self._last_logic_filtered: tuple = (None, None, None, False)
         # (id(rows), table, column) -> (rows, distinct values): an iteration's
         # shadow per column, for ALLSELECTED and the measure memo (#118).
         self._shadow_cache: dict = {}
@@ -6894,11 +10071,23 @@ class DAXEngine:
         self._group_keys: set = set()
         # The caller's true slicer state, when grouped evaluation passes it.
         self._selected_base: dict | None = None
+        # The outermost measure's context: the relationships the checks made
+        # before a measure is evaluated read (_static_refusal).
+        self._static_base: Optional[DAXContext] = None
+        self._static_marks: Optional[tuple] = None
+        # the VAR names of the expression being checked (lower case), which
+        # name no model table there (_static_refusal_uncached)
+        self._static_shadow = frozenset()
         # _selection_token's value for the current outermost measure.
         self._sel_token: tuple | None = None
         # Home tables of the measures currently on the evaluation stack; the
         # innermost one disambiguates a bare [Column] inside that measure.
         self._home_tables: list = []
+        # (table, record) while a SUMX / AVERAGEX that adds as Desktop's
+        # storage engine does evaluates its table (_se_probe_rows, #243)
+        self._se_probe: Optional[tuple] = None
+        # how many IF branches the evaluation is inside (_fe_fold_order)
+        self._if_branch = 0
         self._func_map = {
             # --- Aggregation ---
             'SUM': self._fn_sum,
@@ -7335,7 +10524,8 @@ class DAXEngine:
     def evaluate_measure(self, measure_name: str, ctx: DAXContext,
                          propagate: bool = False) -> Any:
         """Evaluate a named measure in the given context. An error inside a
-        nested measure degrades it to BLANK, unless ``propagate``."""
+        nested measure is its caller's error (#266); the
+        outermost measure records it in eval_errors and returns BLANK."""
         # DAX identifiers are CASE-INSENSITIVE. Canonicalize to the model's own
         # spelling before anything else, so the cache key, the circular-reference
         # stack and the definition lookup all agree.
@@ -7354,6 +10544,17 @@ class DAXEngine:
                 if _name.lower() == lowered:
                     measure_name = _name
                     break
+        # The scope of aggregations scanned together (#339,
+        # _se_scope): the outermost measure opens its own, and so does a
+        # reference from a row context (a filter context of its own) and one
+        # evaluated where the scope in force does not hold (another filter
+        # context, _se_holds). Any other reference inherits it (_se_inherit).
+        _se_open = (ctx._outer_ctx is not None or self._eval_depth == 0
+                    or not self._se_holds(ctx))
+        _se_in: Optional[tuple] = None
+        # a transition of an ADDCOLUMNS row: scanned with the row's other
+        # columns (_fn_addcolumns, #339)
+        _se_row = ctx._se_row_scope if ctx._outer_ctx is not None else None
         if ctx._outer_ctx is not None:
             # The reference transitions the iterated rows: each filters its
             # expanded table (issue #115), and the memo key sees that.
@@ -7438,6 +10639,25 @@ class DAXEngine:
             # selection, which a memo shared across queries must key (#186).
             cache_key = ((measure_name, fc_key) + ((_cg_sig,) if _cg_sig else ())
                          + ((self._selection_token(ctx),) if _sel_on else ()))
+            if not _se_open:
+                # Under another measure, in its filter context, this one's
+                # sums are scanned with that measure's (#339):
+                # its value differs from its own where the scan reads other
+                # columns, and the key says which (_se_inherit).
+                _se_in = self._se_inherit(measure_name, ctx, bool(_groups))
+                if _se_in is not None and _se_in[1]:
+                    cache_key = cache_key + (_se_in[1],)
+            if _se_row:
+                # the row's scope decides what its sums are cut at
+                cache_key = cache_key + (('se-row', tuple(sorted(
+                    (t, tuple(sorted(c))) for t, c in _se_row.items()))),)
+            if self._if_branch and _FE_ORDER_IN_IF and self._reads_fe_order(measure_name, ctx):
+                # Inside an IF branch, an iteration this measure reaches adds
+                # in another order (_fe_fold_order, #345): the
+                # same filters can give two values, so the branch is part of
+                # the key. Without it the first reference fixed the order of
+                # every later one, in the branch or not.
+                cache_key = cache_key + (_IF_BRANCH_KEY,)
         except Exception:
             cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
@@ -7503,6 +10723,8 @@ class DAXEngine:
             self._clearing_cache = None
             self._selected_base = getattr(ctx, 'selected_filters', None)
             self._sel_token = None
+            self._static_base = ctx
+            self._static_marks = _rels_mark_sig(ctx.relationships)
         if self._eval_depth == 1:
             self._deadline = time.monotonic() + self._max_eval_seconds
         # A measure invocation IS the row->filter context transition (implicit
@@ -7528,7 +10750,43 @@ class DAXEngine:
             _cg_prev = self._cg_applied.get(_cg[0].key)
             self._cg_applied[_cg[0].key] = _cg[2]
             self._cg_frames.append(measure_name)
+        _se_prev = ctx._se_fuse
+        if _se_open:
+            # its own scope of aggregations scanned together, read with its
+            # home table (_se_scope, #339)
+            ctx._se_fuse = (ctx, self._se_scope(expr, ctx, ctx.measure_tables.get(measure_name)))
+            if _se_row:
+                ctx._se_fuse = (ctx, self._se_merge_scopes(ctx._se_fuse[1], _se_row))
+        elif _se_in is not None:
+            ctx._se_fuse = _se_in[0]
         try:
+            _bind = self._static_refusal(expr, ctx)
+            if _bind is not None:
+                # Desktop refuses the measure before evaluating any of it
+                # (#284, _static_refusal)
+                raise _bind
+            _ord = _orderby_definition_error(expr)
+            if _ord is None and _has_partitionby(expr):
+                _ord = self._partitionby_definition_error(expr, ctx)
+            if _ord is not None:
+                # wherever the ORDERBY / PARTITIONBY is, before any of the
+                # measure runs; a reference to the measure may catch it
+                # (#259, #262)
+                raise _WindowError(_ord, True)
+            _ord = _order_definition_error(expr)
+            if _ord is not None:
+                # TOPN's, TOPNSKIP's, SAMPLE's and CONCATENATEX's likewise,
+                # caught by no IFERROR (#330)
+                raise _uncatchable(_DAXEvaluationError(_ord))
+            _refused = self._query_refusal(measure_name, ctx) if self._eval_depth == 1 else None
+            if _refused is not None:
+                # before anything runs, wherever the call is
+                # (#268, #270,
+                # #271; _query_refusal)
+                from pbix_mcp.errors import DAXEvaluationError
+                _refusal = DAXEvaluationError(_refused)
+                setattr(_refusal, "_dax_uncatchable", True)
+                raise _refusal
             result = _scalarize(self._eval_expr(expr.strip(), ctx))
             if cache_key:
                 ctx._measure_cache[cache_key] = result
@@ -7553,21 +10811,63 @@ class DAXEngine:
                 # error is the item's error (Desktop: Add100 over Double of
                 # "x" fails; as a BLANK it read 100).
                 raise
+            elif self._eval_depth > 1 and isinstance(
+                    _werr := (_exc if isinstance(_exc, _WindowError)
+                              else getattr(_exc, 'original', None)), _WindowError):
+                # A window function's refusal fails the query that references
+                # its measure, as Power BI Desktop 2.152 does (issue #247:
+                # build_b253.py o_m2m, rn_mb_reg, rn_t3_c, z_empty_ctx, ...;
+                # b247's w_partition_*): as a BLANK, CONCATENATEX(MB,
+                # [h_o_m2m]) read ',,' and [h] + 0 read 0. IFERROR around the
+                # reference catches the static refusals (_WindowError,
+                # z_iferror -1), not ROWNUMBER's tie (z_rn_iferror fails). A
+                # variable's wrapper is dropped: the reference is no use of
+                # the variable.
+                _msg = str(_werr)
+                self.eval_errors.setdefault(measure_name, _msg)
+                _nested.setdefault(measure_name, _msg)
+                if _werr._win_ref_catchable:
+                    _werr._dax_uncatchable = False
+                raise _werr
             else:
                 # Record WHY before degrading, so the tool layer can report
                 # status "error" instead of a blank indistinguishable from a
                 # legitimate BLANK (ledger issues-7).
                 _msg = str(_exc)
                 self.eval_errors.setdefault(measure_name, _msg)
-                self._nested_errors += 1
                 # and for the measures whose evaluation this happened in, to
                 # be kept with their memo entries (issue #233)
                 _nested.setdefault(measure_name, _msg)
+                if self._eval_depth > 1:
+                    # A referenced measure's error is its caller's error
+                    # (#266). Power BI Desktop 2.152 fails the
+                    # measure that references a failing one: build_b134.py's
+                    # VAR x = [Bad] RETURN x is "Calculation error in measure
+                    # 'T'[Bad]: Cannot convert value 'x' of type Text to type
+                    # Number", and B255's SUMX(TM, [m_and]) (x18),
+                    # COUNTROWS(FILTER(TM, TM[d] = 0 || [m_mod] = 1)) (f33)
+                    # and SUMX(TM, IF(TM[d] <> 0 && [m_mod] = 1, 1)) (i12) are
+                    # "Calculation error in measure 'TM'[m_mod]: Division by
+                    # zero ... 'MOD'". Degraded to BLANK, [Bad] + 1 was 1 with
+                    # status ok. IFERROR / ISERROR around the reference still
+                    # catch it (IFERROR([Bad], 13) is 13 on Desktop), through
+                    # _eval_catching's exception path, which also takes the
+                    # records above back (_consume_caught).
+                    if getattr(_exc, '_dax_ref_catchable', False):
+                        # an error Desktop reports before evaluating the
+                        # measure (_bind_error): through the reference
+                        # IFERROR catches it (build_b256c.py
+                        # c_iferr_related_meas: IFERROR([RelBitUR], -1) is
+                        # -1; #284)
+                        _exc._dax_uncatchable = False  # type: ignore[attr-defined]
+                    raise
+                self._nested_errors += 1
             # Graceful degradation
             return None
         finally:
             ctx._outer_ctx = _prev_outer
             ctx._current_row = _prev_row
+            ctx._se_fuse = _se_prev
             self._home_tables.pop()
             self._measure_path.pop()
             if _nested and self._measure_path:
@@ -7585,6 +10885,9 @@ class DAXEngine:
             self._eval_depth -= 1
             if self._eval_depth == 0:
                 self._deadline = None
+                self._static_base = self._static_marks = None
+                # no context outlives the query in the engine (#249)
+                self._last_logic_filtered = (None, None, None, False)
                 # the row-expansion slots of the iterations it ran in the
                 # caller's context, which may outlive it (#229)
                 ctx.__dict__.pop('_rx_slots', None)
@@ -7841,6 +11144,473 @@ class DAXEngine:
         cache[key] = found
         return found
 
+    _FE_ORDER_RE = re.compile(r"(?i)\b(?:SUMX|AVERAGEX)\s*\(")
+
+    def _reads_fe_order(self, name: str, ctx: DAXContext) -> bool:
+        """Can evaluating measure ``name`` reach a SUMX or AVERAGEX, whose
+        formula-engine order an enclosing IF branch changes (_fe_fold_order,
+        #345)? Through its own text, a measure it references or
+        any calculation item; conservative as _reads_shadow. Memoized per
+        model (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('reads-fe-order', name)
+        hit = cache.get(key)
+        if hit is not None:
+            return bool(hit)
+        lower = cache.get(('measure-names',))
+        if lower is None:
+            lower = cache[('measure-names',)] = {m.lower(): m for m in ctx.measures}
+        groups = _calc_registry(ctx.measures)[0]
+        todo = [str(item.get('expression') or '') for g in groups for item in g.items]
+        todo.append(str(ctx.measures.get(name) or ''))
+        seen = {name}
+        found = False
+        while todo:
+            expr = todo.pop()
+            if self._FE_ORDER_RE.search(expr):
+                found = True
+                break
+            for ref in self._BRACKET_REF_RE.findall(expr):
+                m = lower.get(ref.replace(']]', ']').strip().lower())
+                if m is not None and m not in seen:
+                    seen.add(m)
+                    todo.append(str(ctx.measures.get(m) or ''))
+        cache[key] = found
+        return found
+
+    def _query_refusal(self, name: str, ctx: DAXContext) -> Optional[str]:
+        """The message of the refusal Power BI Desktop 2.152 makes before
+        running measure ``name``, reached or not, when it or a measure it
+        references (transitively) holds one of these -- else None:
+
+        * ERROR with an argument that is not a text literal
+          (#268; build_b255b.py, "Function 'ERROR' expects
+          argument number 1 to be a constant" in its Norwegian):
+          IF([m_zero] = 1, ERROR(FORMAT([m_zero], "0")), 0) with the branch
+          never taken (e16; 0.9.147 0), SUMX(TM, IF(TM[d] = 99,
+          ERROR(FORMAT(TM[n], "0")))) (e17; 0.9.147 BLANK), ERROR("a" & "b")
+          (e18) and a branch taken (e20); B255 e13; a number, IF([m_zero] =
+          1, ERROR(5), 0) (build_b255c.py y13);
+        * DIVIDE with an alternate result that is no constant
+          (#270, _divide_alternate_refused; build_b255d.py
+          y19: IF([m_zero] = 1, DIVIDE(1, 1, MOD(1, [m_zero])), 0));
+        * a CALCULATE boolean filter Desktop refuses (#271,
+          _calculate_filter_refused; build_b255d.py k38: IF([m_zero] = 1,
+          CALCULATE(COUNTROWS(TM), TM[d] < [m_cnt]), 0)).
+
+        The refusal names no measure, and IFERROR does not catch it.
+        Memoized per model (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('query-refusal', name)
+        hit = cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            out: Optional[str] = hit
+            return out
+        lower = cache.get(('measure-names',))
+        if lower is None:
+            lower = cache[('measure-names',)] = {m.lower(): m for m in ctx.measures}
+        seen = {name}
+        todo = [str(ctx.measures.get(name) or '')]
+        found: Optional[str] = None
+        while todo and found is None:
+            expr = todo.pop()
+            if _calls_error_with_nonconstant(expr):
+                found = _ERROR_CONST_MSG
+            elif _divide_alternate_refused(expr):
+                found = _DIVIDE_ALT_MSG
+            else:
+                found = self._calculate_filter_refused(expr, ctx)
+            for ref in self._BRACKET_REF_RE.findall(expr):
+                m = lower.get(ref.replace(']]', ']').strip().lower())
+                if m is not None and m not in seen:
+                    seen.add(m)
+                    todo.append(str(ctx.measures.get(m) or ''))
+        cache[key] = found
+        return found
+
+    def _calculate_filter_refused(self, expr: str, ctx: DAXContext) -> Optional[str]:
+        """The refusal of the first CALCULATE / CALCULATETABLE boolean filter
+        argument in ``expr`` that reads a measure, or calls CALCULATE,
+        outside an aggregate (_filter_disallowed_call, the measure test of
+        _boolean_filter_table_checked; #271), else None: the
+        refusals Desktop makes wherever the CALCULATE is."""
+        if 'CALCULATE' not in expr.upper():
+            return None
+        src = _strip_line_comments(expr)
+        for m in _DEP_TOKEN_RE.finditer(src):
+            t = m.group(0)
+            if not (t.endswith('(') and t[:-1].strip().upper() in ('CALCULATE', 'CALCULATETABLE')):
+                continue
+            args = DAXEngine._extract_args_scan(src[m.end() - 1:])
+            if args is None:
+                continue
+            for arg in DAXEngine._split_toplevel_scan(args[1:-1], ',')[1:]:
+                _kf, inner = self._peel_call(arg.strip(), ('KEEPFILTERS',))
+                inner = self._strip_parens(inner)
+                if not inner or not self._is_boolean_filter(inner, ctx):
+                    continue
+                called = self._filter_disallowed_call(inner, ctx)
+                if called:
+                    return _PLACEHOLDER_FILTER_MSG.replace('PLACEHOLDER', called)
+                row_qual, row_bare, _iq, _ib, _idents, _trans = _local_deps(inner)
+                if (any(self._measure_exists(n, ctx) for n in row_bare)
+                        or any(self._model_col(t2, c, ctx) is None and self._measure_exists(c, ctx)
+                               for t2, c in row_qual)):
+                    return _PLACEHOLDER_FILTER_MSG
+        return None
+
+    # ---- the checks made before a measure is evaluated ----------------------
+    def _static_refusal(self, expr: str, ctx: DAXContext) -> Optional[_DAXEvaluationError]:
+        """The error Power BI Desktop 2.152 reports for the measure expression
+        ``expr`` before evaluating any of it, or None (see _static_sites).
+        Desktop fails such a measure although the offending part is never
+        reached -- IF(FALSE(), <it>, 1) -- and IFERROR / ISERROR in the same
+        expression do not catch it (build_b256b.py rl_iffalse; build_b256c.py
+        c_iffalse_lfr, c_iffalse_conflict, c_iffalse_two_cf, c_iferr_conflict,
+        c_iferr_two_cf, c_iffalse_noactive, b_iffalse, b_iferr). Around a
+        reference to the measure they do (c_iferr_related_meas -1): the error
+        is _bind_error's, which evaluate_measure makes catchable when it
+        leaves a referenced measure. The checks:
+
+        - RELATED where no row context can be (#284,
+          _row_context_possible); where every row context is a table of
+          columns (#298) -- SUMX(VALUES(F[Order]), RELATED(
+          Cal[Bit])) and SUMX(SUMMARIZE(F, F[Order]), RELATED(Cal[Bit])) fail
+          (r_values_order, r_summarize_order); and where no active
+          relationship joins the row's table to the column's under the
+          relationship modifiers of the CALCULATEs around it
+          (#284): IF(FALSE(), CALCULATE(SUMX(F, RELATED(
+          Cal[Bit])), CROSSFILTER(F[Order], Cal[Date], None)), 1)
+          (c_iffalse_noactive);
+        - relationship modifiers of one CALCULATE that contradict each other
+          (#283, #292) and CROSSFILTER's
+          OneWay_LeftFiltersRight / OneWay_RightFiltersLeft that would let
+          only the many side filter (#290);
+        - a column read where no row context holds it (#287):
+          SUMX(FILTER(F, F[Id] = 3), CALCULATE(F[v])) is "A single value for
+          column 'v' in table 'F' cannot be determined. ..." with one row
+          (b_one_row), and CONCATENATEX(ALL(S[Reg]), S[Cat], ",") is too
+          (build_b253c.py f_col_no_row); an unqualified [name] that is no
+          measure, where no row holds a column of that name
+          (build_b256d.py b_bare_col, _static_bare_check).
+
+        Conservative: a site counts only where every call around it is one
+        whose row context the check knows (CALCULATE / CALCULATETABLE, the
+        iterators of _STATIC_ROW_ARG1 / _STATIC_ROW_ARGS_ALL and TOPN, the
+        pure scalar functions), every row context's table is one it can read
+        (_static_row_kind) and every name is the model's. Any other shape is
+        left to the evaluation.
+
+        The relationships are the outermost measure's (``_static_base``):
+        Desktop checks a measure against the model and its own modifiers,
+        not against those of a caller. The verdict is kept in the model-wide
+        cache (kind 'static-refusal'), keyed by the expression and by those
+        relationships (signature and modifier marks)."""
+        base = self._static_base if (self._eval_depth > 1 and self._static_base is not None) else ctx
+        sig = base._rels_sig
+        key = None
+        if sig is not None:
+            marks = self._static_marks
+            if base is not self._static_base or marks is None:
+                marks = _rels_mark_sig(base.relationships)
+            key = ('static-refusal', expr, sig, marks)
+            hit = ctx._shield_cache.get(key, _MISSING)
+            if hit is not _MISSING:
+                return None if hit is None else _bind_error(hit)
+        msg = self._static_refusal_uncached(expr, base)
+        if key is not None:
+            ctx._shield_cache[key] = msg
+        return None if msg is None else _bind_error(msg)
+
+    def _static_refusal_uncached(self, expr: str, ctx: DAXContext) -> Optional[str]:
+        """_static_refusal's message, in the order the sites are written."""
+        sites, frame_args, calcs = _static_sites(expr)
+        if not sites and not calcs:
+            return None
+        events = sorted([(s[0], 1, s) for s in sites] + [(p, 0, fid) for p, fid in calcs],
+                        key=lambda e: (e[0], e[1]))
+        # A VAR of the expression named as a model table is the variable, not
+        # the table (Power BI Desktop 2.152, build_b248g.py p_se_tables: VAR
+        # t = FILTER(T3, T3[id] > 0) RETURN SUMX(t, T3[v] * 0.5) is C0.001 in
+        # a model with a table T). The check read SUMX(t, ..) as rows of T and
+        # refused T3[v] (#304): such a name is left to the
+        # evaluation.
+        prev = self._static_shadow
+        self._static_shadow = _declared_var_names(expr)
+        try:
+            for _pos, what, item in events:
+                if what == 0:
+                    msg = self._static_calc_check(frame_args.get(item), ctx)
+                elif item[1] == 'related':
+                    msg = self._static_related_check(item, frame_args, ctx)
+                elif item[1] == 'bare':
+                    msg = self._static_bare_check(item, frame_args, ctx)
+                else:
+                    msg = self._static_col_check(item, frame_args, ctx)
+                if msg is not None:
+                    return msg
+        finally:
+            self._static_shadow = prev
+        return None
+
+    @staticmethod
+    def _static_table_named(name: str, ctx: DAXContext) -> Optional[str]:
+        """The model table called ``name`` (in any case), or None."""
+        t = name.strip()
+        if t in ctx.tables:
+            return t
+        low = t.lower()
+        return next((m for m in ctx.tables if m.lower() == low), None)
+
+    @classmethod
+    def _static_table(cls, text: str, ctx: DAXContext) -> Optional[str]:
+        """The model table the expression ``text`` names on its own (``T`` or
+        ``'T'``), or None."""
+        t = text.strip()
+        if len(t) >= 2 and t[0] == "'" and t[-1] == "'":
+            return cls._static_table_named(t[1:-1].replace("''", "'"), ctx)
+        if not re.match(r"^[A-Za-z_]\w*$", t):
+            return None
+        return cls._static_table_named(t, ctx)
+
+    @classmethod
+    def _static_column(cls, ctx: DAXContext, table: str, column: str) -> Optional[tuple]:
+        """``(table, column)`` as the model spells them when ``table[column]``
+        (the table's name unquoted) is a column of a model table, in any
+        case, else None -- a measure written as T[M], a variable, a table
+        the context holds no data for."""
+        t = cls._static_table_named(table, ctx)
+        if t is None:
+            return None
+        want = column.strip().lower()
+        for c in ctx.tables[t].get('columns') or ():
+            if isinstance(c, str) and c.strip().lower() == want:
+                return t, c
+        return None
+
+    def _static_row_kind(self, text: str, ctx: DAXContext, plain: bool = False) -> Optional[tuple]:
+        """What a row context over the table expression ``text`` holds, as
+        far as the checks read it: ``('table', T)`` for rows of model table T
+        (T, FILTER / CALCULATETABLE / KEEPFILTERS / ADDCOLUMNS / TOPN of such
+        rows, ALL / ALLNOBLANKROW / ALLSELECTED / VALUES / RELATEDTABLE of
+        T), ``('cols', {(T, c), ...})`` for rows of a table of columns (ALL /
+        ALLNOBLANKROW / ALLSELECTED / VALUES / DISTINCT of columns, SUMMARIZE's
+        group-by columns), None for anything else. ``plain``: None as well
+        for rows that may carry columns of their own (ADDCOLUMNS, SUMMARIZE
+        with a named expression), which an unqualified [name] can read."""
+        shadow = self._static_shadow
+        if shadow and text.strip().lower() in shadow:
+            return None             # a VAR of the expression (_static_refusal_uncached)
+        t = self._static_table(text, ctx)
+        if t is not None:
+            return ('table', t)
+        call = _whole_call(text.strip())
+        if call is None:
+            return None
+        fn, inner = call
+        args = self._split_args(inner)
+        if not args:
+            return None
+        if fn == 'ADDCOLUMNS' and plain:
+            return None
+        if fn in ('FILTER', 'CALCULATETABLE', 'KEEPFILTERS', 'ADDCOLUMNS'):
+            return self._static_row_kind(args[0], ctx, plain)
+        if fn == 'TOPN':
+            return self._static_row_kind(args[1], ctx, plain) if len(args) > 1 else None
+        if fn == 'RELATEDTABLE':
+            t = self._static_table(args[0], ctx) if len(args) == 1 else None
+            return ('table', t) if t is not None else None
+        if fn not in ('ALL', 'ALLNOBLANKROW', 'ALLSELECTED', 'VALUES', 'DISTINCT', 'SUMMARIZE'):
+            return None
+        if fn != 'SUMMARIZE' and len(args) == 1:
+            t = self._static_table(args[0], ctx)
+            if t is not None:
+                return ('table', t) if fn != 'DISTINCT' else None
+        cols = set()
+        for a in (args[1:] if fn == 'SUMMARIZE' else args):
+            if fn == 'SUMMARIZE' and a.strip().startswith('"'):
+                if plain:
+                    return None
+                break
+            m = _WHOLE_TCOL_RE.match(a)
+            col = self._static_column(ctx, (m.group(1) or m.group(2) or ''), m.group(3)) if m else None
+            if col is None:
+                return None
+            cols.add(col)
+        if not cols or (fn in ('VALUES', 'DISTINCT') and len(args) != 1):
+            return None
+        return ('cols', frozenset(cols))
+
+    def _static_frames(self, frames: tuple, frame_args: dict, ctx: DAXContext,
+                       topn: bool, plain: bool = False) -> Optional[tuple]:
+        """``(visible, hidden, modifier frames)`` of the row contexts in force
+        inside ``frames`` (_static_sites), or None when a call around the
+        site is not one the checks know or the site is a filter argument of
+        a CALCULATE. visible / hidden: _static_row_kind of each row context
+        the site can read / that a CALCULATE around it consumed; modifier
+        frames: the CALCULATEs whose expression holds the site."""
+        visible: list = []
+        hidden: list = []
+        mods: list = []
+        pure = self._SHIELD_PURE_FNS
+        for name, argi, fid in frames:
+            if name is None:
+                continue
+            if name == 'CALCULATE' or name == 'CALCULATETABLE':
+                if argi != 0:
+                    return None
+                hidden.extend(visible)
+                visible = []
+                mods.append(fid)
+                continue
+            if name in _STATIC_ROW_ARG1 or name in _STATIC_ROW_ARGS_ALL or (topn and name == 'TOPN'):
+                ti = 1 if name == 'TOPN' else 0
+                if argi <= ti:
+                    # the table argument (and TOPN's count) is evaluated where
+                    # the call is: no row context of the call's own
+                    # (#287; build_b256d.py b_filter_other_col)
+                    continue
+                if name in _STATIC_ROW_ARG1 and argi != 1:
+                    return None
+                args = frame_args.get(fid)
+                visible.append(self._static_row_kind(args[ti], ctx, plain)
+                               if args is not None and len(args) > ti else None)
+                continue
+            if name in pure:
+                continue
+            return None
+        return visible, hidden, mods
+
+    def _static_col_check(self, site: tuple, frame_args: dict, ctx: DAXContext) -> Optional[str]:
+        """A column read where no row context holds it (#287;
+        _static_refusal)."""
+        _pos, _kind, table, column, frames = site
+        # T[c] always names the model column (DAX has no var[column]), so a
+        # VAR of that name does not exempt it: only the row contexts read
+        # through _static_row_kind are shadowed.
+        col = self._static_column(ctx, table, column)
+        if col is None:
+            return None
+        got = self._static_frames(frames, frame_args, ctx, False)
+        if got is None:
+            return None
+        visible, hidden, _mods = got
+
+        def holds(kind) -> bool:
+            return kind is None or (col[0] == kind[1] if kind[0] == 'table' else col in kind[1])
+        if any(holds(k) for k in visible):
+            return None
+        # An outer row's column under an inner row context past a CALCULATE
+        # is refused too (#287): Power BI Desktop 2.152
+        # (build_b256d.py) fails SUMX(F, CALCULATE(SUMX(P, P[x] + F[v])))
+        # with this message (b_outer_in_inner; the engine BLANK), and
+        # SUMX(FILTER(ALL(F[pk]), F[v] > 1), 1), a column FILTER's rows of
+        # other columns do not hold, in an iterator's table argument
+        # (b_filter_other_col; the engine BLANK).
+        return _SINGLE_VALUE_MSG.format(t=col[0], c=col[1])
+
+    def _static_bare_check(self, site: tuple, frame_args: dict, ctx: DAXContext) -> Optional[str]:
+        """An unqualified [name] that is no measure, read in a row context
+        none of whose rows holds a column of that name (#287;
+        _static_refusal). Power BI Desktop 2.152 (build_b256d.py):
+        SUMX(VALUES(F[pk]), [v]) fails with "Column 'v' cannot be found or
+        may not be used in this expression" (b_bare_col, translated from its
+        Norwegian UI; the engine BLANK). Left to the evaluation: no row
+        context at all, a row context the check cannot read (a table
+        expression it does not know, ADDCOLUMNS / SUMMARIZE rows that carry
+        columns of their own), and a name no model table has."""
+        _pos, _kind, _table, name, frames = site
+        if not name or self._measure_exists(name, ctx):
+            return None
+        want = name.lower()
+        owners = {t for t, tbl in ctx.tables.items()
+                  if any(isinstance(c, str) and c.strip().lower() == want
+                         for c in (tbl.get('columns') or ()))}
+        if not owners:
+            return None
+        got = self._static_frames(frames, frame_args, ctx, False, True)
+        if got is None:
+            return None
+        visible, hidden, _mods = got
+        if not visible:
+            return None
+        for kind in visible + hidden:
+            if kind is None:
+                return None
+            if kind[0] == 'table':
+                if kind[1] in owners:
+                    return None
+            elif any(c.strip().lower() == want for _t, c in kind[1]):
+                return None
+        return f"Column '{name}' cannot be found or may not be used in this expression."
+
+    def _static_related_check(self, site: tuple, frame_args: dict, ctx: DAXContext) -> Optional[str]:
+        """RELATED with no row context, with rows of a table of columns only,
+        or with no active relationship from the rows' tables to the column's
+        under the modifiers of the CALCULATEs around it (_static_refusal)."""
+        _pos, _kind, table, column, frames = site
+        msg = _RELATED_NO_REL_MSG.format(ref=f"{table}[{column}]")
+        if not _row_context_possible([(f[0], f[1]) for f in frames]):
+            return msg
+        target = self._static_table_named(table, ctx)
+        if target is None:
+            return None
+        got = self._static_frames(frames, frame_args, ctx, True)
+        if got is None:
+            return None
+        visible, _hidden, mod_frames = got
+        if not visible or any(k is None for k in visible):
+            return None
+        tables = [k[1] for k in visible if k[0] == 'table']
+        if not tables:
+            return msg
+        rctx = ctx
+        for fid in mod_frames:
+            args = frame_args.get(fid)
+            if args is None:
+                return None
+            for a in _rel_modifiers_in_order([a for a in args[1:] if _is_rel_modifier(a)]):
+                try:
+                    if a[:15].upper().startswith('USERELATIONSHIP'):
+                        rctx = self._apply_userelationship(a, rctx)
+                    else:
+                        rctx = self._apply_crossfilter(a, rctx)
+                except _DAXEvaluationError:
+                    return None      # the CALCULATE's own check reports it
+        if any(self._tables_joined(rctx, t, target) for t in tables):
+            return None
+        return msg
+
+    def _static_calc_check(self, args: Optional[tuple], ctx: DAXContext) -> Optional[str]:
+        """The relationship modifiers of one CALCULATE / CALCULATETABLE
+        (``args``, its argument texts) that contradict each other or would
+        let only the many side of a many-to-one relationship filter
+        (_static_refusal)."""
+        if not args or len(args) < 2:
+            return None
+        rel = [a for a in args[1:] if _is_rel_modifier(a)]
+        if not rel:
+            return None
+        try:
+            if len(rel) > 1:
+                self._check_relationship_modifiers(rel, ctx)
+            for a in rel:
+                if not a[:11].upper().startswith('CROSSFILTER'):
+                    continue
+                direction = self._crossfilter_direction(a)
+                if direction not in ('ONEWAY_LEFTFILTERSRIGHT', 'ONEWAY_RIGHTFILTERSLEFT'):
+                    continue
+                refs = [ctx.model_column(t, c) for t, c in self._two_col_refs(a)]
+                if len(refs) < 2:
+                    continue
+                pair = {refs[0], refs[1]}
+                for r in ctx.relationships:
+                    if {(r.get('FromTable'), r.get('FromColumn')), (r.get('ToTable'), r.get('ToColumn'))} == pair:
+                        self._crossfilter_behavior(direction, r, refs[0])
+        except _DAXEvaluationError as exc:
+            return getattr(exc, 'message', None) or str(exc)
+        return None
+
     def _reaches_allselected(self, texts: list, ctx: DAXContext, seen: set | None = None) -> bool:
         """Does one of the DAX ``texts``, or a measure they reference
         (transitively), call ALLSELECTED?"""
@@ -7944,11 +11714,8 @@ class DAXEngine:
         return plan
 
     def _shield_cmp_sides(self, expr: str):
-        for op in ('==', '<>', '>=', '<=', '>', '<', '='):
-            parts = self._split_operators(expr, op)
-            if len(parts) == 2:
-                return [p.strip() for p in parts]
-        return None
+        split = DAXEngine._cmp_split(expr)       # a chain groups left to right (#274)
+        return [split[1], split[2]] if split else None
 
     def _shield_scalar(self, expr: str, table: str, ctx: DAXContext, vars_: frozenset,
                        visiting: set, row: bool | str) -> bool:
@@ -8410,6 +12177,18 @@ class DAXEngine:
                 if fn:
                     if ctx._outer_ctx is not None and func_name in _ROW_TRANSITION_FNS:
                         ctx = self._row_transitioned(ctx)
+                    if func_name in _ROW_ITERATOR_FNS:
+                        try:
+                            return fn(args_text, ctx)
+                        except Exception as exc:
+                            if getattr(exc, "_dax_once_arg", False):
+                                # raised by an argument evaluated once, not in
+                                # a row (_eval_once_arg): this call leaves it
+                                # catchable, an enclosing iteration does not
+                                setattr(exc, "_dax_once_arg", False)
+                            else:
+                                _mark_row_error(exc)
+                            raise
                     return fn(args_text, ctx)
                 self._note_unsupported(func_name)
                 import logging
@@ -8446,7 +12225,10 @@ class DAXEngine:
                     v = self._eval_expr(elem, ctx, var_scope)
                     rows.append({'__table__': '', '__column__': 'Value',
                                  '__value__': v, 'Value': v})
-                return rows
+                # a column of Int64 and Double values is a Double column
+                # (#326: MAXX({9007199254740993,
+                # 9007199254740992.0}, [Value]) is the Double 2**53)
+                return _unify_number_columns(rows)
             if kind == _P_IN:
                 result = self._eval_in(data[0], data[1], ctx, var_scope)
                 if result is not None:
@@ -8465,10 +12247,19 @@ class DAXEngine:
                     _cur = next((p for p in _cur['__parts__']
                                  if p.get('__table__') == table_name), _cur)
                 if _cur and _cur.get('__table__') == table_name:
+                    # A Fixed Decimal column's float is read as a Currency
+                    # (issue #248; Desktop 2.152, build_b254.py l_rowctx:
+                    # ISCURRENCY(TR[v]) in every row); rows keep floats.
                     if col_name in _cur:
-                        return _cur[col_name]
+                        _v = _cur[col_name]
+                        if ctx._cur_tcols and type(_v) is float and data in ctx._cur_tcols:
+                            return _Currency(_v)
+                        return _v
                     if _cur.get('__column__') == col_name:
-                        return _cur.get('__value__')
+                        _v = _cur.get('__value__')
+                        if ctx._cur_tcols and type(_v) is float and data in ctx._cur_tcols:
+                            return _Currency(_v)
+                        return _v
                     # The row is keyed by the model's spelling, which may keep a
                     # space the parsed reference lost (' Sales', issue #132) or
                     # spell the name in another case (issue #226).
@@ -8477,14 +12268,27 @@ class DAXEngine:
                         _ci = ctx._find_col_idx(_tt['columns'], col_name)
                         if _ci >= 0:
                             _mc = _tt['columns'][_ci]
+                            _v = _MISSING
                             if _mc in _cur:
-                                return _cur[_mc]
+                                _v = _cur[_mc]
                             # A row of one column (VALUES, DISTINCT, ALL of a
                             # column) names it under __column__: Desktop's
                             # COUNTROWS(FILTER(VALUES(F3[S]), F3[s] = "a")) is
                             # 1, where F3[s] stayed unresolved and kept no row.
-                            if _cur.get('__column__') == _mc:
-                                return _cur.get('__value__')
+                            elif _cur.get('__column__') == _mc:
+                                _v = _cur.get('__value__')
+                            if _v is not _MISSING:
+                                if type(_v) is float and (table_name, _mc) in ctx._cur_tcols:
+                                    return _Currency(_v)
+                                return _v
+                # A part joined onto the current row: GENERATE's inner row, a
+                # natural join's right-hand row (#300;
+                # _joined_cell). They leaked a (table, column) marker.
+                _row = ctx._current_row
+                if _row and ('__joined__' in _row or '_inner___table__' in _row):
+                    _found, _val = self._joined_cell(_row, table_name, col_name, ctx)
+                    if _found:
+                        return _val
                 # Not the current row's: the innermost enclosing row context
                 # over that table (issue #116). Power BI Desktop 2.152:
                 # SUMX(Dim, COUNTROWS(FILTER(Orders, Orders[Region] =
@@ -8544,7 +12348,16 @@ class DAXEngine:
             if kind == _P_BRACKET1:
                 if (data not in ctx.measures and ctx._current_row
                         and data in ctx._current_row):
-                    return ctx._current_row[data]
+                    _v = ctx._current_row[data]
+                    # a Fixed Decimal column reads as a Currency (issue #248),
+                    # a natural join's right-hand one too (_joined_typed)
+                    if type(_v) is float and ctx._cur_tcols:
+                        if ((ctx._current_row.get('__table__'), data) in ctx._cur_tcols
+                                and _cur_lineage(ctx._current_row, data)):
+                            return _Currency(_v)
+                        if '__joined__' in ctx._current_row:
+                            return _joined_typed(ctx, ctx._current_row, data, _v)
+                    return _v
                 if not self._measure_exists(data, ctx):
                     # A row context's column: the current row's one-column
                     # cell, or an enclosing row's (issues #225, #235).
@@ -8582,17 +12395,37 @@ class DAXEngine:
             if kind == _P_PAREN:
                 return self._eval_expr(data, ctx, var_scope)
             if kind == _P_LOGICAL:
-                # Left to right, and no further than the answer, as AND() and
-                # OR() (_fn_and, _fn_or) always went: a && b is AND(a, b). Every
-                # side was evaluated, so a guard was no guard once MOD by 0
-                # raised (issue #239): COUNTROWS(FILTER(T, T[d] <> 0 &&
-                # MOD(T[n], T[d]) = 1)) failed the measure where the AND()
-                # form counted 2. Not measured on Desktop.
+                # Stops at the deciding side only where nothing it reads can
+                # change (issue #249, _logic_eager): Power BI Desktop 2.152
+                # (build_b255.py) answers the scalar IF([m_zero] <> 0 &&
+                # MOD(1, [m_zero]) = 1, 1, 0) 0 (s1; || s2 1, s8 0), but
+                # evaluates every operand on every row of an iteration:
+                # SUMX(TM, IF(TM[d] <> 0 && MOD(TM[n], TM[d]) = 1, 1)) fails
+                # with MOD's division by zero (a3; AND() x5, || x9, n1 over
+                # GENERATESERIES), as does the same IF in a measure reached
+                # from a row (x18) or under a filter on what it reads
+                # (build_b255b.py v4, CALCULATE([m_and_d], TM[d] = 0)).
+                # Issue #239 had made && stop early everywhere, as AND() /
+                # OR() did. FILTER's top-level conjunction is split before
+                # it gets here (_filter_keep). The question is asked only
+                # when a side decides: otherwise every operand runs anyway.
+                # In a row, operands that read nothing the row changes go
+                # first, and one that decides decides alone (_logic_hoisted;
+                # build_b255c.py h1-h4, w2).
                 lop, parts = data
                 truthy, ev = self._dax_truthy, self._eval_expr
-                if lop == '||':
-                    return any(truthy(ev(p, ctx, var_scope)) for p in parts)
-                return all(truthy(ev(p, ctx, var_scope)) for p in parts)
+                stop = lop == '||'
+                if ctx._current_row is not None or ctx._outer_ctx is not None:
+                    split = self._logic_split(parts, ctx)
+                    if split is not None:
+                        return self._logic_hoisted(parts, split, ctx, var_scope, stop, True)
+                for i, p in enumerate(parts):
+                    if truthy(ev(p, ctx, var_scope)) is stop:
+                        if i + 1 < len(parts) and self._logic_eager(parts, ctx, var_scope):
+                            for q in parts[i + 1:]:
+                                truthy(ev(q, ctx, var_scope))
+                        return stop
+                return not stop
             if kind == _P_CONCAT:
                 # `&` renders a blank as "", but an ALL-BLANK concatenation is
                 # BLANK, not the empty string -- Desktop: BLANK() & BLANK() is
@@ -8604,6 +12437,12 @@ class DAXEngine:
                 return _from_u16(''.join(_concat_str(v) for v in vals))
             if kind == _P_NEG:
                 inner_val = self._eval_expr(data, ctx, var_scope)
+                if type(inner_val) is _Currency:
+                    # -Currency stays a Currency, the count negated and
+                    # wrapped (issue #248; Desktop 2.152, build_b254.py
+                    # r_neg; build_b254b.py g_ovf: -CURRENCY("-922337203685477.5808")
+                    # is itself)
+                    return _cur_make(_wrap64(-_cur_count(inner_val)))
                 if isinstance(inner_val, (int, float)) and not isinstance(inner_val, bool):
                     return -inner_val
                 if inner_val is None or isinstance(inner_val, (list, tuple)):
@@ -8631,7 +12470,14 @@ class DAXEngine:
             if kind == _P_BRACKET2:
                 if (data not in ctx.measures and ctx._current_row
                         and data in ctx._current_row):
-                    return ctx._current_row[data]
+                    _v = ctx._current_row[data]
+                    if type(_v) is float and ctx._cur_tcols:
+                        if ((ctx._current_row.get('__table__'), data) in ctx._cur_tcols
+                                and _cur_lineage(ctx._current_row, data)):
+                            return _Currency(_v)
+                        if '__joined__' in ctx._current_row:
+                            return _joined_typed(ctx, ctx._current_row, data, _v)
+                    return _v
                 if not self._measure_exists(data, ctx):
                     found, val = self._bare_row_value(data, ctx)
                     if found:
@@ -8652,6 +12498,8 @@ class DAXEngine:
                 return None
             if kind == _P_TAIL:
                 return self._eval_tail(data, ctx)
+            if kind == _P_POW:
+                return self._fold_pow(data, ctx, var_scope)
         return None
 
     def _eval_tail(self, expr: str, ctx: DAXContext):
@@ -8673,6 +12521,12 @@ class DAXEngine:
                 tbl = ctx.tables.get(bare_name)
         if tbl and tbl.get('rows'):
             cols = tbl['columns']
+            probe = self._se_probe
+            if probe is not None and probe[0] == bare_name and not probe[1]:
+                # the iterator's table: its rows' storage positions (#243);
+                # the same table read again on the way (a condition's
+                # COUNTROWS) is read as always
+                return self._se_probe_rows(probe, bare_name, tbl, ctx)
             filtered_rows = ctx.get_filtered_rows(bare_name)
             return [
                 {**{'__table__': bare_name, '__row__': True},
@@ -8680,6 +12534,25 @@ class DAXEngine:
                 for row in filtered_rows
             ]
         return None
+
+    def _se_probe_rows(self, probe: tuple, table_name: str, tbl: dict, ctx: DAXContext) -> list:
+        """_eval_tail's rows of table_name for a SUMX / AVERAGEX that adds as
+        Desktop's storage engine does (_se_iter_total): the same rows, each
+        recorded with its storage position and the context that selected
+        it, so the iterator can tell which rows it was handed (issue #243)."""
+        cols = tbl['columns']
+        rows = tbl['rows']
+        positions = ctx.get_row_positions(table_name)
+        picked = rows if positions is None else [rows[i] for i in positions]
+        out = [
+            {**{'__table__': table_name, '__row__': True},
+             **{cols[i]: row[i] for i in range(min(len(cols), len(row)))}}
+            for row in picked
+        ]
+        seen = probe[1]
+        seen['lists'] = [(out, ctx)]      # keeps the dicts, and so their ids
+        seen['pos'] = range(len(out)) if positions is None else positions
+        return out
 
     def _eval_var_return(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Parse and evaluate a VAR ... RETURN block.
@@ -8709,7 +12582,7 @@ class DAXEngine:
                 # Evaluated eagerly, an unused VAR x = "a" * 1 failed a measure
                 # Desktop answers, and a calculation item computed every
                 # period's VAR for each measure it applied to.
-                scope[var_name] = _LazyVar(var_expr, ctx, dict(scope))
+                scope[var_name] = _LazyVar(var_expr, ctx, dict(scope), self._if_branch)
 
             # Evaluate RETURN expression
             self._current_var_scope = scope
@@ -8770,47 +12643,17 @@ class DAXEngine:
         return self._split_top_level(args_str, ',')
 
     @staticmethod
-    @lru_cache(maxsize=100_000)
     def _split_in_scan(expr: str) -> tuple:
-        """Find a TOP-LEVEL ``IN`` word operator: ``(left, right)`` or ``()``.
+        """``(left, right)`` when the comparison-class operator ``expr``
+        applies last is a TOP-LEVEL ``IN`` word operator, else ``()``.
 
-        A word operator cannot be found by substring scanning -- "MIN(", "IN"
-        inside an identifier and the text of a string literal all contain it --
-        so this requires non-word characters on both sides and skips anything
-        nested in (), [], {} or quotes. Braces count as nesting so the SET on the
-        right of an IN is never mistaken for a second operator.
-        """
-        depth = 0
-        in_string = False
-        quote = ''
-        i = 0
-        n = len(expr)
-        while i < n:
-            ch = expr[i]
-            if in_string:
-                if ch == quote:
-                    in_string = False
-                i += 1
-                continue
-            if ch in ('"', "'"):
-                in_string, quote = True, ch
-                i += 1
-                continue
-            if ch in '([{':
-                depth += 1
-            elif ch in ')]}':
-                depth -= 1
-            elif (depth == 0 and (ch == 'I' or ch == 'i')
-                    and i + 1 < n and expr[i + 1] in ('N', 'n')):
-                before = expr[i - 1] if i > 0 else ' '
-                after = expr[i + 2] if i + 2 < n else ' '
-                if (not (before.isalnum() or before in '_.')
-                        and not (after.isalnum() or after in '_.')):
-                    left, right = expr[:i].strip(), expr[i + 2:].strip()
-                    if left and right:
-                        return (left, right)
-            i += 1
-        return ()
+        IN binds tighter than the comparison operators (Power BI Desktop
+        2.152, build_b255d.py d9-d11), so ``2 IN {1, 2} = TRUE()`` is
+        ``(2 IN {1, 2}) = TRUE()``: its last operator is ``=``, and IN is
+        not split here (it was, with the set ``{1, 2} = TRUE()``)
+        (#274). See _cmp_chain_scan."""
+        got = DAXEngine._cmp_chain_scan(expr)
+        return (got[1], got[2]) if got and got[0] == 'IN' else ()
 
     @staticmethod
     def _wraps_whole(s: str) -> bool:
@@ -8897,6 +12740,100 @@ class DAXEngine:
         return list(self._split_operators_scan(expr, op))
 
     @staticmethod
+    def _cmp_split(expr: str) -> tuple:
+        """``(op, left, right)`` at the top-level comparison operator (=, ==,
+        <>, <, >, <=, >=) of ``expr`` that is applied last, else ``()``; also
+        ``()`` when the operator applied last is IN (_split_in_scan).
+
+        The comparison operators share one precedence and group from left to
+        right (Microsoft Learn, DAX operators: "If the operators have equal
+        precedence value, they are ordered from left to right"), so in a
+        chain that is the LAST one: 0 = 0 = TRUE() is (0 = 0) = TRUE()
+        (#274). Each caller tried the operators in a fixed
+        order and took one with exactly two sides, so a chain was split
+        right to left (1 < 2 = TRUE() as 1 < (2 = TRUE())) or not at all (0
+        = 0 = TRUE() fell through to BLANK)."""
+        got = DAXEngine._cmp_chain_scan(expr)
+        return got if got and got[0] != 'IN' else ()
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def _cmp_chain_scan(expr: str) -> tuple:
+        """``(op, left, right)`` at the top-level comparison-class operator
+        of ``expr`` that is applied last -- one of =, ==, <>, <, >, <=, >=
+        and the word IN (as ``'IN'``); else ``()``. The comparison operators
+        group from left to right (Microsoft Learn, DAX operators), so the
+        RIGHTMOST of them is applied last. IN binds tighter than they do:
+        Power BI Desktop 2.152 (build_b255d.py d11) fails IF(1 = 1 IN
+        {TRUE()}, 1, 0) with CONTAINSROW's "does not support comparing values
+        of type True/False with values of type Integer" -- 1 = (1 IN
+        {TRUE()}), where (1 = 1) IN {TRUE()} would be 1 -- while 2 IN {1, 2}
+        = TRUE() is 1 and TM[d] IN {0, 2} = TRUE() keeps 3 rows (d9, d10).
+        So IN is split only where no other comparison operator is, at its
+        last occurrence. Quotes, parentheses and braces nest, and
+        a bracketed name is read whole (an apostrophe in it, TQ[it's], opens
+        no quoted name: CALCULATE(COUNTROWS(TQ), TQ[it's] = 2) applied no
+        filter, #278); IN needs a non-word character on both
+        sides ("MIN(", an identifier and a string's text contain it)
+        (#274)."""
+        last = None
+        last_in = None
+        dp = 0
+        insq = indq = False
+        i, n = 0, len(expr)
+        while i < n:
+            ch = expr[i]
+            if insq:
+                insq = ch != "'"
+            elif indq:
+                indq = ch != '"'
+            elif ch == "'":
+                insq = True
+            elif ch == '"':
+                indq = True
+            elif ch == '[':
+                # a column or measure name: opaque up to its ']' (']]' is an
+                # escaped ']'), so TQ[it's] = 2 is no quoted name
+                i += 1
+                while i < n:
+                    if expr[i] == ']':
+                        if expr[i + 1:i + 2] == ']':
+                            i += 2
+                            continue
+                        break
+                    i += 1
+            elif ch in '({':
+                dp += 1
+            elif ch in ')}':
+                dp -= 1
+            elif dp == 0:
+                if ch in '<>=':
+                    two = expr[i:i + 2]
+                    if two in ('==', '<>', '<=', '>='):
+                        last = (two, i, i + 2)
+                        i += 2
+                        continue
+                    last = (ch, i, i + 1)
+                elif (ch == 'I' or ch == 'i') and i + 1 < n and expr[i + 1] in 'Nn':
+                    before = expr[i - 1] if i > 0 else ' '
+                    after = expr[i + 2] if i + 2 < n else ' '
+                    if (not (before.isalnum() or before in '_.')
+                            and not (after.isalnum() or after in '_.')):
+                        last_in = ('IN', i, i + 2)
+                        i += 2
+                        continue
+            i += 1
+        if last is None:
+            last = last_in
+        if last is None:
+            return ()
+        op, a, b = last
+        left, right = expr[:a].strip(), expr[b:].strip()
+        if not left or not right:
+            return ()
+        return (op, left, right)
+
+    @staticmethod
     @lru_cache(maxsize=200_000)
     def _split_operators_scan(expr: str, op: str) -> tuple:
         """Character scan behind ``_split_operators``, cached by input.
@@ -8916,9 +12853,11 @@ class DAXEngine:
                 cur.append(ch); insq = (ch != "'"); i += 1; continue
             if indq:
                 cur.append(ch); indq = (ch != '"'); i += 1; continue
-            if ch == "'":
+            # inside a bracketed name a quote is a character of the name:
+            # TQ[it's] * 2 opens no quoted name (#278)
+            if ch == "'" and db == 0:
                 insq = True; cur.append(ch); i += 1; continue
-            if ch == '"':
+            if ch == '"' and db == 0:
                 indq = True; cur.append(ch); i += 1; continue
             if ch == '(':
                 dp += 1; cur.append(ch); i += 1; continue
@@ -8944,8 +12883,8 @@ class DAXEngine:
                 skip = False
                 if op in ('+', '-'):
                     p = prev.rstrip()
-                    if p == '' or p[-1] in '+-*/(<>=&|,':
-                        skip = True                       # unary sign
+                    if p == '' or p[-1] in '+-*/^(<>=&|,':
+                        skip = True                       # unary sign (2 ^ -1 too)
                     elif len(p) >= 2 and p[-1] in 'eE' and p[-2].isdigit():
                         skip = True                       # exponent 1e-5
                 elif op == '=' and (prev[-1:] in ('<', '>', '=') or nxt == '='):
@@ -9001,6 +12940,12 @@ class DAXEngine:
             new_ctx._current_row = row_item
             new_ctx._outer_ctx = ctx
             return new_ctx
+        if '_inner___table__' in row_item:
+            # a GENERATE / GENERATEALL row (#302)
+            new_ctx = self._transitioned_ctx(ctx, self._generate_row_filters(row_item, shadow, ctx))
+            new_ctx._current_row = row_item
+            new_ctx._outer_ctx = ctx
+            return new_ctx
         new_ctx = self._transitioned_ctx(ctx, self._row_filters(row_item, shadow))
         # Bind the current row for ALL iteration shapes (full-row SUMX dicts,
         # single-column VALUES/ALL dicts, ADDCOLUMNS/SELECTCOLUMNS extension
@@ -9013,13 +12958,46 @@ class DAXEngine:
         new_ctx._outer_ctx = ctx
         return new_ctx
 
+    @classmethod
+    def _generate_row_filters(cls, row_item: dict, shadow: Optional[list], ctx: 'DAXContext') -> dict:
+        """The filters the context transition of a GENERATE / GENERATEALL row
+        applies: its outer row's columns, and those of each inner row it
+        holds (keys prefixed ``_inner_``, _generate_inner) that is a row of a
+        model table -- every column of a table's row, the column of a row of
+        one column (VALUES); a BLANK inner row (GENERATEALL's, _blank_like)
+        filters each of its columns to BLANK.
+
+        The transition filtered the outer row's table alone, with the inner
+        row's prefixed keys as columns of it that match nothing: over T four
+        rows of c 0.1, 0.1, 0.2, 1.2345 in groups a, a, b, b and D[g] = a, b,
+        SUMX(GENERATE(D, FILTER(T, T[g] = D[g])), CALCULATE(SUM(T[c]))) was
+        3.269, each group's total once per row of it, where DAX filters each
+        row's own T row, 1.6345 (#302). Not measured in
+        Desktop (build_b248g.py g3_*). Not changed: a row of columns
+        (SELECTCOLUMNS, SUMMARIZE; ``__columns__``) or of no model table
+        (ROW, { }) filters nothing, as before, and the inner row's expanded
+        table is not filtered (expansion_filters reads the outer row)."""
+        outer = {k: v for k, v in row_item.items() if not k.startswith('_inner_')}
+        filters = cls._row_filters(outer, shadow)
+        p = '_inner_'
+        n = 7
+        while (p + '__table__') in row_item:
+            t = row_item[p + '__table__']
+            if (isinstance(t, str) and t in ctx.tables and not row_item.get(p + '__columns__')):
+                level = {k[n:]: v for k, v in row_item.items()
+                         if k.startswith(p) and not k.startswith('_inner_', n)}
+                filters.update(cls._row_filters(level, shadow))
+            p += '_inner_'
+            n += 7
+        return filters
+
     @staticmethod
     def _row_filters(row_item: dict, shadow: Optional[list] = None) -> dict:
         """The filters one row's context transition applies: every column of
         the row, as an iterated (in-scope) value. ``shadow`` is the iteration's
         rows, which ALLSELECTED restores (issue #118)."""
         meta_keys = {'__table__', '__column__', '__value__', '__row__',
-                     '__blank_row__', '__parts__', '__tuple__'}
+                     '__blank_row__', '__parts__', '__tuple__', '__joined__'}
         table_name = row_item.get('__table__', '')
         filters: dict[str, list] = {}
 
@@ -9090,24 +13068,80 @@ class DAXEngine:
         # instead of 5 and `20 / 4 / 5` gave 25 instead of 1 -- wrong on every
         # repeated subtraction or division, silently.
         #
-        # Splitting on `+` before `-` (and `*` before `/`) is still correct:
-        # a - b + c groups as (a - b) + c, so each `-` chain folds on its own.
-        for op in ['+', '-']:
-            parts = self._split_operators(expr, op)
-            if len(parts) > 1:
-                return self._fold_arith(parts, op, ctx, var_scope)
+        # A mix of the two operators of one level groups from the left too
+        # (_left_assoc_split): a + b - c is (a + b) - c.
+        for ops in (('+', '-'), ('*', '/')):
+            split = self._left_assoc_split(expr, ops)
+            if split is not None:
+                op, parts = split
+                return self._fold_arith(list(parts), op, ctx, var_scope)
 
-        for op in ['*', '/']:
-            parts = self._split_operators(expr, op)
+        if not expr.lstrip().startswith('-'):
+            parts = self._split_operators(expr, '^')
             if len(parts) > 1:
-                return self._fold_arith(parts, op, ctx, var_scope)
+                return self._fold_pow(parts, ctx, var_scope)
 
         return _NOT_APPLICABLE
 
+    @staticmethod
+    def _left_assoc_split(expr: str, ops: tuple) -> Optional[tuple]:
+        """``(op, parts)``: ``expr`` split at ALL its top-level operators of
+        one precedence level, ``ops`` = ('+', '-') or ('*', '/'), for
+        _fold_arith to fold left to right; None when neither operator occurs.
+
+        ``op`` is the operator when the chain has one (a + b + c), and for a
+        mix the tuple of operators between the parts: a + b - c + d is
+        (('+', '-', '+'), (a, b, c, d)), folded as ((a + b) - c) + d.
+        Splitting on '+' first made it a + ((b - c) + d), and a * b / c
+        a * (b / c): exact in the reals, not in Doubles. Power BI Desktop
+        2.152 (build_b257b.py z53_power, #335): POWER(2, 53) +
+        1 - 9007199254740992 is 0 -- 2**53 + 1 is the Double 2**53 -- and we
+        answered 1; Microsoft's DAX operator reference: operators of one
+        precedence evaluate from left to right.
+
+        Flat, not nested: splitting a mix at its LAST operator and analysing
+        the left part again built a plan as deep as the chain is long -- an
+        alternating chain of about 350 operators ran out of recursion and
+        its measure came back BLANK, and every level was one more plan node
+        per row. The parts are the '+' scan's parts, each split by the '-'
+        scan, which sees the same unary signs and exponents (``a + -b``,
+        ``1e-5``) as one scan over both operators would."""
+        first, second = ops
+        scan = DAXEngine._split_operators_scan
+        pa = scan(expr, first)
+        if len(pa) == 1:
+            pb = scan(expr, second)
+            return (second, pb) if len(pb) > 1 else None
+        subs = [scan(p, second) for p in pa]
+        if all(len(s) == 1 for s in subs):
+            return first, pa
+        parts: list = list(subs[0])
+        seq: list = [second] * (len(subs[0]) - 1)
+        for s in subs[1:]:
+            seq.append(first)
+            seq.extend([second] * (len(s) - 1))
+            parts.extend(s)
+        return tuple(seq), tuple(parts)
+
     def _fold_arith(self, parts, op, ctx, var_scope):
         """Fold `parts` left-to-right with `op`, DAX-style. A one-row,
-        one-column table is its value (#145: FIRSTDATE(Dt[Date]) + 1)."""
+        one-column table is its value (#145: FIRSTDATE(Dt[Date]) + 1).
+
+        ``op`` is one operator, or a tuple of one operator per part after the
+        first (a mix of one precedence level, _left_assoc_split)."""
+        # a mix steps through its operators; one operator costs one test a
+        # part (a zip over repeat(op) cost a tenth of a two-part fold)
+        op_iter: Any = None
+        if type(op) is tuple:
+            op_iter = iter(op)
+            op = op[0]
         acc = _scalarize(self._eval_expr(parts[0].strip(), ctx, var_scope))
+        if type(acc) is list:
+            # a table of several values is no operand (#275;
+            # Power BI Desktop 2.152, build_b255d.py m3: VALUES(TM[d]) + 0
+            # fails with "A table of multiple values was supplied where a
+            # single value was expected.", where it was BLANK)
+            _table_as_scalar(acc)
         # A blank folds to 0 for + and - ONLY IF SOMETHING ELSE HAS A VALUE.
         # When every operand is blank the whole expression is blank:
         #   BLANK()+BLANK() -> BLANK      BLANK()+BLANK()+5 -> 5
@@ -9124,7 +13158,11 @@ class DAXEngine:
         # the final serial back. `*`/`/` results are plain numbers.
         result_is_dt = isinstance(acc, (datetime, date)) and op in ('+', '-')
         for p in parts[1:]:
+            if op_iter is not None:
+                op = next(op_iter)
             rhs = _scalarize(self._eval_expr(p.strip(), ctx, var_scope))
+            if type(rhs) is list:
+                _table_as_scalar(rhs)        # #275 (m3)
             any_value = any_value or rhs is not None
             if op == '+':
                 result_is_dt = result_is_dt or isinstance(rhs, (datetime, date))
@@ -9160,7 +13198,10 @@ class DAXEngine:
                 # hands dates over as ISO strings, so coerce before giving up.
                 # Returning None here made `[end] - [start]` blank on every row
                 # of a datetime column.
-                ln, rn = _as_number(left), _as_number(right)
+                # a Currency side keeps its type (issue #248; Desktop 2.152,
+                # build_b254.py t_mixed: CURRENCY(1.5) * "2" is the Currency 3)
+                ln = left if type(left) is _Currency else _as_number(left)
+                rn = right if type(right) is _Currency else _as_number(right)
                 _cul = getattr(ctx, 'culture', None)
                 if ln is None and isinstance(left, str):
                     ln = _arith_text_number(left, _cul)
@@ -9179,6 +13220,8 @@ class DAXEngine:
                             f"Cannot convert value '{_txt}' of type Text to type Number")
                     return None
                 left, right = ln, rn
+            # a Currency side: _Currency's operators are Desktop's Currency
+            # arithmetic (_cur_arith, issue #248)
             if op == '+':
                 acc = left + right
             elif op == '-':
@@ -9194,9 +13237,20 @@ class DAXEngine:
                     # Returning None here made `[x] / [y]` blank where Desktop
                     # shows infinity, which also flipped every downstream
                     # comparison against it.
-                    if left == 0:
-                        return float('nan')
-                    return float('inf') if left > 0 else float('-inf')
+                    #
+                    # A Currency over a zero that is no Currency raises
+                    # (issue #248, #307; _cur_div0_error).
+                    if type(left) is _Currency and type(right) is not _Currency:
+                        raise _cur_div0_error()
+                    # The special is the running value, not the answer: the
+                    # fold goes on (5 / 0 * -1 is -inf, 5 / 0 * 0 is nan), as
+                    # (5 / 0) * -1 did when each pair was its own plan node
+                    # (#335 folds a * b / c flat).
+                    if left == 0 or left != left:
+                        acc = float('nan')
+                    else:
+                        acc = float('inf') if left > 0 else float('-inf')
+                    continue
                 acc = left / right
         if not any_value:
             return None
@@ -9207,6 +13261,40 @@ class DAXEngine:
             except (OverflowError, ValueError):
                 return acc
         return acc
+
+    def _fold_pow(self, parts, ctx, var_scope):
+        """``a ^ b ^ ...``: Power BI Desktop 2.152 (build_b254b.py h_pow,
+        #314): always a Double (2 ^ 3 is D8, CURRENCY(1.1) ^
+        2 D1.21), right-associative (2 ^ 3 ^ 2 is 512), above the sign (-2 ^ 2
+        is -4) and below * (2 * 3 ^ 2 is 18); BLANK() ^ 2 is BLANK, 0 ^ 0 an
+        error. The operator was not implemented: 2 ^ 3 was BLANK and f(x) ^ y
+        answered f(x). Each step is POWER's (_dax_pow): a BLANK exponent is
+        0 (build_b248c.py b_pow: 2 ^ BLANK() is D1, BLANK() ^ 0 BLANK), a
+        negative base takes an odd root ((-8) ^ (1 / 3) is D-2), and 0 ^ 0
+        fails with POWER's message (a_err_pow00)."""
+        vals = []
+        for p in parts:
+            v = self._pow_operand(self._eval_expr(p.strip(), ctx, var_scope), ctx)
+            if v is _MISSING:
+                return None
+            vals.append(v)
+        acc = vals[-1]
+        for v in reversed(vals[:-1]):
+            acc = _dax_pow(v, acc)
+        return acc
+
+    def _pow_operand(self, v, ctx: DAXContext):
+        """An operand of ^ or POWER as a number, None for BLANK: TRUE / FALSE
+        are 1 / 0, a date its serial, text read as arithmetic reads it (text
+        that is no number raises); _MISSING for a table of several rows or
+        anything else that is no number (the whole ^ is BLANK, as before)."""
+        t = type(v)
+        if t is float or t is int:
+            return v
+        v = _scalarize(v)
+        if v is not None and not isinstance(v, (int, float, str, datetime, date)):
+            return _MISSING
+        return self._num_operand(v, ctx)
 
     def _in_set_values(self, right: str, ctx: DAXContext,
                        var_scope: dict | None = None) -> list | None:
@@ -9236,7 +13324,9 @@ class DAXEngine:
                 if elem.startswith('('):
                     return None
                 out.append(self._eval_expr(elem, ctx, var_scope))
-            return out
+            # one column, one type: {9007199254740992, 5.0} is a Double column
+            # (#326, build_b257b.py in_mixed_ctor / c_in_mixed)
+            return _unify_number_values(out)
         # A table expression: reuse the engine's row-dict convention.
         result = self._eval_expr(right, ctx, var_scope)
         if isinstance(result, list):
@@ -9276,7 +13366,23 @@ class DAXEngine:
         if values is None:
             return None
         lval = self._eval_expr(left.strip(), ctx, var_scope)
-        return any(_compare(lval, '=', v) for v in values)
+        # BLANK is in the set only with a BLANK, and no BLANK is in a set of
+        # values (#273). Microsoft Learn (CONTAINSROW, which IN
+        # is): "Unlike the = operator, the IN operator and the CONTAINSROW
+        # function perform strict comparison. For example, the BLANK value
+        # does not match 0." Power BI Desktop 2.152 (build_b255b.py k15):
+        # CALCULATE(COUNTROWS(TM), TM[d] IN {0, 2} && TM[n] = 7) is 2 -- the
+        # (7, BLANK) row is not in.
+        lval = _scalarize(lval)
+        if lval is None:
+            return any(_scalarize(v) is None for v in values)
+        lbool = type(lval) is bool
+        for v in values:
+            if v is not None and (type(v) is bool) is not lbool:
+                # TRUE / FALSE against a number (#279;
+                # build_b255d.py d11)
+                _bool_number_clash(v, lval, 'CONTAINSROW')
+        return any(v is not None and _compare(lval, '=', v) for v in values)
 
     def _eval_comparison(self, expr: str, ctx: DAXContext, var_scope: dict | None = None) -> Any:
         """Evaluate comparison operators.
@@ -9293,41 +13399,66 @@ class DAXEngine:
         `IF(SELECTEDVALUE(StateDim[State],0)==0, ...)` -- took the wrong branch
         and then concatenated a 57-row table into the string.
         """
-        for op_str, op_fn in [('==', lambda a, b: a == b),
-                              ('<>', lambda a, b: a != b), ('>=', lambda a, b: a >= b),
-                              ('<=', lambda a, b: a <= b), ('>', lambda a, b: a > b),
-                              ('<', lambda a, b: a < b), ('=', lambda a, b: a == b)]:
-            parts = self._split_operators(expr, op_str)
-            if len(parts) == 2:
-                # A one-row, one-column table is its value (#145):
-                # FIRSTDATE(Dt[Date]) = Dt[Date].
-                left = _scalarize(self._eval_expr(parts[0].strip(), ctx, var_scope))
-                right = _scalarize(self._eval_expr(parts[1].strip(), ctx, var_scope))
-                if op_str == '==':
-                    # Strict: a blank equals only a blank.
-                    if left is None or right is None:
-                        return left is None and right is None
-                else:
-                    # BLANK does not propagate through a comparison in DAX; it
-                    # takes the zero of the other operand's type. See
-                    # _blank_zero_of for the Desktop-verified table.
-                    left, right = _coerce_blanks_for_compare(left, right)
-                if isinstance(left, str) and isinstance(right, str):
-                    # Text compares case-insensitively ("North" = "north",
-                    # "a" < "B"; issue #107).
-                    left, right = _text_key(left), _text_key(right)
-                elif isinstance(left, (datetime, date)) != isinstance(right, (datetime, date)):
-                    # A date against a number compares as its serial: date -
-                    # date is a date (#146), and `d1 - d2 < 0` must still work.
-                    if isinstance(right, (int, float)) and not isinstance(right, bool):
-                        left = _as_number(left)
-                    elif isinstance(left, (int, float)) and not isinstance(left, bool):
-                        right = _as_number(right)
-                if left is not None and right is not None:
-                    try:
-                        return op_fn(left, right)
-                    except TypeError:
-                        return None
+        # the operator applied last: a chain groups left to right (_cmp_split,
+        # #274)
+        split = DAXEngine._cmp_split(expr)
+        if not split:
+            return None
+        op_str = split[0]
+        op_fn = _CMP_OPS[op_str]
+        parts = split[1:]
+        # A one-row, one-column table is its value (#145):
+        # FIRSTDATE(Dt[Date]) = Dt[Date].
+        left = _scalarize(self._eval_expr(parts[0].strip(), ctx, var_scope))
+        right = _scalarize(self._eval_expr(parts[1].strip(), ctx, var_scope))
+        if type(left) is list or type(right) is list:
+            # a table of several rows (or columns) is no value to
+            # compare (#275; Power BI Desktop 2.152,
+            # build_b255c.py v15: VALUES(TM[d]) = 7 over two values
+            # fails, where it was FALSE)
+            _table_as_scalar(left if type(left) is list else right)
+        if op_str == '==':
+            # Strict: a blank equals only a blank.
+            if left is None or right is None:
+                return left is None and right is None
+        else:
+            # BLANK does not propagate through a comparison in DAX; it
+            # takes the zero of the other operand's type. See
+            # _blank_zero_of for the Desktop-verified table.
+            left, right = _coerce_blanks_for_compare(left, right)
+        if left is not None and right is not None and (type(left) is bool) is not (type(right) is bool):
+            _bool_number_clash(left, right)     # #279
+        if isinstance(left, str) and isinstance(right, str):
+            # Text compares case-insensitively ("North" = "north",
+            # "a" < "B"; issue #107).
+            left, right = _text_key(left), _text_key(right)
+        elif isinstance(left, (datetime, date)) != isinstance(right, (datetime, date)):
+            # A date against a number compares as its serial: date -
+            # date is a date (#146), and `d1 - d2 < 0` must still work.
+            if isinstance(right, (int, float)) and not isinstance(right, bool):
+                left = _as_number(left)
+            elif isinstance(left, (int, float)) and not isinstance(left, bool):
+                right = _as_number(right)
+        else:
+            # An Int64 that meets a Double compares as a Double
+            # (#325; Power BI Desktop 2.152, build_b257.py:
+            # 9007199254740993 = 9007199254740992.0 is TRUE, > is FALSE,
+            # and so are == and <> (build_b257b.py eq_strict_id, ne_id)).
+            # Within +-2**53 an int is its own Double, and Python
+            # compares the two exactly, so only a larger one converts.
+            tl, tr = type(left), type(right)
+            if tl is not tr:
+                if tl is int:
+                    if tr is float and not -9007199254740992 <= left <= 9007199254740992:
+                        left = _int_as_double(left)
+                elif tr is int and tl is float \
+                        and not -9007199254740992 <= right <= 9007199254740992:
+                    right = _int_as_double(right)
+        if left is not None and right is not None:
+            try:
+                return op_fn(left, right)
+            except TypeError:
+                return None
         return None
 
     # =========================================================================
@@ -9826,29 +13957,61 @@ class DAXEngine:
         Orders, "x", ...) has the column x and no other. A CROSSJOIN row has
         its parts' columns, and the ones ADDCOLUMNS put on the joined row
         (whose other keys are the parts' copies, the right part's prefixed
-        ``_2_``; _fn_crossjoin)."""
+        ``_2_``; _fn_crossjoin). A GENERATE row has its inner row's columns
+        too (prefixed ``_inner_``), a natural join's row its right-hand
+        row's, typed by that row's table (#300)."""
         if not isinstance(row, dict):
             return False, None
         parts = row.get('__parts__')
+        # a Fixed Decimal column's value reads as a Currency (issue #248)
+        typed = _cur_typed
         for part in parts or (row,):
             if name in part and not name.startswith('__'):
-                return True, part[name]
+                v = part[name]
+                if type(v) is float and ctx._cur_tcols:
+                    t = part.get('__table__')
+                    if (t, name) in ctx._cur_tcols and _cur_lineage(part, name):
+                        return True, _Currency(v)
+                    if '__joined__' in part:
+                        # a natural join's right-hand column, its table's type
+                        return True, _joined_typed(ctx, part, name, v)
+                return True, v
             if isinstance(part, _ColumnsRow):
                 continue
             col = part.get('__column__')
             if col == name:
-                return True, part.get('__value__')
+                return True, typed(ctx, part.get('__table__'), name, part.get('__value__'))
             tbl = ctx.tables.get(part.get('__table__') or '')
             if tbl is not None:
                 ci = ctx._find_col_idx(tbl.get('columns') or [], name)
                 if ci >= 0:
                     spelled = tbl['columns'][ci]
                     if spelled in part:
-                        return True, part[spelled]
+                        return True, typed(ctx, part.get('__table__'), spelled, part[spelled])
                     if col == spelled:
-                        return True, part.get('__value__')
+                        return True, typed(ctx, part.get('__table__'), spelled, part.get('__value__'))
         if parts and name in row and not name.startswith(('__', '_2_')):
             return True, row[name]
+        if '_inner___table__' in row and not name.startswith('__'):
+            # GENERATE's inner row, its keys prefixed (_generate_inner): a
+            # column it adds is the GENERATE row's (GENERATE(T, ROW("z",
+            # ..)) has [z]; #300), where the reference raised
+            p = '_inner_'
+            while (p + '__table__') in row:
+                t = row[p + '__table__']
+                tbl = ctx.tables.get(t) if isinstance(t, str) else None
+                names = [name]
+                ci = -1
+                if tbl is not None:
+                    ci = ctx._find_col_idx(tbl.get('columns') or [], name)
+                    if ci >= 0 and tbl['columns'][ci] != name:
+                        names.append(tbl['columns'][ci])
+                for nm in names:
+                    if (p + nm) in row:
+                        return True, typed(ctx, t, nm, row[p + nm])
+                    if row.get(p + '__column__') == nm and (p + '__value__') in row:
+                        return True, typed(ctx, t, nm, row[p + '__value__'])
+                p += '_inner_'
         return False, None
 
     def _bare_row_value(self, name: str, ctx: DAXContext) -> tuple:
@@ -10005,6 +14168,569 @@ class DAXEngine:
                     and r.get('__table__') == table for r in rows)
                 and not self._measure_exists(name, ctx))
 
+    # ---- the storage engine's Currency * Double (issue #248) -----------------
+
+    def _se_value_space(self, row_expr: str, rows, ctx: DAXContext, table_expr: str) -> bool:
+        """Does an iteration over ``rows`` evaluate ``row_expr`` as Desktop's
+        storage engine does, Currency * Double on the VALUES?
+
+        Power BI Desktop 2.152 (build_b254b.py b_se_basic, b_se_aggs,
+        b_se_shapes, b_se_list; build_b254.py s_order): over a model table,
+        SUMX / AVERAGEX / MINX / MAXX of an expression of the table's columns
+        and constants, + - * / and VAR alone, take a Currency times a Double as
+        the Double product of the VALUE and the Double, x 10000 in Double and
+        rounded half away from zero (_cur_from_double): T3[v] = 0.0003 times
+        0.5 is 0.00014999999999999999, 1.4999999999999998 counts, so 1 --
+        SUMX(T3, T3[v] * 0.5) over ten rows is C0.001, SUMX(T3, 0.5 * T3[v]),
+        T3[v] * T3[d], T3[v] * 0.5 + 0, VAR x = T3[v] * 0.5 RETURN x and
+        CALCULATE(SUMX(TR, TR[v] * 0.5), TR[id] = k) too; AVERAGEX, MAXX and
+        MINX of T3[v] * 0.5 C0.0001. Where the formula engine computes it --
+        IF, ROUND, ABS, ADDCOLUMNS, CALCULATE(SUM(...)) * 0.5, a row of
+        CONCATENATEX -- the product is the count's (_cur_arith): 2 counts,
+        C0.002. Currency / Integer is the count's in both (b_se_list_div,
+        b_se_basic cell 2: SUMX(T3, T3[v] / 2) C0.002), except by a zero:
+        the storage engine's quotient is out of the Currency range
+        (build_b248c.py d_div0_se_raw: SUMX(T3, T3[v] / (T3[id] - 1)) fails
+        with "The result of a conversion or arithmetic operation is either
+        too large or too small.", _cur_arith), where the formula engine's is
+        "Division by zero was encountered.". Only an expression that reads a
+        Fixed Decimal column and multiplies or divides can differ, so any
+        other costs a test or two (#318).
+
+        ``table_expr`` is the iterated table's text: one the storage engine
+        scans (_se_table).
+
+        An IF whose condition is a constant is the branch it takes
+        (_se_constant_branch): Power BI Desktop 2.152 (build_b248g.py
+        p_fe_div0_iter) fails SUMX(T3, IF(TRUE(), T3[v] / (T3[id] - 1)))
+        with the storage engine's range message at the query, not with the
+        formula engine's "Division by zero was encountered."."""
+        if not ctx._cur_tcols or ('*' not in row_expr and '/' not in row_expr) or not rows:
+            return False
+        # the rows of one model table (RELATEDTABLE's carry no __row__), the
+        # table expression one the storage engine scans (_se_table)
+        first = rows[0]
+        if not (type(first) is dict and '__parts__' not in first):
+            return False
+        table = first.get('__table__')
+        if not isinstance(table, str) or not self._se_table(table_expr, table, ctx):
+            return False
+        # memoized on the model-wide cache (a droppable entry), with the
+        # measures it was read against (a bare [name] may be one); the cache
+        # starts over when the model's Currency columns change (_currency_tcols)
+        cache = ctx._filter_idx_cache
+        key = ('se-shape', table, row_expr)
+        hit = cache.get(key)
+        if hit is None or hit[0] is not ctx.measures:
+            hit = (ctx.measures, self._se_shape(row_expr, table, ctx, {}, 0) is True)
+            _put_filter_entry(cache, key, hit, 1)
+        return hit[1]
+
+    def _se_filter_value_space(self, cond_expr: str, rows, ctx: DAXContext, table_expr: str) -> bool:
+        """_se_value_space for FILTER's condition: a comparison (or && / ||
+        of comparisons) of such expressions. Desktop 2.152 (build_b254b.py
+        b_se_aggs): COUNTROWS(FILTER(T3, T3[v] * 0.5 = 0.0001)) is 10, = 0.0002
+        0 -- the product is 1 count."""
+        if not ctx._cur_tcols or ('*' not in cond_expr and '/' not in cond_expr) or not rows:
+            return False
+        first = rows[0]
+        if not (type(first) is dict and '__parts__' not in first):
+            return False
+        table = first.get('__table__')
+        if not isinstance(table, str) or not self._se_table(table_expr, table, ctx):
+            return False
+        cache = ctx._filter_idx_cache
+        key = ('se-shape', table, '?' + cond_expr)
+        hit = cache.get(key)
+        if hit is None or hit[0] is not ctx.measures:
+            hit = (ctx.measures, self._se_condition(cond_expr, table, ctx, 0) is True)
+            _put_filter_entry(cache, key, hit, 1)
+        return hit[1]
+
+    def _se_table(self, table_expr: str, table: str, ctx: DAXContext) -> bool:
+        """Is ``table_expr``, an iteration's table, one the storage engine
+        scans: the model table ``table`` itself, ALL of it, RELATEDTABLE of
+        it, CALCULATETABLE of such a table (with any filters), a FILTER of
+        one, or a VAR holding one? The shapes Power BI Desktop 2.152 was
+        measured to push down (build_b254b.py b_se_basic, b_se_aggs:
+        SUMX(T3, ...), SUMX(FILTER(T3, T3[d] > 0), ...), COUNTROWS(FILTER(T3,
+        ...)); b_se_list: CALCULATE(SUMX(TR, ...), ...); build_b248c.py
+        d_se_tables: SUMX(ALL(T3), T3[v] * 0.5), SUMX(CALCULATETABLE(T3), ..),
+        SUMX(D3, SUMX(RELATEDTABLE(T3), ..)) and VAR t = T3 RETURN SUMX(t, ..)
+        are C0.001, the values' product; d_se_div: SUMX(CALCULATETABLE(T3,
+        T3[id] > 0), ..) too; #318). A table the formula
+        engine builds first -- TOPN, SAMPLE, FILTER(TOPN(..)) (d_se_tables:
+        C0.002, the counts'), ADDCOLUMNS (b_se_shapes cell 6), a CROSSJOIN --
+        is iterated by the formula engine, so its rows take Currency * Double
+        on the counts."""
+        e = table_expr
+        scope = self._current_var_scope
+        for _ in range(16):
+            e = e.strip()
+            plan = _PLAN_CACHE.get(e) or _analyze_expr(e)
+            kind, data = plan[0]
+            if kind == _P_PAREN:
+                e = data
+                continue
+            if kind == _P_FUNC:
+                fname = data[0]
+                args = self._split_args(data[1])
+                if fname == 'FILTER':
+                    if len(args) != 2:
+                        return False
+                elif fname == 'CALCULATETABLE':
+                    if not args:
+                        return False
+                elif fname in ('ALL', 'RELATEDTABLE', 'ALLSELECTED', 'ALLNOBLANKROW'):
+                    # of the table itself, not of some of its columns
+                    # (build_b248g.py p_se_tables: SUMX(ALLSELECTED(T3),
+                    # T3[v] * 0.5) and SUMX(ALLNOBLANKROW(T3), ..) are
+                    # C0.001, the values' product, as ALL's)
+                    if len(args) != 1 or '[' in args[0]:
+                        return False
+                else:
+                    return False
+                e = args[0]
+                continue
+            if len(e) > 1 and e[0] == "'" and e[-1] == "'":
+                e = e[1:-1].replace("''", "'")
+            elif kind != _P_MAYBEVAR:
+                return False
+            elif scope:
+                # a VAR in scope holding a table: its expression decides
+                v = scope.get(e)
+                if v is None:
+                    v = next((x for k, x in scope.items() if k.lower() == e.lower()), None)
+                if v is not None:
+                    if not isinstance(v, _LazyVar):
+                        return False
+                    e, scope = v.expr, v.scope
+                    continue
+            return ctx.model_table(e) == table
+        return False
+
+    def _se_condition(self, cond: str, table: str, ctx: DAXContext, depth: int):
+        """True when ``cond`` compares storage-engine shaped expressions one
+        of which reads a Fixed Decimal column, False when they read none,
+        None when it is no such condition."""
+        if depth > 32:
+            return None
+        plan = _PLAN_CACHE.get(cond) or _analyze_expr(cond)
+        kind, data = plan[0]
+        if kind == _P_PAREN:
+            return self._se_condition(data, table, ctx, depth + 1)
+        if kind == _P_LOGICAL:
+            out = False
+            for part in data[1]:
+                got = self._se_condition(part, table, ctx, depth + 1)
+                if got is None:
+                    return None
+                out = out or got
+            return out
+        if kind != _P_CMP:
+            return None
+        split = DAXEngine._cmp_split(data)       # a chain groups left to right (#274)
+        if split:
+            a = self._se_shape(split[1], table, ctx, {}, depth + 1)
+            b = self._se_shape(split[2], table, ctx, {}, depth + 1)
+            if a is None or b is None:
+                return None
+            return a or b
+        return None
+
+    def _se_shape(self, expr: str, table: str, ctx: DAXContext, env: dict, depth: int):
+        """None when ``expr`` is not storage-engine shaped (see
+        _se_value_space), else whether it reads a Fixed Decimal column of
+        ``table``. ``env`` maps the VAR names in scope to the same."""
+        if depth > 32:
+            return None
+        plan = _PLAN_CACHE.get(expr) or _analyze_expr(expr)
+        kind, data = plan[0]
+        if kind == _P_CONST:
+            return False if type(data) in (int, float) else None
+        if kind in (_P_PAREN, _P_NEG):
+            return self._se_shape(data, table, ctx, env, depth + 1)
+        if kind == _P_BINARY:
+            out = False
+            for part in data[1]:
+                got = self._se_shape(part, table, ctx, env, depth + 1)
+                if got is None:
+                    return None
+                out = out or got
+            return out
+        if kind == _P_TCOL or kind in (_P_BRACKET1, _P_BRACKET2):
+            if kind == _P_TCOL:
+                t, c = data
+                if t != table and ctx.model_table(t) != table:
+                    return None
+            else:
+                c = data
+                if self._measure_exists(c, ctx):
+                    return None
+            tbl = ctx.tables.get(table)
+            if not isinstance(tbl, dict):
+                return None
+            ci = ctx._find_col_idx(tbl.get('columns') or [], c)
+            if ci < 0:
+                return None
+            return (table, tbl['columns'][ci]) in ctx._cur_tcols
+        if kind == _P_FUNC and data[0] == 'RELATED':
+            # a column of a table the iterated one reaches: the storage
+            # engine joins it (Power BI Desktop 2.152, build_b248c.py
+            # d_se_div: SUMX(T3, T3[v] * RELATED(D3[p])) is C0.001, the
+            # values' product; #318)
+            ref = self._parse_column_ref(data[1])
+            if ref is None:
+                return None
+            t2 = ctx.model_table(ref[0])
+            tbl2 = ctx.tables.get(t2)
+            if t2 == table or not isinstance(tbl2, dict):
+                return None
+            ci = ctx._find_col_idx(tbl2.get('columns') or [], ref[1])
+            if ci < 0:
+                return None
+            return (t2, tbl2['columns'][ci]) in ctx._cur_tcols
+        if kind == _P_FUNC and data[0] == 'IF':
+            # a constant condition: the branch it takes, folded before the
+            # scan (build_b248g.py p_fe_div0_iter, see _se_value_space); a
+            # condition that reads anything leaves the formula engine's
+            # (build_b254b.py b_se_shapes: C0.002)
+            args = self._split_args(data[1])
+            if not 2 <= len(args) <= 3:
+                return None
+            taken = self._se_constant_branch(args, ctx)
+            if taken is None:
+                return None
+            return self._se_shape(args[taken], table, ctx, env, depth + 1) if taken else False
+        if kind == _P_MAYBEVAR:
+            return env.get(data.lower())
+        if kind == _P_VARRET:
+            decls, ret = _var_block_parts(_collapse_ws_outside_strings(data))
+            env2 = dict(env)
+            for name, vexpr in decls:
+                if name is None:
+                    return None
+                got = self._se_shape(vexpr.strip(), table, ctx, env2, depth + 1)
+                if got is None:
+                    return None
+                env2[name.strip().lower()] = got
+            if not ret:
+                return None
+            return self._se_shape(ret.strip(), table, ctx, env2, depth + 1)
+        return None
+
+    # ---- the static number type of an expression (#320) ----
+    # IF / SWITCH / COALESCE type their result from every branch, as Desktop
+    # does (Power BI Desktop 2.152, build_b254b.py c_if, c_coalesce;
+    # build_b257b.py if_unify ...): an Int64 beside a Double branch is a
+    # Double, beside a Currency a Currency, a Currency beside a Double a
+    # Double. The engine evaluates one branch, so the others are typed from
+    # their text: 'I' Int64, 'C' Currency, 'D' Double, 'B' BLANK, 'S' text,
+    # 'L' TRUE / FALSE, 'T' a date, 'V' a Variant (an IF / SWITCH / COALESCE
+    # mixing a number with another type, _branch_static_type), None unknown.
+
+    _STATIC_FN_TYPES = {
+        **{f: 'I' for f in ('COUNT', 'COUNTA', 'COUNTAX', 'COUNTX', 'COUNTBLANK', 'COUNTROWS',
+                            'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK', 'APPROXIMATEDISTINCTCOUNT', 'LEN',
+                            'FIND', 'SEARCH', 'YEAR', 'MONTH', 'DAY', 'HOUR', 'MINUTE', 'SECOND',
+                            'WEEKDAY', 'WEEKNUM', 'QUARTER', 'RANKX', 'ROWNUMBER', 'RANK', 'DATEDIFF',
+                            'SIGN', 'UNICODE')},
+        **{f: 'D' for f in ('POWER', 'SQRT', 'EXP', 'LN', 'LOG', 'LOG10', 'PI', 'RAND', 'VALUE',
+                            'PRODUCT', 'PRODUCTX')},
+        **{f: 'S' for f in ('FORMAT', 'CONCATENATE', 'CONCATENATEX', 'LEFT', 'RIGHT', 'MID', 'UPPER',
+                            'LOWER', 'TRIM', 'SUBSTITUTE', 'REPLACE', 'REPT', 'FIXED', 'COMBINEVALUES',
+                            'UNICHAR')},
+        **{f: 'T' for f in ('DATE', 'TIME', 'NOW', 'TODAY', 'UTCNOW', 'EDATE', 'EOMONTH', 'DATEVALUE',
+                            'TIMEVALUE')},
+        **{f: 'L' for f in ('ISBLANK', 'ISERROR', 'ISNUMBER', 'ISTEXT', 'ISNONTEXT', 'ISLOGICAL', 'AND',
+                            'OR', 'NOT', 'CONTAINS', 'CONTAINSROW', 'CONTAINSSTRING', 'ISFILTERED',
+                            'ISCROSSFILTERED', 'HASONEVALUE', 'HASONEFILTER', 'ISINSCOPE', 'TRUE',
+                            'FALSE', 'ISEVEN', 'ISODD', 'EXACT')},
+        'CURRENCY': 'C', 'BLANK': 'B',
+    }
+    # the result is the type of this argument (index), as given
+    _STATIC_FN_ARG = {'SUMX': 1, 'MINX': 1, 'MAXX': 1, 'CALCULATE': 0, 'SUM': 0, 'SELECTEDVALUE': 0,
+                      'LOOKUPVALUE': 0, 'RELATED': 0, 'FIRSTNONBLANKVALUE': 1, 'LASTNONBLANKVALUE': 1}
+    # a Currency stays one, a Double one (an Int64 unknown)
+    _STATIC_FN_KEEP = frozenset({'ABS', 'ROUND', 'ROUNDUP', 'ROUNDDOWN', 'TRUNC', 'FLOOR', 'CEILING',
+                                 'MROUND'})
+
+    def _static_type(self, expr: str, ctx: DAXContext, env: Optional[dict] = None,
+                     depth: int = 0, stack: frozenset = frozenset()):
+        """The number type ``expr`` has, read from its text and the model
+        (see above); None when unknown."""
+        if depth > 24:
+            return None
+        expr = expr.strip()
+        if not expr:
+            return None
+        plan = _PLAN_CACHE.get(expr) or _analyze_expr(expr)
+        kind, data = plan[0]
+        rec = self._static_type
+        if kind == _P_CONST:
+            ct = type(data)
+            return 'L' if ct is bool else 'I' if ct is int else 'D' if ct is float else 'S' if ct is str else None
+        if kind == _P_PAREN:
+            return rec(data, ctx, env, depth + 1, stack)
+        if kind == _P_NEG:
+            t = rec(data, ctx, env, depth + 1, stack)
+            return t if t in ('I', 'C', 'D', 'B') else None
+        if kind == _P_POW:
+            return 'D'
+        if kind == _P_BINARY:
+            # a mix of one precedence level carries one operator per part
+            # after the first (_left_assoc_split): typed with ONE operator,
+            # a + b - c and a * b / c were no type at all
+            # (#331)
+            op, parts = data
+            ops = op if type(op) is tuple else itertools.repeat(op)
+            acc = rec(parts[0], ctx, env, depth + 1, stack)
+            for o, part in zip(ops, parts[1:]):
+                acc = _arith_type(o, acc, rec(part, ctx, env, depth + 1, stack))
+            return acc
+        if kind in (_P_IN, _P_CMP, _P_LOGICAL, _P_NOT):
+            return 'L'
+        if kind == _P_CONCAT:
+            return 'S'
+        if kind == _P_TCOL:
+            return self._col_num_type(ctx, data[0], data[1])
+        if kind in (_P_BRACKET1, _P_BRACKET2):
+            name = data
+            if self._measure_exists(name, ctx):
+                m = name if name in ctx.measures else next(
+                    (k for k in ctx.measures if k.lower() == name.lower()), name)
+                if m in stack:
+                    return None
+                # memoized per measure (a droppable entry): measures that
+                # share measures would type them again and again
+                text = ctx.measures.get(m)
+                if not isinstance(text, str):
+                    return None
+                cache = ctx._filter_idx_cache
+                key = ('static-mtype', m)
+                hit = cache.get(key)
+                if hit is None or hit[0] is not ctx.measures:
+                    hit = (ctx.measures, rec(text, ctx, None, depth + 1, stack | {m}))
+                    _put_filter_entry(cache, key, hit, 1)
+                return hit[1]
+            col = self._resolve_bare_column(name, ctx)
+            if isinstance(col, tuple) and len(col) == 2:
+                return self._col_num_type(ctx, col[0], col[1])
+            return None
+        if kind == _P_MAYBEVAR:
+            return (env or {}).get(data.lower())
+        if kind == _P_VARRET:
+            decls, ret = _var_block_parts(_collapse_ws_outside_strings(data))
+            env2 = dict(env or {})
+            for name, vexpr in decls:
+                if name is not None:
+                    env2[name.strip().lower()] = rec(vexpr, ctx, env2, depth + 1, stack)
+            return rec(ret, ctx, env2, depth + 1, stack) if ret else None
+        if kind == _P_FUNC:
+            fname, args_text = data
+            fixed = self._STATIC_FN_TYPES.get(fname)
+            if fixed is not None:
+                return fixed
+            args = self._split_args(args_text)
+            if fname in self._STATIC_FN_ARG:
+                i = self._STATIC_FN_ARG[fname]
+                return rec(args[i], ctx, env, depth + 1, stack) if len(args) > i else None
+            if fname == 'CONVERT' and len(args) == 2:
+                return {'INTEGER': 'I', 'INT64': 'I', 'DOUBLE': 'D', 'CURRENCY': 'C', 'DECIMAL': 'C',
+                        'STRING': 'S', 'BOOLEAN': 'L', 'DATETIME': 'T'}.get(args[1].strip().upper())
+            if fname in ('MIN', 'MAX'):
+                types = [rec(a, ctx, env, depth + 1, stack) for a in args[:2]]
+                return types[0] if len(types) == 1 else _unify_num_types(types)
+            if fname in ('AVERAGE', 'AVERAGEA', 'AVERAGEX', 'MEDIAN', 'MEDIANX'):
+                i = 1 if fname.endswith('X') else 0
+                t = rec(args[i], ctx, env, depth + 1, stack) if len(args) > i else None
+                return 'C' if t == 'C' else ('D' if fname.startswith('AVERAGE') and t in ('I', 'D') else None)
+            if fname == 'DIVIDE' and len(args) >= 2:
+                return _arith_type('/', rec(args[0], ctx, env, depth + 1, stack),
+                                   rec(args[1], ctx, env, depth + 1, stack))
+            if fname == 'INT' and args:
+                return 'C' if rec(args[0], ctx, env, depth + 1, stack) == 'C' else 'I'
+            if fname in self._STATIC_FN_KEEP and args:
+                t = rec(args[0], ctx, env, depth + 1, stack)
+                if fname in ('CEILING', 'FLOOR') and t in ('I', 'D') and len(args) > 1:
+                    # typed as the significance: CEILING(2.5, 1) and
+                    # CEILING(5, 2) are Int64s (Power BI Desktop 2.152,
+                    # build_b257c.py j_type_ceiling_*; #333)
+                    ts = rec(args[1], ctx, env, depth + 1, stack)
+                    return ts if ts in ('I', 'D', 'C') else None
+                if t == 'I' and fname in ('ROUND', 'ROUNDUP', 'ROUNDDOWN', 'TRUNC'):
+                    # an Int64 stays one at any digits: ROUND(5, 0),
+                    # ROUNDUP(5, 0), TRUNC(5) (build_b257c.py j_type_round_int,
+                    # ...), ROUND(5, 2), ROUNDUP(5, 1), TRUNC(5, 1)
+                    # (build_b257d.py j_type_round_int2, ...)
+                    return 'I'
+                return t if t in ('C', 'D') else ('I' if fname == 'ABS' and t == 'I' else None)
+            # a Variant ('V') when a branch is no number beside a number
+            # (_branch_static_type; build_b248c.py f_if_types)
+            if fname in ('IF', 'IF.EAGER') and len(args) >= 2:
+                return _branch_static_type([rec(a, ctx, env, depth + 1, stack) for a in args[1:3]])
+            if fname == 'SWITCH' and len(args) >= 3:
+                res = list(args[2::2])
+                if len(args) % 2 == 0:
+                    res.append(args[-1])
+                return _branch_static_type([rec(a, ctx, env, depth + 1, stack) for a in res])
+            if fname == 'COALESCE':
+                return _branch_static_type([rec(a, ctx, env, depth + 1, stack) for a in args])
+            return None
+        return None
+
+    @staticmethod
+    def _col_num_type(ctx: DAXContext, table, column):
+        """A model column's type for _static_type: 'C' for a Fixed Decimal
+        column, else from its first non-BLANK cell ('I' an Int64, 'D' a
+        Double, 'S' text, 'L' TRUE / FALSE, 'T' a date); None when unknown.
+        On the model-wide cache (a structural entry, one per column)."""
+        tbl = ctx.tables.get(table)
+        if tbl is None and isinstance(table, str):
+            table = ctx.model_table(table)
+            tbl = ctx.tables.get(table)
+        if not isinstance(tbl, dict):
+            return None
+        cols = tbl.get('columns') or []
+        i = ctx._find_col_idx(cols, column)
+        if i < 0:
+            return None
+        if (table, cols[i]) in ctx._cur_tcols:
+            return 'C'
+        cache = ctx._filter_idx_cache
+        key = (id(tbl), 'col-numtype', i)
+        hit = cache.get(key, _MISSING)
+        if hit is _MISSING:
+            v = next((r[i] for r in (tbl.get('rows') or []) if len(r) > i and r[i] is not None), None)
+            t = type(v)
+            hit = ('L' if t is bool else 'I' if t is int else 'D' if t is float else 'S' if t is str
+                   else 'T' if isinstance(v, (datetime, date)) else None)
+            cache[key] = hit
+        return hit
+
+    def _unify_entry(self, kind: str, args_str: str, args: list, ctx: DAXContext) -> tuple:
+        """``(best, idents, kinds)`` for IF / SWITCH / COALESCE (``kind``)
+        over ``args``: ``best`` the type every result branch's _static_type
+        unifies to ('D', 'C' or None -- None for a Variant too,
+        _unify_branch_types), ``idents`` the branches that are bare names (a
+        VAR of the enclosing block is typed when the call runs,
+        _branch_num_type), ``kinds`` the other branches' known types.
+
+        Memoized per call text on the MODEL's filter cache, a dict per kind
+        (_UNIFY_MEMO_SLOTS, cleared past _UNIFY_MEMO_MAX entries and when the
+        cache starts over), with the measures it was typed against. A call
+        whose Int64 result nothing can change -- no Double, Currency or VAR
+        branch -- is memoized as those measures themselves: _fn_if,
+        _fn_switch and _fn_coalesce read the memo inline and return such a
+        result on one dict hit and one identity test (an iteration asks once
+        per row; the two calls to _unify_result and _branch_num_type cost
+        SUMX(P, COALESCE(P[k], 0)) a tenth more on a model without a
+        Currency column). Never on the engine: the module's engine lives as
+        long as its thread, across models, and a memo there that held a
+        model's objects kept a closed model's tables alive (review of
+        #320); the model's own cache goes with the model."""
+        memo: Optional[dict] = getattr(ctx._filter_idx_cache, _UNIFY_MEMO_SLOTS[kind], None)
+        if memo is None:              # a cache of no model (no slots): not memoized
+            memo = {}
+        hit = memo.get(args_str)
+        if hit is ctx.measures:
+            return None, (), _NO_COLUMNS
+        if type(hit) is tuple and hit[0] is ctx.measures:
+            return hit[1], hit[2], hit[3]
+        if kind == 'IF':
+            branches = args[1:3]
+        elif kind == 'SWITCH':
+            branches = list(args[2::2])
+            if len(args) % 2 == 0:
+                branches.append(args[-1])
+        else:
+            branches = list(args)
+        types: list = []
+        names: list = []
+        for b in branches:
+            b = b.strip()
+            if _IDENT_RE.match(b) and b.upper() not in ('TRUE', 'FALSE'):
+                names.append(b)
+            else:
+                types.append(self._static_type(b, ctx))
+        # a branch that is no number beside a number: a Variant, nothing is
+        # converted (_unify_branch_types)
+        best = _unify_branch_types(types)
+        kinds = frozenset(t for t in types if t is not None)
+        if len(memo) >= _UNIFY_MEMO_MAX:
+            memo.clear()
+        memo[args_str] = ctx.measures if best is None and not names else (ctx.measures, best, tuple(names), kinds)
+        return best, tuple(names), kinds
+
+    def _branch_num_type(self, kind: str, args_str: str, args: list, ctx: DAXContext):
+        """The type IF / SWITCH / COALESCE (``kind``) unify a number result
+        to: 'D', 'C' or None -- from every result branch's _static_type
+        (_unify_entry, memoized per model). A branch that is a VAR of the
+        enclosing block is typed from its value or its expression (not
+        memoized); text, TRUE / FALSE or a date there makes the call a
+        Variant beside a number (_unify_branch_types)."""
+        best, idents, kinds = self._unify_entry(kind, args_str, args, ctx)
+        if idents:
+            scope = self._current_var_scope or {}
+            types: Optional[set] = None
+            for name in idents:
+                v = scope.get(name)
+                if v is None:
+                    v = next((x for k, x in scope.items() if k.lower() == name.lower()), None)
+                if isinstance(v, _LazyVar):
+                    if v.state == 2:
+                        val = v.value
+                        tv = type(val)
+                        t = 'I' if tv is int else 'D' if tv is float else _value_static_type(val)
+                    else:
+                        t = self._static_type(v.expr, ctx) if v.state == 0 else None
+                elif v is not None:
+                    t = _value_static_type(v)
+                else:
+                    continue
+                # a type that changes nothing: unknown, BLANK, the best type
+                # itself, or a number beside a Double (an iteration asks per row)
+                if t is None or t == 'B' or t == best or (best == 'D' and t in _NUM_KINDS):
+                    continue
+                if types is None:
+                    types = set(kinds)
+                types.add(t)
+            if types is not None:
+                best = _unify_branch_types(types)
+        return best
+
+    def _unify_result(self, value, kind: str, args_str: str, args: list, ctx: DAXContext):
+        """``value``, IF's / SWITCH's / COALESCE's chosen number, converted to
+        the type every branch unifies to (_branch_num_type): an Int64 or a
+        Currency beside a Double branch is a Double, an Int64 beside a
+        Currency branch a Currency. Power BI Desktop 2.152 (build_b254b.py
+        c_if: IF(TRUE(), CURRENCY(1.5), 2.5) is D1.5, IF(FALSE(),
+        CURRENCY(1.5), 2) C2, IF(TRUE(), 1, 2.5) D1, IF(TRUE(), [h_cur],
+        [h_dbl]) D1.5, IF(TRUE(), CURRENCY(1.5), "x") C1.5; c_coalesce:
+        COALESCE(1, 2.5) D1, COALESCE(BLANK(), 1, CURRENCY(2)) C1,
+        SWITCH(TRUE(), TRUE(), 1, 2.5) D1; build_b257b.py if_unify,
+        if_unify_col, switch_unify, coalesce_unify: 9007199254740993 beside
+        a Double branch is the Double 9007199254740992;
+        #320). Text, dates, TRUE / FALSE and BLANK are left
+        as they are."""
+        t = type(value)
+        if t is not int and t is not _Currency:
+            return value
+        # a memoized type without VAR branches is read here, as the callers
+        # read a kept one: SUMX(P, SWITCH(P[m], 1, P[k], 2, P[w], 0)) unifies
+        # six rows in seven, and the calls to _branch_num_type and
+        # _unify_entry cost it a twentieth more
+        hit = getattr(ctx._filter_idx_cache, _UNIFY_MEMO_SLOTS[kind], _EMPTY_MEMO).get(args_str)
+        if type(hit) is tuple and hit[0] is ctx.measures and not hit[2]:
+            best = hit[1]
+        else:
+            best = self._branch_num_type(kind, args_str, args, ctx)
+        if best == 'D':
+            return float(value)
+        if best == 'C' and t is int:
+            return _cur_from_value(value)
+        return value
+
     def _fn_sum(self, args_str: str, ctx: DAXContext) -> Any:
         col = self._parse_column_ref(args_str)
         if col is not None:
@@ -10089,6 +14815,9 @@ class DAXEngine:
             col = ref if isinstance(ref, tuple) and len(ref) == 2 else None
         if not col:
             return None
+        # a Fixed Decimal column's extremum is a Currency (issue #248; Desktop
+        # 2.152, build_b254.py a_col: MIN(TCur3[v]) is C0.1, MAX C0.2)
+        cur = self._currency_column(col, ctx)
 
         def extremum(data):
             values = self._comparable_values(data)
@@ -10097,7 +14826,10 @@ class DAXEngine:
             if not values:
                 return None
             # text in the model's collation (Desktop: MIN "_x", MAX "Zeta"; #157)
-            return pick(values, key=_text_key) if isinstance(values[0], str) else pick(values)
+            if isinstance(values[0], str):
+                return pick(values, key=_text_key)
+            got = pick(values)
+            return _Currency(got) if cur and type(got) is float else got
 
         kind = 'MIN' if pick is min else 'MAX' if pick is max else None
         if kind is None:
@@ -10107,11 +14839,50 @@ class DAXEngine:
     @staticmethod
     def _minmax_pair(a, b, pick):
         """Two-argument form. Compares dates and text as well as numbers, but
-        never across incompatible types; text in the model's collation."""
+        never across incompatible types; text in the model's collation.
+
+        Two numbers unify their types as IF's branches do, and a BLANK beside
+        a number is 0 -- returned as BLANK when it is the answer. Power BI
+        Desktop 2.152 (build_b254b.py c_coalesce: MIN(1, 2.5) is D1, MAX(2,
+        0.5) D2, MIN(CURRENCY(2.5), 2) C2; build_b254.py f_minmax:
+        MAX(CURRENCY(1.5), 0.25) D1.5; c_minmax_blank: MAX(CURRENCY(0.1),
+        BLANK()) C0.1, MAX(1, BLANK()) I1, MIN(1, BLANK()) BLANK, MIN(BLANK(),
+        -1) I-1, MAX(BLANK(), -1) BLANK; #319,
+        #320). Any BLANK was BLANK, and each number kept
+        its own type. So an Int64 beside a Double is a Double
+        (#325, _num_meet): build_b257.py m_pair_id answers
+        MAX(9007199254740993, 9007199254740992.0) - 9007199254740992 with 0,
+        we answered 1."""
+        ta = type(a)
+        if ta is type(b) and (ta is int or ta is float):
+            # two numbers of one type: nothing to unify (the usual MIN(T[k], 100))
+            return pick(a, b)
+        num_a = isinstance(a, (int, float)) and not isinstance(a, bool)
+        num_b = isinstance(b, (int, float)) and not isinstance(b, bool)
+        if (num_a and (num_b or b is None)) or (num_b and a is None):
+            # BLANK as 0; on a tie the number wins, in either order (Power BI
+            # Desktop 2.152, build_b248c.py c_minmax_tie: MIN(0, BLANK()),
+            # MIN(BLANK(), 0), MAX(0, BLANK()) and MAX(BLANK(), 0) are I0,
+            # MIN(0.0, BLANK()) D0, MIN(CURRENCY(0), BLANK()) C0); the first
+            # argument won, so MIN(BLANK(), 0) was BLANK
+            if b is None:
+                return a if ((a <= 0) if pick is min else (a >= 0)) else None
+            if a is None:
+                return b if ((b <= 0) if pick is min else (b >= 0)) else None
+            best = _unify_num_types([_value_num_type(a), _value_num_type(b)])
+            if best == 'D':
+                a, b = float(a), float(b)
+            elif best == 'C':
+                a, b = _cur_from_value(a), _cur_from_value(b)
+            return pick(a, b)
         for kinds in ((int, float), (datetime, date), (str,)):
             if isinstance(a, kinds) and isinstance(b, kinds) \
                     and not isinstance(a, bool) and not isinstance(b, bool):
-                return pick(a, b, key=_text_key) if kinds == (str,) else pick(a, b)
+                if kinds == (str,):
+                    return pick(a, b, key=_text_key)
+                if kinds == (int, float):
+                    return pick(*_num_meet(a, b))
+                return pick(a, b)
         return None
 
     def _fn_min(self, args_str: str, ctx: DAXContext) -> Any:
@@ -10180,6 +14951,805 @@ class DAXEngine:
             col = ref
         return self._column_aggregate('COUNTA', col, ctx, _agg_count)
 
+    # ---- Desktop's storage-engine sums (issue #243, pbix_mcp.dax.se_scan) ----
+
+    def _aggregate_scan(self, kind: str, col: tuple, actx: DAXContext, compute,
+                        values: Optional[list] = None) -> Any:
+        """``compute`` of column ``col``'s visible values in actx (the scan
+        _column_aggregate memoizes). SUM and AVERAGE of a column that is not
+        Currency add as Power BI Desktop's storage engine adds it
+        (_se_column_total): along the column's storage layout, so the sum of
+        ten rows of 0.1 is 0.9999999999999999 (build_b210.py f_sum10_bits
+        -11.102230246251565) and Agents' SUM(FactSales[SalesAmount]) -
+        729782919 is 0.215398073196411 (build_b243.py a_total), where the
+        correctly rounded sum of 0.9.147 (issue #246) gave 1 and
+        0.21539998054504395. AVERAGE is that sum over the count (av_sa)."""
+        if compute is _agg_sum or compute is _agg_average:
+            got = self._se_column_total(actx, col, values)
+            if got is not _MISSING:
+                total, n = got
+                if not n:
+                    return None
+                return total if compute is _agg_sum else total / n
+        return compute(actx.get_column_data(*col) if values is None else values)
+
+    def _se_column_total(self, actx: DAXContext, col: tuple, values: Optional[list] = None) -> Any:
+        """``(total, count)`` of column ``col``'s numbers visible in actx, as
+        Desktop's storage engine adds them (_se_total), or _MISSING when the
+        column does not resolve to a table's column."""
+        tname = col[0] if col[0] in actx.tables else actx.model_table(col[0])
+        tbl = actx.tables.get(tname)
+        if not isinstance(tbl, dict) or not tbl.get('columns'):
+            return _MISSING
+        cols = tbl['columns']
+        idx = actx._find_col_idx(cols, col[1])
+        if idx < 0:
+            return _MISSING
+        if values is None and tname == col[0]:
+            vals, positions = actx.get_column_data_at(tname, col[1])
+        else:
+            vals = actx.get_column_data(*col) if values is None else values
+            positions = actx.get_row_positions(tname)
+        if len(vals) != (len(tbl.get('rows') or ()) if positions is None else len(positions)):
+            return _MISSING
+        return self._se_total(actx, tname, tbl, (cols[idx],), vals, positions, cols[idx])
+
+    def _se_total(self, ctx: DAXContext, tname: str, tbl: dict, own: tuple, vals: list,
+                  positions: Optional[list], column: Optional[str] = None,
+                  where_extra: frozenset = frozenset(), fuse: bool = True,
+                  const: bool = False) -> tuple:
+        """``(total, count)`` of the numbers ``vals`` -- the values at the
+        sorted storage ``positions`` of tbl's rows (None: every row) of the
+        columns ``own`` or of an expression over them -- as one scan of
+        Desktop's storage engine adds them (se_scan.scan_sum): along the
+        pieces of the runs of ``own``, of the columns ctx's filters name
+        (DAXContext.se_scan_columns, plus ``where_extra``) and of the
+        aggregations it scans with them (_se_fused, when ``fuse``), grouped
+        when an iteration's filter names a column. ``column``: ``vals`` are
+        that column's own values, so a value-encoded column adds its stored
+        integers exactly (Root Cause rc_sum_profit 0.0216999999829568).
+        ``const``: ``vals`` are an expression that reads no column (``own``
+        is empty), added chunk by chunk as value x count (se_scan rule 5).
+        Whole numbers add exactly in any order; a total of no number is
+        None."""
+        kinds = set(map(type, vals))
+        blank = type(None) in kinds
+        kinds.discard(type(None))
+        if not kinds:
+            return None, 0
+        if kinds <= _INT_KINDS:
+            nums = [v for v in vals if v is not None] if blank else vals
+            return sum(nums), len(nums)
+        numeric = all(issubclass(k, (int, float)) for k in kinds)
+        if column is not None and numeric:
+            enc, mag = _se_scan.column_encoding(tbl, column)
+            if enc == 'value':
+                nums = [v for v in vals if v is not None] if blank else vals
+                return _se_scan.exact_total(nums, enc, mag), len(nums)
+        si = tbl.get('storage_index')
+        if si is not None:
+            positions = list(si) if positions is None else [si[i] for i in positions]
+        if ctx._outer_ctx is not None:
+            # a row context reads its rows under the row root's filters
+            ctx = ctx._row_root()
+        where, group = ctx.se_scan_columns(tname, tbl)
+        if si is not None:
+            where = where | (tbl.get('scan_where') or _NO_COLUMNS)
+            group = group | (tbl.get('scan_group') or _NO_COLUMNS)
+        cut = where | where_extra
+        if fuse:
+            cut = cut | self._se_fused(ctx, tname)
+        pieces = self._se_pieces(ctx, tbl, own, cut, group)
+        if const:
+            # every row's value the same (a constant reads nothing); else fold
+            const = len(set(v for v in vals if v is not None)) == 1
+        return _se_scan.scan_sum(pieces, positions, vals, bool(group), numeric and not blank, const)
+
+    @staticmethod
+    def _se_pieces(ctx: DAXContext, tbl: dict, own: tuple, cut: frozenset, group: frozenset):
+        """se_scan.build_pieces, memoized on the model's cache (kind
+        'se-pieces', weighed and dropped as any entry a query names: one per
+        combination of columns scanned together)."""
+        cut = cut - frozenset(own)
+        if 'storage_index' in tbl:
+            # a bucket of evaluate_per_dimension: its mapping's cache lives
+            # for one bucket, the pieces are its parent's
+            return _se_scan.bucket_pieces(tbl, own, cut, group)
+        key = (id(tbl), 'se-pieces', own, cut, group)
+        cache = ctx._filter_idx_cache
+        hit = cache.get(key)
+        if hit is None:
+            hit = _se_scan.build_pieces(tbl, own, tuple(sorted(cut)), tuple(sorted(group)))
+            _put_filter_entry(cache, key, hit, 4 + len(cut) + len(group) + hit.weight())
+        return hit
+
+    def _se_scope(self, expr: str, ctx: DAXContext, home: Optional[str] = None) -> dict:
+        """``{table: columns}``: what the aggregations of ``expr`` that
+        Desktop's storage engine scans together read -- the aggregations of
+        one table evaluated in the filter context ``expr`` itself is
+        evaluated in (issue #339). ``home``: the table of the
+        measure ``expr`` belongs to, which a bare ``[column]`` names
+        (SUM([v]) in a measure of T is SUM(T[v])).
+
+        Power BI Desktop 2.152 (build_b243b.py, Agents FactSales): SUM(SA) +
+        SUM(TC) cuts each sum at the other column's runs too (fu_sa_tc
+        0.445394039154053, where two scans give 0.445398...), and so does
+        [Total Sales] + [Total Discount] through measures (fu_meas), an Int64
+        SUM beside (fu_sa_sq) and SUMX(SA - TC) beside SUM(DA) (fu_prof_da);
+        the census's DIVIDE([Profit], [Total Sales]) is one scan of SA and TC
+        (fu_pm, a_profit_split 0.985394060611725). COUNTROWS reads no column
+        (fu_sa_cnt), and a SUM under another filter is another scan
+        (fu_sa_tc_f).
+
+        A cheap static reading, cached per expression: SUM, AVERAGE, AVERAGEA
+        and COUNT of a column, and SUMX / AVERAGEX over a bare table (the
+        columns of that table its expression reads, RELATED's join column
+        among them), found in ``expr`` and in the measures it references,
+        through any scalar function (IF, DIVIDE, VAR, SELECTEDVALUE's
+        alternate result, arithmetic, ...) and a CALCULATE without filters.
+        Not looked into: a CALCULATE with filters, an iterator's expression,
+        a table function's arguments (_SE_OPAQUE_CALLS) -- each of those is a
+        scan of its own, read when it is evaluated (CALCULATE and
+        evaluate_measure open their scopes; so do TOTALYTD & co.,
+        _se_eval_scoped, and each group of SUMMARIZE / SUMMARIZECOLUMNS, over
+        all its extension columns, _se_extensions_scope). A measure
+        referenced where this reading does not look joins its own scope to
+        the one in force (_se_inherit).
+
+        Power BI Desktop 2.152 (build_b243c.py, Agents): COUNT beside a sum
+        is scanned with it (f_count) and MIN / MAX / DISTINCTCOUNT are not
+        (f_min, f_max, f_dc: answered without a scan where no filter
+        applies; under a filter not probed); an IF whose condition is a
+        constant scans the branch it takes only (f_if_true, f_if_false,
+        _se_constant_branch); SELECTEDVALUE's alternate result is scanned
+        with the rest (s_sel_alt, s_sel_meas); the extension columns of one
+        SUMMARIZECOLUMNS are one scan (f_sc_two).
+
+        build_b243d.py (Agents): COUNTA is scanned as COUNT (f_counta); MIN
+        and MAX are scanned with the rest under a filter (f_min_f, f_max_f:
+        _SE_MINMAX, _se_fused), DISTINCTCOUNT is not (f_dc_f); an IF whose
+        condition reads the data scans its condition here and each branch
+        as a scan of its own (f_if_dyn, f_if_cond, f_if_sib; _fn_if); the
+        columns of one ROW are one scan (f_row_two, _fn_row), and so are the
+        transitions of one ADDCOLUMNS row (f_addcols, _fn_addcolumns). Not
+        probed: MIN / MAX in a grouped scan without a WHERE (not scanned),
+        whether a data-reading IF's condition is scanned with the sums
+        beside the IF (it is), SWITCH (all its arguments read), an
+        aggregation under a filter that happens to leave the context
+        unchanged (not fused with the outer ones), and the expressions of
+        calculated columns and tables (calc_tables), which open no scope.
+        pbix_evaluate_dax evaluates each measure it is given as a query of
+        its own, as a card shows it: the measures of one visual are one
+        query to Desktop, scanned together like f_sc_two's columns."""
+        scope: dict = self._se_scope_entry(expr, ctx, home)[0]
+        return scope
+
+    def _se_scope_entry(self, expr: str, ctx: DAXContext, home: Optional[str] = None) -> tuple:
+        """``(scope, reach)``: _se_scope of ``expr``, and every model table
+        its evaluation can name -- in any argument, in the measures it
+        references at any depth, and the home tables of those measures --
+        or None for reach when the text could not be read. ``reach`` bounds
+        the tables a nested measure's value can depend on through a scope
+        it inherits (_se_inherit)."""
+        # On the model's cache (kind 'se-scope', weighed and dropped as any
+        # entry), with the measures dict it was read from -- held, so its id
+        # stays its own -- and the texts of the measures it read: a measure
+        # changed in place is read again. The home table is part of the key:
+        # SUM([v]) reads T[v] in a measure of T and nothing in a measure of
+        # no table.
+        cache = ctx._filter_idx_cache
+        # the relationships decide what RELATED reads (#344)
+        key = ('se-scope', expr, home, ctx._rels_sig, ctx.date_table, ctx.date_column)
+        measures = ctx.measures
+        held = cache.get(key)
+        if held is not None and held[0] is measures and (not held[1] or all(
+                measures.get(n) is t or measures.get(n) == t for n, t in held[1])):
+            entry: tuple = held[2]
+            return entry
+        found: dict = {}
+        visited: dict = {}
+        named: set = set()
+        reach: Optional[set] = named
+        try:
+            self._se_scope_walk(expr, ctx, found, set(), home, 0, visited)
+            self._se_reach_walk(expr, ctx, named, set(), home, 0, visited)
+        except (RecursionError, ValueError, TypeError):
+            found = {}
+            reach = None
+        scope = {t: frozenset(c) for t, c in found.items() if c}
+        entry = (scope, None if reach is None else frozenset(reach))
+        _put_filter_entry(cache, key, (measures, tuple(visited.items()), entry),
+                          4 + (len(expr) >> 6) + len(visited)
+                          + sum(map(len, scope.values())) + len(entry[1] or ()))
+        return entry
+
+    def _se_scope_walk(self, text: str, ctx: DAXContext, found: dict, visiting: set,
+                       home: Optional[str], depth: int, visited: Optional[dict] = None) -> None:
+        """_se_scope's reading of ``text`` (``home``: the table of the measure
+        it belongs to, for a bare [column]; ``visited``: the measures read,
+        with their texts)."""
+        if depth > 64:
+            return
+        for kind, name, rest in _se_items(text):
+            if kind == 'ref':
+                table = name
+                mname = rest
+                if table is None or self._se_column(ctx, table, mname) is None:
+                    real = self._se_measure_name(mname, ctx)
+                    if real is not None and real not in visiting:
+                        # read once: what a measure adds to the scope does
+                        # not depend on the path that reached it
+                        visiting.add(real)
+                        body = ctx.measures.get(real) or ''
+                        if visited is not None:
+                            visited[real] = body
+                        self._se_scope_walk(body, ctx, found, visiting,
+                                            ctx.measure_tables.get(real), depth + 1, visited)
+                continue
+            if kind != 'call':
+                continue
+            if name in ('SUM', 'AVERAGE', 'AVERAGEA', 'COUNT', 'COUNTA'):
+                col = self._se_arg_column(rest.strip(), ctx, home)
+                if col is not None:
+                    found.setdefault(col[0], set()).add(col[1])
+            elif name in ('MIN', 'MAX'):
+                # under a filter only (_SE_MINMAX); MIN(a, b) of two values
+                # reads no column of its own
+                col = self._se_arg_column(rest.strip(), ctx, home)
+                if col is not None:
+                    found.setdefault(col[0] + _SE_MINMAX, set()).add(col[1])
+            elif name == 'IF':
+                # a condition that is a constant leaves the other branch
+                # unscanned (build_b243c.py f_if_true / f_if_false); one that
+                # reads the data is scanned here, and each branch is a scan of
+                # its own, opened when it is evaluated (_fn_if; build_b243d.py
+                # f_if_dyn, f_if_cond, f_if_sib)
+                args = self._split_args(rest)
+                taken = self._se_constant_branch(args, ctx) if len(args) >= 2 else None
+                if taken is None:
+                    self._se_scope_walk(args[0], ctx, found, visiting, home, depth + 1, visited)
+                elif taken:
+                    self._se_scope_walk(args[taken], ctx, found, visiting, home, depth + 1, visited)
+            elif name in ('SUMX', 'AVERAGEX'):
+                args = self._split_args(rest)
+                if len(args) == 2:
+                    tname = self._se_bare_table(args[0], ctx)
+                    if tname is not None:
+                        cols = self._se_expr_columns(args[1], tname, ctx, strict=False)
+                        if cols:
+                            found.setdefault(tname, set()).update(cols)
+            elif name == 'CALCULATE':
+                args = self._split_args(rest)
+                if len(args) == 1:
+                    self._se_scope_walk(args[0], ctx, found, visiting, home, depth + 1, visited)
+            elif name not in _SE_OPAQUE_CALLS:
+                self._se_scope_walk(rest, ctx, found, visiting, home, depth + 1, visited)
+
+    # what a constant condition may be written with: literals, comparisons
+    # and these (_se_constant_branch)
+    _SE_CONST_WORDS = frozenset({'TRUE', 'FALSE', 'NOT', 'AND', 'OR'})
+
+    def _se_constant_branch(self, args: list, ctx: DAXContext) -> Optional[int]:
+        """Which argument of IF(args) is evaluated when its condition is a
+        constant -- 1 (TRUE), 2 (FALSE, an else branch), 0 (FALSE, none) --
+        or None when the condition reads anything (a column, a measure, a
+        variable, a function of the context).
+
+        Power BI Desktop 2.152 (build_b243c.py, Agents FactSales): IF(1 = 1,
+        SUM(SalesAmount), SUM(TotalCost)) - 729782919 is 0.215398073196411,
+        the sum scanned alone (a_total), and so is IF(1 = 0, SUM(TotalCost),
+        SUM(SalesAmount)); reading both branches cut it at TotalCost's runs
+        (0.2153940200805664, fu_sa_tc's value). With a condition that is not
+        a constant each branch is a scan of its own (build_b243d.py f_if_dyn,
+        f_if_cond, f_if_sib; _fn_if; #339)."""
+        cond = args[0].strip()
+        if not self._se_is_constant(cond, 0):
+            return None
+        try:
+            value = self._eval_expr(cond, ctx)
+        except Exception:      # noqa: BLE001 -- not a value: read as before
+            return None
+        if not isinstance(value, (bool, int, float)):
+            return None
+        if value:
+            return 1
+        return 2 if len(args) > 2 else 0
+
+    @classmethod
+    def _se_is_constant(cls, text: str, depth: int) -> bool:
+        """Is ``text`` written with literals, operators, TRUE / FALSE and
+        NOT / AND / OR of such only?"""
+        if depth > 16:
+            return False
+        for kind, name, rest in _se_items(text):
+            if kind == 'word':
+                if name not in cls._SE_CONST_WORDS:
+                    return False
+            elif kind != 'call' or name not in cls._SE_CONST_WORDS or not cls._se_is_constant(rest, depth + 1):
+                return False
+        return True
+
+    def _se_reach_walk(self, text: str, ctx: DAXContext, reach: set, seen: set,
+                       home: Optional[str], depth: int, visited: dict) -> None:
+        """_se_scope_entry's ``reach``: every model table ``text`` names --
+        ``T[c]``, ``'T'``, a bare table name, the home table of a bare
+        ``[column]`` -- in any argument of any call, and through the
+        measures it references (each read once, with its own home)."""
+        if depth > 64:
+            raise ValueError('too deep')
+        for kind, name, rest in _se_items(text):
+            if kind == 'call':
+                self._se_reach_walk(rest, ctx, reach, seen, home, depth + 1, visited)
+                continue
+            if kind == 'ref':
+                if name is not None:
+                    got = self._se_column(ctx, name, rest)
+                    if got is not None:
+                        reach.add(got[0])
+                        continue
+                    tname = name if name in ctx.tables else ctx.model_table(name)
+                    if isinstance(ctx.tables.get(tname), dict):
+                        reach.add(tname)
+                real = self._se_measure_name(rest, ctx)
+                if real is not None:
+                    if real not in seen:
+                        seen.add(real)
+                        body = ctx.measures.get(real) or ''
+                        visited[real] = body
+                        self._se_reach_walk(body, ctx, reach, seen,
+                                            ctx.measure_tables.get(real), depth + 1, visited)
+                elif name is None and home is not None:
+                    reach.add(home)
+                continue
+            if kind == 'table' or kind == 'word':
+                # a quoted or bare table name (a word comes upper-cased:
+                # model_table reads names case-insensitively)
+                tname = name if name in ctx.tables else ctx.model_table(name)
+                if isinstance(ctx.tables.get(tname), dict):
+                    reach.add(tname)
+
+    def _se_measure_name(self, name: str, ctx: DAXContext) -> Optional[str]:
+        """The model's spelling of measure ``name``, or None."""
+        if name in ctx.measures:
+            return name
+        low = name.lower()
+        for m in ctx.measures:
+            if m.lower() == low:
+                found: str = m
+                return found
+        return None
+
+    @staticmethod
+    def _se_column(ctx: DAXContext, table: str, col: str) -> Optional[tuple]:
+        """(canonical table, canonical column) of ``table[col]``, or None."""
+        tname = table if table in ctx.tables else ctx.model_table(table)
+        tbl = ctx.tables.get(tname)
+        if not isinstance(tbl, dict):
+            return None
+        cols = tbl.get('columns') or []
+        i = ctx._find_col_idx(cols, col)
+        return (tname, cols[i]) if i >= 0 else None
+
+    def _se_arg_column(self, arg: str, ctx: DAXContext, home: Optional[str]) -> Optional[tuple]:
+        """The (table, column) a SUM-like argument names: ``T[c]``, or a bare
+        ``[c]`` of the home table that no measure claims."""
+        items = _se_items(arg)
+        if len(items) != 1 or items[0][0] != 'ref':
+            return None
+        _k, table, col = items[0]
+        if table is None:
+            if home is None or self._se_measure_name(col, ctx) is not None:
+                return None
+            table = home
+        return self._se_column(ctx, table, col)
+
+    @staticmethod
+    def _se_bare_table(arg: str, ctx: DAXContext) -> Optional[str]:
+        """The model table a bare table argument (``T`` or ``'T'``) names."""
+        s = arg.strip()
+        if len(s) > 1 and s[0] == s[-1] == "'":
+            name = s[1:-1].replace("''", "'")
+        elif _IDENT_RE.match(s):
+            name = s
+        else:
+            return None
+        tname = name if name in ctx.tables else ctx.model_table(name)
+        return tname if isinstance(ctx.tables.get(tname), dict) else None
+
+    def _se_expr_columns(self, expr: str, tname: str, ctx: DAXContext,
+                         strict: bool = True) -> Optional[tuple]:
+        """The columns of table tname that a row expression reads, in order;
+        None when ``strict`` and it reads anything else -- another table's
+        column, a measure, a variable or a function that is no function of
+        the row's own values (_SE_ROW_FUNCS)."""
+        cols: list = []
+        for kind, name, rest in _se_items(expr):
+            if kind == 'ref':
+                table = name
+                col = rest
+                if table is not None:
+                    got = self._se_column(ctx, table, col)
+                    if got is None or got[0] != tname:
+                        if strict:
+                            return None
+                        continue
+                else:
+                    if self._se_measure_name(col, ctx) is not None:
+                        if strict:
+                            return None
+                        continue
+                    got = self._se_column(ctx, tname, col)
+                    if got is None:
+                        if strict:
+                            return None
+                        continue
+                if got[1] not in cols:
+                    cols.append(got[1])
+            elif kind == 'call' and name == 'RELATED':
+                # another table's column, read through tname's join column
+                # toward it (#344, _se_related_column)
+                join = self._se_related_column(rest, tname, ctx)
+                if join is None:
+                    if strict:
+                        return None
+                    continue
+                if join not in cols:
+                    cols.append(join)
+            elif kind == 'call':
+                if name not in _SE_ROW_FUNCS:
+                    if strict:
+                        return None
+                    continue
+                inner = self._se_expr_columns(rest, tname, ctx, strict)
+                if inner is None:
+                    return None
+                cols.extend(c for c in inner if c not in cols)
+            elif kind == 'table' or (kind == 'word' and strict and name not in
+                                     ('TRUE', 'FALSE', 'BLANK', 'AND', 'OR', 'NOT', 'IN')):
+                if strict:
+                    return None
+        return tuple(cols)
+
+    def _se_related_column(self, arg: str, tname: str, ctx: DAXContext) -> Optional[str]:
+        """The column of table tname that RELATED(arg) reads in a scan of
+        tname: its join column toward the table of ``arg`` (the last hop of
+        the path, as a filter on that table reaches tname;
+        DAXContext._se_join_column), or None -- not one column of another
+        table, or no path.
+
+        Power BI Desktop 2.152 (build_b243c.py, Agents FactSales):
+        SUMX(FactSales, SalesAmount * RELATED(DimChannel[ChannelKey])) adds
+        over the pieces of SalesAmount and channelKey (x_related
+        0.972300052642822; folded row by row 0.972441), and
+        SUMX(FILTER(FactSales, RELATED(DimStore[StoreKey]) <> 0), SalesAmount)
+        is cut at FactSales[StoreKey]'s runs, as a CALCULATE filter on
+        DimStore is (r_filter_related 0.215399503707886 = af_dimstore;
+        #344)."""
+        items = _se_items(arg)
+        if len(items) != 1 or items[0][0] != 'ref' or items[0][1] is None:
+            return None
+        got = self._se_column(ctx, items[0][1], items[0][2])
+        if got is None or got[0] == tname:
+            return None
+        tbl = ctx.tables.get(tname)
+        if not isinstance(tbl, dict):
+            return None
+        return ctx._se_join_column(tname, tbl, got[0])
+
+    def _se_rows_filter_cut(self, text: str, ctx: DAXContext) -> Optional[tuple]:
+        """``(table, columns)`` for a CALCULATE table filter FILTER(<T, ALL(T)
+        or such a FILTER>, <condition>): the columns of T its conditions read
+        -- the join column for what they read through RELATED -- which a
+        scan of T reads for its rows (_SeRowsValues, #344); None
+        for any other filter, or a condition that reads anything else (a
+        measure, a variable, a function of the context), whose scan is not
+        measured. Memoized on the model's cache (kind 'se-rows-cut', with
+        the measures dict it was read against: a bare [name] may be one)."""
+        cache = ctx._filter_idx_cache
+        key = ('se-rows-cut', text, ctx._rels_sig, ctx.date_table, ctx.date_column)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is ctx.measures:
+            held: Optional[tuple] = hit[1]
+            return held
+        got = None
+        try:
+            got = self._se_rows_filter_cut_uncached(text, ctx)
+        except (RecursionError, ValueError, TypeError):
+            got = None
+        _put_filter_entry(cache, key, (ctx.measures, got),
+                          4 + (len(text) >> 6) + (len(got[1]) if got is not None else 0))
+        return got
+
+    def _se_rows_filter_cut_uncached(self, text: str, ctx: DAXContext) -> Optional[tuple]:
+        conds: list = []
+        arg = text.strip()
+        tname = None
+        for _ in range(16):
+            tname = self._se_bare_table(arg, ctx)
+            if tname is not None:
+                break
+            items = _se_items(arg)
+            if len(items) != 1 or items[0][0] != 'call':
+                return None
+            fn = items[0][1]
+            parts = self._split_args(items[0][2])
+            if fn == 'FILTER' and len(parts) == 2:
+                conds.append(parts[1])
+                arg = parts[0].strip()
+                continue
+            if fn == 'ALL' and len(parts) == 1:
+                tname = self._se_bare_table(parts[0], ctx)
+            break
+        if tname is None or not conds:
+            return None
+        cut: set = set()
+        for cond in conds:
+            cols = self._se_expr_columns(cond, tname, ctx)
+            if cols is None:
+                return None
+            cut.update(cols)
+        return tname, frozenset(cut)
+
+    def _se_iter_plan(self, table_arg: str, row_expr: str, ctx: DAXContext) -> Optional[tuple]:
+        """How SUMX / AVERAGEX(table_arg, row_expr) adds as Desktop's storage
+        engine does, or None (it adds left to right in the rows' order, as
+        before): ``(table, columns the expression reads, columns its FILTERs
+        read, whether a FILTER is in the way, whether the expression is one
+        bare column)``. The table may be a bare model table, FILTER(<such a
+        table>, <condition>) -- nested too -- or CALCULATETABLE of one; the
+        expression must read that table's columns and nothing else
+        (_se_expr_columns) -- another table's through RELATED, which reads
+        the join column (_se_related_column) -- or no column at all (a
+        constant: ``columns`` is empty). Power BI Desktop 2.152
+        (build_b243b.py): every such expression adds over the pieces of the
+        columns it reads, an IF included (x_if), and a FILTER's condition
+        cuts them as a CALCULATE filter would (x_filter 0.215399503707886);
+        build_b243c.py x_related, r_filter_related, x_const."""
+        # on the model's cache (kind 'se-plan', weighed by its texts and
+        # columns -- not by the measures dict it holds), with the measures
+        # dict it was read against, held so its id stays its own
+        cache = ctx._filter_idx_cache
+        # the relationships decide what RELATED reads (#344)
+        key = ('se-plan', table_arg, row_expr, ctx._rels_sig, ctx.date_table, ctx.date_column)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is ctx.measures:
+            held: Optional[tuple] = hit[1]
+            return held
+        plan = None
+        try:
+            plan = self._se_iter_plan_uncached(table_arg, row_expr, ctx)
+        except (RecursionError, ValueError, TypeError):
+            plan = None
+        _put_filter_entry(cache, key, (ctx.measures, plan),
+                          4 + ((len(table_arg) + len(row_expr)) >> 6)
+                          + (len(plan[1]) + len(plan[2]) if plan is not None else 0))
+        return plan
+
+    def _se_iter_plan_uncached(self, table_arg: str, row_expr: str, ctx: DAXContext) -> Optional[tuple]:
+        pred_cols: list = []
+        filtered = False
+        arg = table_arg.strip()
+        tname = None
+        for _ in range(16):
+            tname = self._se_bare_table(arg, ctx)
+            if tname is not None:
+                break
+            items = _se_items(arg)
+            if len(items) != 1 or items[0][0] != 'call' or items[0][1] not in ('FILTER', 'CALCULATETABLE'):
+                return None
+            parts = self._split_args(items[0][2])
+            if len(parts) < 2:
+                return None
+            if items[0][1] == 'FILTER':
+                filtered = True
+                pred_cols.append(parts[1])
+            arg = parts[0].strip()
+        if tname is None:
+            return None
+        own = self._se_expr_columns(row_expr, tname, ctx)
+        if own is None:
+            return None
+        # No column read (SUMX(T, 0.1)): a constant, added chunk by chunk as
+        # value x count (se_scan rule 5, #343). A condition cuts
+        # at the columns of the table it reads, and at the join column of
+        # what it reads of another table through RELATED (r_filter_related,
+        # _se_related_column).
+        cut: set = set()
+        for pred in pred_cols:
+            cut.update(self._se_expr_columns(pred, tname, ctx, strict=False) or ())
+        # the expression is the column and nothing else: T[c], 'T'[c] or [c]
+        expr = row_expr.strip()
+        bare = len(own) == 1 and bool(_WHOLE_TCOL_RE.match(expr) or _SE_BARE_REF_RE.match(expr))
+        return tname, own, frozenset(cut), filtered, bare
+
+    def _se_iter_table(self, table_arg: str, plan: Optional[tuple], ctx: DAXContext) -> tuple:
+        """``(rows, probe)``: the iterator's table, evaluated so that its rows
+        of the plan's table are known by storage position (_se_probe_rows)
+        when there is a plan."""
+        if plan is None:
+            return self._eval_expr(table_arg.strip(), ctx), None
+        probe: tuple = (plan[0], {})
+        prev = self._se_probe
+        self._se_probe = probe
+        try:
+            rows = self._eval_expr(table_arg.strip(), ctx)
+        finally:
+            self._se_probe = prev
+        return rows, probe
+
+    def _se_iter_column(self, plan: Optional[tuple], probe: Optional[tuple], rows: Any,
+                        ctx: DAXContext) -> Any:
+        """``(total, count)`` of SUMX / AVERAGEX of one bare column of its
+        table's own rows (_se_iter_plan), read straight off the rows -- the
+        values the iteration would evaluate to, row by row -- or _MISSING:
+        no such plan, no number, or a value the iteration treats otherwise
+        (a date, text: the iteration decides) or a Currency column (#241)."""
+        if plan is None or probe is None or not plan[4] or not isinstance(rows, list) or not rows:
+            return _MISSING
+        name = plan[1][0]
+        if self._currency_column((plan[0], name), ctx):
+            return _MISSING
+        try:
+            vals = list(map(operator.itemgetter(name), rows))
+        except (KeyError, TypeError):
+            return _MISSING
+        if not all(issubclass(t, (int, float)) or t is type(None) for t in set(map(type, vals))):
+            return _MISSING
+        got = self._se_iter_total(plan, probe, rows, vals, ctx)
+        if got is _MISSING or not got[1]:
+            return _MISSING
+        return got
+
+    def _se_iter_total(self, plan: tuple, probe: tuple, rows: list, results: list,
+                       ctx: DAXContext) -> Any:
+        """``(total, count)`` of an iterator's ``results`` (one per row of
+        ``rows``) as Desktop's storage engine adds them over the pieces of
+        the plan's columns (_se_total), or _MISSING when a row is not one
+        the probe recorded (a blank row, a row of another evaluation).
+
+        Power BI Desktop 2.152: SUMX(T, T[r]) is SUM(T[r]) (build_b243.py
+        x_r_N = s_r_N at every size; a_total_sumx), SUMX(FactSales,
+        FactSales[SalesAmount] - FactSales[TotalCost]) 414617394.985398292541504
+        (a_profit), an expression over one RLE piece adds expr(v) x k
+        (x_run_mul), and over a value-encoded column it adds Doubles
+        (rc_sumx_mul) where the column alone adds its integers
+        (rc_sumx_profit)."""
+        tname, own, pred_cols, filtered, bare = plan
+        rec = probe[1]
+        lists = rec.get('lists')
+        if not lists:
+            return _MISSING
+        made, ectx = lists[0]
+        at = rec['pos']
+        if ectx._outer_ctx is not None:
+            ectx = ectx._row_root()
+        tbl = ectx.tables.get(tname)
+        if not isinstance(tbl, dict) or not rows:
+            return _MISSING
+        pos: Optional[list]
+        if rows is made:
+            # the table itself, its rows in storage order: every row when
+            # nothing filters it
+            pos = None if type(at) is range and len(at) == len(tbl.get('rows') or ()) else list(at)
+        else:
+            # a FILTER (or a CALCULATETABLE) of its rows: which ones
+            picked = set(map(id, rows))
+            keep = list(map(picked.__contains__, map(id, made)))
+            if len(picked) == len(rows):
+                # FILTER and CALCULATETABLE (the only tables _se_iter_plan
+                # admits) keep the rows' order
+                pos = list(compress(at, keep))
+                if len(pos) != len(rows):
+                    return _MISSING
+            else:
+                index = {id(d): i for i, d in enumerate(made)}
+                pos = []
+                get = index.get
+                for r in rows:
+                    i = get(id(r))
+                    if i is None:
+                        return _MISSING
+                    pos.append(at[i])
+            if any(map(operator.ge, pos, pos[1:])):
+                order = sorted(range(len(pos)), key=pos.__getitem__)
+                pos = [pos[i] for i in order]
+                if any(map(operator.ge, pos, pos[1:])):
+                    return _MISSING
+                results = [results[i] for i in order]
+        return self._se_total(ectx, tname, tbl, own, results, pos, own[0] if bare else None,
+                              pred_cols, fuse=not filtered, const=not own)
+
+    def _se_inherit(self, measure_name: str, ctx: DAXContext, wide: bool) -> Optional[tuple]:
+        """``(scope, token)`` for a measure evaluated under another one's
+        scope that holds in ctx (_se_holds): the scope its aggregations are
+        scanned with -- the scope in force, joined with the measure's own
+        (_se_scope with its home table), so a sum the outer reading did not
+        reach (an argument of SELECTEDVALUE, say) still fuses with its
+        siblings -- and what of it makes the measure's value differ from its
+        value on its own, part of the measure memo's key (#339).
+
+        The value can differ only in the tables its evaluation can name
+        (_se_scope_entry's reach; every table of the scope when it could
+        not be read, or ``wide``: a calculation group may stand an item's
+        expression in for the body), and only where the scope's columns
+        are not the measure's own: a measure memoized under a scope keyed
+        by less made the answers depend on the order of the evaluations
+        (SUM([v]) in a measure of T, read without its home table, kept its
+        fused value under the key of its value on its own)."""
+        fuse = ctx._se_fuse
+        if fuse is None:
+            return None
+        owner, mapping = fuse
+        own, reach = self._se_scope_entry(ctx.measures.get(measure_name) or '', ctx,
+                                          ctx.measure_tables.get(measure_name))
+        scope = mapping
+        for t, cols in own.items():
+            have = mapping.get(t)
+            if have is None or not cols <= have:
+                if scope is mapping:
+                    scope = dict(mapping)
+                scope[t] = cols if have is None else (have | cols)
+        tables = set(own)
+        if wide or reach is None:
+            tables.update(scope)
+        else:
+            tables.update(t for t in scope if t.split(_SE_MINMAX, 1)[0] in reach)
+        tok = tuple(sorted((t, tuple(sorted(scope.get(t, _NO_COLUMNS))))
+                           for t in tables if scope.get(t, _NO_COLUMNS) != own.get(t, _NO_COLUMNS)))
+        return (owner, scope), tok
+
+    @staticmethod
+    def _se_holds(ctx: DAXContext) -> bool:
+        """Does the scope in force (DAXContext._se_fuse) hold in ctx: are its
+        filters those of the context that opened it? The same table under
+        another filter is another scan (Power BI Desktop 2.152,
+        build_b243b.py fu_sa_tc_f), and a context whose filters changed on
+        the way down (TOTALYTD, ...) left its scope behind."""
+        fuse = ctx._se_fuse
+        if fuse is None:
+            return False
+        owner = fuse[0]
+        if owner is ctx or owner._filter_context is ctx._filter_context:
+            return True
+        try:
+            return bool(owner._filters_sig() == ctx._filters_sig()
+                        and owner._no_prop_keys == ctx._no_prop_keys
+                        and owner._rels_sig == ctx._rels_sig)
+        except TypeError:
+            return False
+
+    def _se_fused(self, ctx: DAXContext, tname: str) -> frozenset:
+        """The columns of tname that Desktop's storage engine scans together
+        with an aggregation evaluated in ctx (_se_scope), or none: the scope
+        in force, while it holds (_se_holds)."""
+        fuse = ctx._se_fuse
+        if fuse is None:
+            return _NO_COLUMNS
+        mapping = fuse[1]
+        cols: Optional[frozenset] = mapping.get(tname)
+        mm: Optional[frozenset] = mapping.get(tname + _SE_MINMAX) if mapping else None
+        if not cols and not mm:
+            return _NO_COLUMNS
+        owner = fuse[0]
+        if owner is ctx or owner._filter_context is ctx._filter_context or self._se_holds(ctx):
+            if mm:
+                # MIN / MAX are scanned where the scan has a filter (_SE_MINMAX)
+                tbl = ctx.tables.get(tname)
+                if isinstance(tbl, dict) and ctx.se_scan_columns(tname, tbl)[0]:
+                    return mm if not cols else (cols | mm)
+            return cols or _NO_COLUMNS
+        return _NO_COLUMNS
+
+    def _se_fused_beyond(self, ctx: DAXContext, tname: str, column: str) -> frozenset:
+        """_se_fused without ``column``, the aggregated one: what of the scope
+        cuts its sum (_se_pieces leaves the sum's own columns out). The memo
+        keys' part, so a sum scanned alone and one whose scope reads no other
+        column of its table share their entries."""
+        cols = self._se_fused(ctx, tname)
+        if column in cols:
+            return _NO_COLUMNS if len(cols) == 1 else cols - {column}
+        return cols
+
     def _column_aggregate(self, kind: str, col: tuple, ctx: DAXContext, compute) -> Any:
         """``compute`` (one of the _agg_* functions, or MIN / MAX) of column
         ``col``'s visible values, memoized on the model-wide cache (issue #231).
@@ -10222,7 +15792,10 @@ class DAXEngine:
                 preds = _predicate_filters(actx.filter_context)
                 key = self._agg_memo_key(actx, kind, tname, tbl, idx, preds)
         if key is None:
-            return compute(actx.get_column_data(*col))
+            return self._aggregate_scan(kind, col, actx, compute)
+        if compute is _agg_sum or compute is _agg_average:
+            # the aggregations scanned together cut the column's pieces (#243)
+            key = key + (self._se_fused_beyond(actx, tname, tbl['columns'][idx]),)
         cache = actx._filter_idx_cache
         hit = cache.get(key)
         if hit is not None:
@@ -10232,8 +15805,8 @@ class DAXEngine:
         if preds and kind in _RANGE_KINDS:
             got, note = self._range_aggregate(kind, actx, tname, tbl, idx, preds)
         if got is _MISSING:
-            got = (compute(actx.get_column_data(*col)) if note is None
-                   else self._range_scan(actx, note, tname, col, compute))
+            got = (self._aggregate_scan(kind, col, actx, compute) if note is None
+                   else self._range_scan(actx, note, tname, col, compute, kind))
         # weighed by its key's filter-set signature (issue #229)
         _put_filter_entry(cache, key, _AGG_BLANK if got is None else got, 3 + actx._filters_sig_weight())
         return got
@@ -10246,10 +15819,9 @@ class DAXEngine:
         ``preds``: _predicate_filters of the filter set, when known.
 
         The DatePartOnly joins are in it although the relationship set
-        decides them: a USERELATIONSHIP context keeps the joins of the set it
-        came from (DAXContext.with_relationships), so two contexts with one
-        relationship set can read the fact rows differently; the memo must
-        not hand one's answer to the other."""
+        decides them -- every context takes those of its own list, the
+        relationships active or not (issue #250) -- so a caller pairing a list
+        with joins of its own cannot share an entry."""
         if preds is None:
             preds = _predicate_filters(ctx.filter_context)
         for _k, spec in preds:
@@ -10293,24 +15865,18 @@ class DAXEngine:
           counted it once for each (the hop takes a union);
         - the D rows' sets of fact rows pairwise disjoint, the blank row's
           included (_range_owners) -- checked, not assumed;
-        - the DatePartOnly joins in force those of the relationship set: a
-          USERELATIONSHIP context keeps the joins of the set it came from
-          (DAXContext.with_relationships), while the base is read through
-          without_filters, which takes the set's own. The base then joined
-          the fact rows of a USERELATIONSHIP over a DatePartOnly relationship
-          by date part and the scan by value: 628 where the scan says 600
-          (dp_userel4.py of the #231 review);
         - no row transition over T's own rows (a filter of T's expanded table
           that the row put there, _ExpansionValues): it names one fact row,
           so its base is asked once, and SUMX(F, CALCULATE(SUM(F[Amt]),
           Cust[CustKey] <= 5)) paid for the attempt and a marker per fact row,
           9% more time and 23% more memory than the scans (mem_rowrt.py);
-        - for a total of Doubles, a window from the first key over fact rows
-          that lie in key order: Desktop adds Doubles in row order, one + per
-          row (#228), and only then are the window's numbers the first ones in
-          row order, whose left fold is held (never a difference of two
-          folds). Whole numbers add exactly in any order and any window.
-          Mixed whole and fractional numbers, NaN and infinities: the scan.
+        - a total of Doubles is the scan's: Desktop's storage engine adds
+          along the column's layout (issue #243), so a window's total is a
+          difference of prefix sums only where every partial sum is exact
+          (_RangePartials 'float', 'value'); otherwise the scan is replayed
+          over the window's rows ('kernel'), with the pieces every window's
+          scan cuts (_range_scan_layout). Whole numbers add exactly in any
+          order and any window. NaN and infinities: the scan.
 
         The base's totals are built only once its scans have paid for them
         many times over (_range_pays), and never on its first request: a
@@ -10326,7 +15892,7 @@ class DAXEngine:
                 rkey = k
         if rkey is None or ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
             return _RANGE_NO
-        if not self._range_joins_current(ctx) or self._range_row_transition(fc, tname):
+        if self._range_row_transition(fc, tname):
             return _RANGE_NO
         dname, sep, xcol = rkey.partition('.')
         if not sep or dname == tname:
@@ -10347,11 +15913,14 @@ class DAXEngine:
         axis: Any = cache.get(akey)
         if owners is _RANGE_UNUSABLE or axis is _RANGE_UNUSABLE:
             return _RANGE_NO
+        # the aggregations scanned with this one cut its pieces (#243)
+        fused = (self._se_fused_beyond(ctx, tname, tbl['columns'][col_idx])
+                 if kind in ('SUM', 'AVERAGE') else _NO_COLUMNS)
         try:
             # the base filter set's signature, as without_filters' context signs it
             base_sig = ctx._filters_sig() - {(rkey, ctx._filters_sigd()[rkey])}
             pkey = (id(tbl), 'range-partials', col_idx, dname, x_idx, base_sig, ctx._rels_sig,
-                    ctx.date_table, ctx.date_column, ctx._date_part_joins)
+                    ctx.date_table, ctx.date_column, ctx._date_part_joins, fused)
             part: Any = cache.get(pkey)
         except (TypeError, KeyError):
             return _RANGE_NO
@@ -10376,7 +15945,8 @@ class DAXEngine:
             if owners is not None and axis is not None:
                 try:
                     part = self._range_partials(ctx, tname, tbl, col_idx, rkey, dname, dtbl,
-                                                owners, axis, len(base_sig))
+                                                owners, axis, len(base_sig),
+                                                self._range_scan_layout(ctx, tname, tbl, col_idx, fused))
                 except (IndexError, TypeError, ValueError):
                     part = _RANGE_UNUSABLE
             _put_filter_entry(cache, pkey, part, 3 + ctx._filters_sig_weight()
@@ -10398,16 +15968,6 @@ class DAXEngine:
             else:
                 lo = max(lo, _RANGE_LOWER[op](keys, num))
         return part.answer(kind, lo, hi, blank), None
-
-    @staticmethod
-    def _range_joins_current(ctx: DAXContext) -> bool:
-        """Are the DatePartOnly joins ctx reads those of its relationship
-        set? Not in a USERELATIONSHIP / CROSSFILTER context, which keeps the
-        joins of the set it came from (DAXContext.with_relationships), while
-        a context derived from it with without_filters -- the route's base --
-        takes the set's own (see _range_aggregate)."""
-        joins = _relationship_indexes(ctx.relationships)[6]
-        return joins is ctx._date_part_joins or joins == ctx._date_part_joins
 
     @staticmethod
     def _range_row_transition(fc: dict, tname: str) -> bool:
@@ -10443,7 +16003,8 @@ class DAXEngine:
             est += n_dim * hop * _RANGE_OWNERS_FACTOR + n_rows * per_row * _RANGE_CLAIM_FACTOR
         return total - first >= _RANGE_BUILD_FACTOR * est
 
-    def _range_scan(self, ctx: DAXContext, note: tuple, tname: str, col: tuple, compute) -> Any:
+    def _range_scan(self, ctx: DAXContext, note: tuple, tname: str, col: tuple, compute,
+                    kind: str = '') -> Any:
         """``compute`` of the column's visible values, the scan as always,
         timed for the base's record ``(scans, seconds in all, seconds of the
         first, least seconds per visible fact row after the cross filter)``
@@ -10467,7 +16028,7 @@ class DAXEngine:
             ctx._get_cross_table_filters(tname)
         t1 = time.perf_counter()
         values = ctx.get_column_data(*col)
-        got = compute(values)
+        got = self._aggregate_scan(kind, col, ctx, compute, values)
         t2 = time.perf_counter()
         cache = ctx._filter_idx_cache
         n, total, first, per_row = cache.get(skey) or (0, 0.0, t2 - t0, math.inf)
@@ -10617,10 +16178,22 @@ class DAXEngine:
         cache[akey] = hit
         return None if hit is _RANGE_UNUSABLE else hit
 
+    def _range_scan_layout(self, ctx: DAXContext, tname: str, tbl: dict, col_idx: int,
+                           fused: frozenset) -> tuple:
+        """``(pieces, grouped, encoding, Magnitude)`` of the scans a running
+        total's windows stand for (issue #243): the same pieces for every
+        window, since the window's filter names the same join column each
+        time (DAXContext.se_scan_columns) and the base's filters are fixed."""
+        name = tbl['columns'][col_idx]
+        where, group = ctx.se_scan_columns(tname, tbl)
+        pieces = self._se_pieces(ctx, tbl, (name,), where | fused, group)
+        enc, mag = _se_scan.column_encoding(tbl, name)
+        return pieces, bool(group), enc, mag
+
     @staticmethod
     def _range_partials(ctx: DAXContext, tname: str, tbl: dict, col_idx: int, rkey: str,
                         dname: str, dtbl: dict, owners: _RangeOwners, axis: _RangeAxis,
-                        nkey: int) -> _RangePartials:
+                        nkey: int, layout: Optional[tuple] = None) -> _RangePartials:
         """The totals of tbl's column col_idx over the T rows the base keeps:
         the filter set without the window ``rkey``.
 
@@ -10656,7 +16229,12 @@ class DAXEngine:
         rows = tbl['rows']
         vals = list(map(operator.itemgetter(col_idx), map(rows.__getitem__, kept)))
         currency = tbl['columns'][col_idx] in (tbl.get('currency_columns') or ())
-        return _RangePartials(axis.keys, pos, vals, nkey, currency)
+        se = None
+        if layout is not None:
+            # the windows' scans, replayed over the kept rows (issue #243)
+            pieces, grouped, enc, mag = layout
+            se = (pieces, kept, grouped, enc, mag)
+        return _RangePartials(axis.keys, pos, vals, nkey, currency, se)
 
     def _num_operand(self, v, ctx: DAXContext):
         """A numeric argument as Desktop's formula engine converts it: BLANK
@@ -10698,6 +16276,22 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
+        if len(args) > 2:
+            # Power BI Desktop 2.152 (build_b255b.py, #270)
+            # refuses an alternate result that is no constant, needed or
+            # not: DIVIDE(1, 1, MOD(1, [m_zero])) (y4) and SUMX(TM,
+            # DIVIDE(TM[z], 1, MOD(TM[n], TM[d]))) (y3) fail with "The
+            # alternate result to return on division by zero must be a
+            # constant numeric value" (its Norwegian, in English), where the
+            # engine evaluated the alternate first and failed on MOD. What
+            # is taken is a constant (_constant_alternate): a literal
+            # (DIVIDE(3, 0, "7") is "7", build_b139.py), CURRENCY(2.5)
+            # (build_b254b.py c_divide), TRUE() and DATE(2020, 1, 1)
+            # (build_b255c.py y17, y18), a VAR (y11); INT(2.5) (y15),
+            # COUNTROWS(TM) (y16) and a measure (y10) are refused, and
+            # IFERROR does not catch the refusal (y12).
+            if not self._divide_alternate_ok(args[2], self._current_var_scope, ctx, 0):
+                raise _uncatchable(_DAXEvaluationError(_DIVIDE_ALT_MSG))
         numerator = self._eval_expr(args[0].strip(), ctx)
         denominator = self._eval_expr(args[1].strip(), ctx)
         # DAX: the alternate result defaults to BLANK (None), not 0.
@@ -10714,15 +16308,85 @@ class DAXEngine:
         # Text, TRUE / FALSE and dates are numbers here (issue #139).
         numerator = self._num_operand(numerator, ctx)
         denominator = self._num_operand(denominator, ctx)
-        if isinstance(numerator, (int, float)) and isinstance(denominator, (int, float)):
-            if denominator == 0:
-                return alt
+        if isinstance(numerator, (int, float)) and (denominator is None or isinstance(denominator, (int, float))):
+            # a BLANK denominator is a zero one: the alternate, of the
+            # division's type (_divide_alternate)
+            if denominator is None or denominator == 0:
+                return self._divide_alternate(
+                    alt, (type(numerator) is _Currency, type(denominator) is _Currency), ctx)
+            # a Currency side is typed as the / operator types it, by
+            # _Currency's operators (issue #248; Desktop 2.152, build_b254.py
+            # t_divide: DIVIDE(CURRENCY(1), 3) is C0.3333, DIVIDE(1,
+            # CURRENCY(3)) a Double)
             return numerator / denominator
         return alt
 
+    def _divide_alternate_ok(self, text: str, scope: Optional[dict], ctx: DAXContext,
+                             depth: int) -> bool:
+        """Is DIVIDE's alternate result ``text`` a constant
+        (_constant_alternate), every name in it a VAR of ``scope`` bound to
+        one -- VAR k = -1 (build_b255c.py y11), not VAR k = [m_zero]
+        (build_b255d.py y23) -- or no table (#270)?"""
+        names = _constant_alternate(text)
+        if names is None:
+            return False
+        for n in names:
+            lv = (scope or {}).get(n)
+            if lv is None and scope:
+                low = n.lower()
+                lv = next((v for k, v in scope.items() if k.lower() == low), None)
+            if lv is None:
+                if _model_table_fast(ctx, n) in ctx.tables:
+                    return False
+            elif isinstance(lv, _LazyVar) and depth < 8 and not self._divide_alternate_ok(
+                    lv.expr, lv.scope, lv.ctx, depth + 1):
+                return False
+        return True
+
+    @staticmethod
+    def _divide_alternate(alt, cur: tuple, ctx: DAXContext):
+        """DIVIDE's alternate result, converted to the division's result
+        type: a Currency over a non-Currency is a Currency (rounded; past the
+        range an error), anything else a Double; text and BLANK stay as they
+        are. Power BI Desktop 2.152 (build_b254b.py c_divide, issue #248):
+        DIVIDE(CURRENCY(1), 0, 2.55555) is C2.5556, DIVIDE(CURRENCY(1), 0,
+        1E16) an error, DIVIDE(1, 0, CURRENCY(2.5)) D2.5; build_b254.py
+        t_divide: DIVIDE(CURRENCY(1), 0, 2.5) C2.5; c_divide_text:
+        DIVIDE(CURRENCY(1), 0, "x") is "x". An Int64 alternate beside a
+        Double division is a Double too (build_b248c.py e_divide_alt:
+        DIVIDE(1, 0, 5) and DIVIDE(1.5, 0, 5) are D5, DIVIDE(CURRENCY(1), 0,
+        5) C5, and TRUE stays TRUE: DIVIDE(1, 0, TRUE()) is L1;
+        #322); it stayed an Int64. A date is a number
+        (#277; build_b255c.py y18: DIVIDE(1, 0, DATE(2020, 1,
+        1)) is 43831, where TRUE() stays TRUE, y17)."""
+        if isinstance(alt, list):
+            alt = _scalarize(alt)
+        if isinstance(alt, (datetime, date)):
+            n = _as_number(alt)
+            return float(n) if n is not None else None
+        if not isinstance(alt, (int, float)) or isinstance(alt, bool):
+            return alt
+        if cur[0] and not cur[1]:
+            return _cur_from_value(alt, getattr(ctx, 'culture', None))
+        return float(alt)
+
     def _fn_abs(self, args_str: str, ctx: DAXContext) -> Any:
         val = self._num_arg(args_str, ctx)
+        if type(val) is _Currency:
+            # a Currency stays one (Power BI Desktop 2.152, build_b254.py
+            # f_math: ABS(CURRENCY(-1.5)) is C1.5; #305);
+            # the least Currency has no positive counterpart, an error where
+            # its negation wraps (build_b248c.py h_abs_min: ABS(CURRENCY(
+            # "-922337203685477.5808")) is an error; build_b254b.py g_ovf)
+            return _cur_make(_cur_checked(abs(_cur_count(val))))
         return abs(val) if isinstance(val, (int, float)) else None
+
+    @staticmethod
+    def _cur_unit(digits) -> int:
+        """The count a Currency rounds to at ``digits`` decimals: 10 ** (4 -
+        digits), 1 from 4 decimals on."""
+        d = int(digits)
+        return 10 ** (4 - d) if d < 4 else 1
 
     def _fn_round(self, args_str: str, ctx: DAXContext) -> Any:
         """ROUND(number, digits) -- half AWAY from zero, on the decimal value
@@ -10730,20 +16394,28 @@ class DAXEngine:
         works on the binary double: ROUND(2.5, 0) was 2, ROUND(1250, -2) 1200
         and ROUND(1.005, 2) 1.0, where DAX gives 3, 1300 and 1.01. Negative
         digits round to tens, hundreds, ... The arithmetic is FORMAT's
-        (_format_number, pinned off Desktop)."""
+        (_format_number, pinned off Desktop). The number is read as its
+        Double's 15-digit decimal (_dec15, #333): Desktop's
+        ROUND(9007199254740993, 0) is 9007199254740990 and ROUND(
+        1.0049999999999997, 2) 1.01, we answered the Int64 itself and 1 (its
+        exact spelling). An Int64 stays an Int64 at any digits
+        (build_b257c.py j_type_round_int: ROUND(5, 0); build_b257d.py
+        j_type_round_int2: ROUND(5, 2))."""
         args = self._split_args(args_str)
         val = self._num_arg(args[0], ctx)
         d = self._num_arg(args[1], ctx) if len(args) > 1 else 0
         digits = int(d) if d is not None else 0
         if not isinstance(val, (int, float)):
             return None
-        try:
-            q = decimal.Decimal(repr(val)).quantize(
-                decimal.Decimal(1).scaleb(-digits), rounding=decimal.ROUND_HALF_UP,
-                context=decimal.Context(prec=60))
-        except (decimal.InvalidOperation, ValueError):
-            return val          # NaN / infinity: nothing to round
-        return int(q) if isinstance(val, int) and digits <= 0 else float(q)
+        if type(val) is _Currency:
+            # a Currency rounds its exact count half away from zero and stays
+            # one (Power BI Desktop 2.152, build_b254.py r_round:
+            # ROUND(CURRENCY(1.005), 2) is C1.01, CURRENCY(2.675) C2.68,
+            # ROUND(CURRENCY(-2.5), 0) C-3; f_round; build_b254b.py f_fns:
+            # ROUND(CURRENCY(1234.5), -1) C1230; #305)
+            unit = self._cur_unit(digits)
+            return _cur_make(_wrap64(_div_half_away(_cur_count(val), unit) * unit))
+        return _round_dec15_half(val, digits)
 
     def _fn_rounddown(self, args_str: str, ctx: DAXContext) -> Any:
         """ROUNDDOWN(number, digits) — toward ZERO, not toward -infinity.
@@ -10759,21 +16431,42 @@ class DAXEngine:
         return self._round_directed(args_str, ctx, up=True)
 
     def _round_directed(self, args_str: str, ctx: DAXContext, up: bool) -> Any:
+        """ROUNDUP / ROUNDDOWN: away from / toward zero, on the number's
+        15-digit decimal (_dec15, _round_dec15_directed, #333):
+        Power BI Desktop 2.152 answers ROUNDUP(9007199254740993, 0) and
+        ROUNDDOWN(9007199254740993, 0) with 9007199254740990 (build_b257b.py
+        z53_roundup, z53_rounddown; we answered 9007199254740992),
+        ROUNDUP(2.0000000001, 0) with 3 and ROUNDUP(0.1 + 0.2, 16) with 0.3
+        (build_b257c.py j_roundup_tiny, j_roundup_sum), where the Double
+        product and its 1e-9 tolerance gave 2 and 0.30000000000000004.
+
+        A Double rounds to a Double: ROUNDUP(1.5, 0) is the Double 2
+        (build_b254b.py f_fns), we answered the Int64 (ROUNDDOWN shares the
+        rule, not measured). An Int64 stays an Int64 at any digits
+        (build_b257c.py j_type_roundup_int; build_b257d.py
+        j_type_roundup_int1: ROUNDUP(5, 1))."""
         args = self._split_args(args_str)
         val = self._num_arg(args[0], ctx)
-        if val is None:
+        if not isinstance(val, (int, float)):
             return None
         digits = 0
         if len(args) > 1:
             n = self._num_arg(args[1], ctx)
             digits = int(n) if n is not None else 0
-        scale = 10.0 ** digits
-        scaled = val * scale
-        # math.floor/ceil on the ABSOLUTE value keeps the direction relative to
-        # zero rather than to the number line.
-        mag = math.ceil(abs(scaled) - 1e-9) if up else math.floor(abs(scaled) + 1e-9)
-        out = math.copysign(mag, scaled) / scale
-        return int(out) if digits <= 0 and float(out).is_integer() else out
+        if type(val) is _Currency:
+            # on the exact count, and a Currency stays one (Power BI Desktop
+            # 2.152, build_b254.py f_round: ROUNDUP(CURRENCY(1.2341), 2) is
+            # C1.24, ROUNDDOWN(CURRENCY(-1.2349), 2) C-1.23;
+            # #305)
+            return self._cur_directed(val, digits, up)
+        return _round_dec15_directed(val, digits, up)
+
+    def _cur_directed(self, val, digits, up: bool):
+        """ROUNDUP / ROUNDDOWN / TRUNC of a Currency at ``digits`` decimals:
+        its count away from / toward zero, a Currency."""
+        n, unit = _cur_count(val), self._cur_unit(digits)
+        mag = -(-abs(n) // unit) * unit if up else (abs(n) // unit) * unit
+        return _cur_make(_wrap64(mag if n >= 0 else -mag))
 
     def _fn_weeknum(self, args_str: str, ctx: DAXContext) -> Any:
         """WEEKNUM(date, [return_type]) — week of year, 1-based.
@@ -10814,6 +16507,18 @@ class DAXEngine:
         val = self._num_arg(args_str, ctx)
         if not isinstance(val, (int, float)):
             return None
+        if type(val) is _Currency:
+            # a Currency stays one (Power BI Desktop 2.152, build_b254.py
+            # f_round: INT(CURRENCY(-1.5)) is C-2; #305)
+            return _cur_make((_cur_count(val) // 10000) * 10000)
+        if type(val) is int and not -_FLOAT_EXACT_INTS <= val <= _FLOAT_EXACT_INTS:
+            # INT works on the Double: Power BI Desktop 2.152 (build_b257b.py
+            # z53_int, #334) gives INT(9007199254740993) -
+            # 9007199254740992 = 0, we answered 1. The result is an Int64.
+            try:
+                return math.floor(float(val))
+            except OverflowError:
+                return val
         return math.floor(val)
 
     def _fn_if(self, args_str: str, ctx: DAXContext) -> Any:
@@ -10821,11 +16526,99 @@ class DAXEngine:
         if len(args) < 2:
             return None
         condition = self._eval_expr(args[0].strip(), ctx)
-        if condition:
-            return self._if_result(self._eval_expr(args[1].strip(), ctx), args[2:3])
-        elif len(args) > 2:
-            return self._if_result(self._eval_expr(args[2].strip(), ctx), args[1:2])
-        return None
+        if not condition and len(args) <= 2:
+            # the omitted else of a TRUE / FALSE IF is FALSE, not BLANK
+            # (#276, _bool_typed_call)
+            return False if self._bool_typed_call('IF', args_str, args, ctx) else None
+        # a branch, for the order SUMX / AVERAGEX add in, where the condition
+        # reads the data (#345; build_b243d.py i_avgx_iftrue:
+        # IF(1 = 1, ...) is none)
+        branch = self._BRANCH_COUNTS.get(args_str)
+        if branch is None:
+            branch = self._branch_counts(args_str, args[:1])
+        self._if_branch += branch
+        # and a scan of its own: the branch's aggregations are not scanned
+        # with the condition's or the ones beside the IF (_se_scope_walk;
+        # build_b243d.py f_if_dyn, f_if_cond, f_if_sib; #339)
+        scoped = (branch and ctx._se_fuse is not None and ctx._outer_ctx is None
+                  and ctx._current_row is None)
+        try:
+            taken = args[1].strip() if condition else args[2].strip()
+            if self._false_blank_branch('IF', taken, args_str, args, ctx):
+                return False         # IF(c, FALSE(), BLANK()) (build_b255d.py b2)
+            value = self._if_result(self._se_eval_scoped(taken, ctx) if scoped else self._eval_expr(taken, ctx),
+                                    args[2:3] if condition else args[1:2])
+        finally:
+            self._if_branch -= branch
+        # typed as every branch types it (#320, _unify_result);
+        # an IF none of whose branches is a Double, a Currency or a VAR -- the
+        # usual IF(c, 1, 0) -- is one dict hit (_unify_entry's memo, inline)
+        t = type(value)
+        if (t is int or t is _Currency) and len(args) > 2:
+            if ctx._filter_idx_cache.unify_if.get(args_str) is ctx.measures:  # type: ignore[attr-defined]
+                return value
+            return self._unify_result(value, 'IF', args_str, args, ctx)
+        return value
+
+    # a branch written as BLANK() (or BLANK), in parentheses or not
+    _BLANK_LITERAL_RE = re.compile(r'(?i)^\(*\s*BLANK\s*(?:\(\s*\))?\s*\)*$')
+    # IF / SWITCH argument texts -> 1 where a condition reads the data, 0
+    # where every condition is a constant (_branch_counts)
+    _BRANCH_COUNTS: dict = {}
+
+    def _branch_counts(self, args_str: str, conds: list) -> int:
+        """1 when the IF / SWITCH of ``args_str`` is a branch for the order
+        SUMX / AVERAGEX add in (_fe_fold_order): one of its conditions
+        ``conds`` reads anything but literals -- 0 for a constant condition,
+        which Desktop folds (build_b243d.py i_avgx_iftrue: IF(1 = 1,
+        [Employees Avg MTD Sales]) adds in storage order, as without the IF;
+        IF([_ShowValueForDates], ...) in data-ID order, i_avgx_if; and so
+        does SWITCH(TRUE(), [_ShowValueForDates], ...), i_switch;
+        #345). Memoized by text."""
+        hit = self._BRANCH_COUNTS.get(args_str)
+        if hit is None:
+            hit = 0 if all(self._se_is_constant(c.strip(), 0) for c in conds) else 1
+            if len(self._BRANCH_COUNTS) > 20_000:
+                self._BRANCH_COUNTS.clear()
+            self._BRANCH_COUNTS[args_str] = hit
+        return int(hit)
+
+
+    def _false_blank_branch(self, kind: str, chosen: str, args_str: str, args: list,
+                            ctx: DAXContext) -> bool:
+        """Is the IF / SWITCH branch ``chosen`` written BLANK() in a call of
+        type TRUE / FALSE (_bool_typed_call), so FALSE?"""
+        return (chosen[:1] in _BLANK_HEADS and self._BLANK_LITERAL_RE.match(chosen) is not None
+                and self._bool_typed_call(kind, args_str, args, ctx))
+
+    def _bool_typed_call(self, kind: str, args_str: str, args: list, ctx: DAXContext) -> bool:
+        """Is the IF / SWITCH call ``kind(args_str)`` of type TRUE / FALSE:
+        every result branch a TRUE / FALSE expression or BLANK(), one at
+        least TRUE / FALSE (_static_type 'L', _branch_static_type)? Then a
+        branch that is omitted or written BLANK() is FALSE, not BLANK
+        (#276). Power BI Desktop 2.152: build_b255c.py
+        IF(ISBLANK(IF(FALSE(), FALSE())), 1, 0) is 0 (y7; y6, y8, y9,
+        build_b255b.py y2), and build_b255d.py the same for a value-if-true
+        TRUE() (b1), a comparison (b4), a measure that is one (b5), IF.EAGER
+        (b6), a nested IF(TRUE(), FALSE()) (b7), an explicit BLANK() else
+        (b2) and SWITCH(1, 2, TRUE()) with no else (b3); IF(FALSE(), TRUE())
+        is FALSE (b8) and COUNTROWS(FILTER(TM, IF(TM[z] = 1, TRUE()) ==
+        FALSE())) 2 (b9). A branch that evaluates to BLANK (a column, a
+        lookup) keeps it: Desktop has not been asked. Memoized per model
+        (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('bool-typed-call', kind, args_str)
+        hit = cache.get(key)
+        if hit is None:
+            if kind == 'SWITCH':
+                res = list(args[2::2])
+                if len(args) % 2 == 0:
+                    res.append(args[-1])
+            else:
+                res = list(args[1:3])
+            types = [self._static_type(a, ctx) for a in res]
+            hit = cache[key] = ('L' in types and all(t in ('L', 'B') for t in types))
+        return bool(hit)
 
     _NUMBER_LITERAL_RE = re.compile(r'\s*-?\s*\d+(?:\.\d+)?\s*')
 
@@ -10855,20 +16648,71 @@ class DAXEngine:
             # the plain identity test.
             if (test_val == case_val if test_val is None or case_val is None
                     else _compare(test_val, '=', case_val)):
-                return self._eval_expr(args[i + 1].strip(), ctx)
+                chosen = args[i + 1]
+                break
             i += 2
-        # Default (odd number of remaining args)
-        if len(args) % 2 == 0:
-            return self._eval_expr(args[-1].strip(), ctx)
-        return None
+        else:
+            # Default (odd number of remaining args)
+            if len(args) % 2:
+                # no else: FALSE in a TRUE / FALSE SWITCH (#276;
+                # build_b255d.py b3)
+                return False if self._bool_typed_call('SWITCH', args_str, args, ctx) else None
+            chosen = args[-1]
+        if self._false_blank_branch('SWITCH', chosen.strip(), args_str, args, ctx):
+            return False
+        # a SWITCH whose test or cases read the data is a branch, as an IF
+        # (build_b243d.py i_switch, #345)
+        branch = self._branch_counts(args_str, args[0:1] + args[1:len(args) - 1:2])
+        self._if_branch += branch
+        try:
+            value = self._eval_expr(chosen.strip(), ctx)
+        finally:
+            self._if_branch -= branch
+        # typed as every result types it (issue #248, #320,
+        # _unify_result); an Int64 no Double, Currency or VAR result can
+        # change is returned from _unify_entry's memo, read inline
+        t = type(value)
+        if t is not int and t is not _Currency:
+            return value
+        if ctx._filter_idx_cache.unify_switch.get(args_str) is ctx.measures:  # type: ignore[attr-defined]
+            return value
+        return self._unify_result(value, 'SWITCH', args_str, args, ctx)
 
     def _fn_and(self, args_str: str, ctx: DAXContext) -> Any:
-        args = self._split_args(args_str)
-        return all(self._eval_expr(a.strip(), ctx) for a in args)
+        """AND(a, b): as a && b (issue #249; Desktop 2.152, build_b255.py:
+        SUMX(TM, IF(AND(TM[d] <> 0, MOD(TM[n], TM[d]) = 1), 1)) fails, x5)."""
+        return self._logic_fn(args_str, ctx, False)
 
     def _fn_or(self, args_str: str, ctx: DAXContext) -> Any:
-        args = self._split_args(args_str)
-        return any(self._eval_expr(a.strip(), ctx) for a in args)
+        """OR(a, b): as a || b (issue #249; build_b255.py f13)."""
+        return self._logic_fn(args_str, ctx, True)
+
+    def _logic_fn(self, args_str: str, ctx: DAXContext, stop: bool) -> bool:
+        """AND() (``stop`` False) / OR() (True): the operands in order up to
+        the first that decides, the rest too where _logic_eager says so (the
+        question asked only then)."""
+        args = self._logic_args(args_str)
+        if ctx._current_row is not None or ctx._outer_ctx is not None:
+            split = self._logic_split(args, ctx)
+            if split is not None:
+                return self._logic_hoisted(args, split, ctx, self._current_var_scope, stop, False)
+        for i, a in enumerate(args):
+            if bool(self._eval_expr(a, ctx)) is stop:
+                if i + 1 < len(args) and self._logic_eager(args, ctx, self._current_var_scope):
+                    for b in args[i + 1:]:
+                        self._eval_expr(b, ctx)
+                return stop
+        return not stop
+
+    def _logic_args(self, args_str: str) -> tuple:
+        """AND() / OR()'s operands, stripped, memoized by text: the same
+        tuple each time, which _logic_deps recognizes by identity."""
+        hit: Optional[tuple] = _LOGIC_ARGS.get(args_str)
+        if hit is None:
+            if len(_LOGIC_ARGS) > 50_000:
+                _LOGIC_ARGS.clear()
+            hit = _LOGIC_ARGS[args_str] = tuple(a.strip() for a in self._split_args(args_str))
+        return hit
 
     def _fn_not(self, args_str: str, ctx: DAXContext) -> Any:
         return not self._eval_expr(args_str.strip(), ctx)
@@ -10882,12 +16726,18 @@ class DAXEngine:
     def _fn_blank(self, args_str: str, ctx: DAXContext) -> Any:
         return None
 
-    def _fn_calculate(self, args_str: str, ctx: DAXContext) -> Any:
-        """CALCULATE(expression, filter1, filter2, ...)"""
+    def _fn_calculate(self, args_str: str, ctx: DAXContext, _dates: Optional[list] = None) -> Any:
+        """CALCULATE(expression, filter1, filter2, ...)
+
+        ``_dates``: an evaluated table of dates (DATESYTD, ENDOFMONTH, ...)
+        applied as this call's first filter argument, after the modifiers --
+        how TOTALYTD / TOTALQTD / TOTALMTD and OPENING/CLOSINGBALANCE* apply
+        their dates beside their own filter arguments (#282). An
+        empty one is BLANK, as an empty time-intelligence filter is."""
         args = self._split_args(args_str)
         if not args:
             return None
-        pushed = self._pushdown_table_filter(args, ctx)
+        pushed = self._pushdown_table_filter(args, ctx) if _dates is None else None
         if pushed is not None:
             args = pushed
 
@@ -10901,6 +16751,9 @@ class DAXEngine:
             if _tf:
                 new_ctx = ctx.with_filters(_tf)
                 new_ctx._current_row = ctx._current_row
+        # what the filter arguments start from: a filter on a date column
+        # clears the rest of this (#78)
+        _start = new_ctx
         # Keys this CALL has filtered, so two predicates on the SAME column
         # INTERSECT (DAX ANDs multiple filter arguments) while a predicate on a
         # column the OUTER context already filtered still REPLACES it -- that
@@ -10919,12 +16772,27 @@ class DAXEngine:
         # the filter it had just applied and returned the all-T total (Desktop:
         # the "x" value, issue #87). Each group keeps its own order.
         _rest = [a.strip() for a in args[1:]]
-        ordered = ([a for a in _rest if _CALC_MODIFIER_RE.match(a)]
+        _mods = [a for a in _rest if _CALC_MODIFIER_RE.match(a)]
+        if len(_mods) > 1:
+            self._check_relationship_modifiers(_mods, ctx)
+            # a CROSSFILTER before a USERELATIONSHIP of the call
+            # (#293, _rel_modifiers_in_order)
+            _mods = _rel_modifiers_in_order(_mods)
+        ordered = (_mods + ([_TI_DATES_ARG] if _dates is not None else [])
                    + [a for a in _rest if not _CALC_MODIFIER_RE.match(a)])
+        # the row errors of the FILTER arguments, judged once every argument
+        # is known (#265, _raise_surviving_filter_error)
+        _row_errs: list = []
         for filter_arg in ordered:
+            _orig_arg = filter_arg
             if _kf_before is not None:
                 keep_keys |= self._written_keys(_kf_before, new_ctx)
                 _kf_before = None
+            if filter_arg is _TI_DATES_ARG:
+                if not _dates:
+                    return None
+                new_ctx = self._apply_date_rows(_dates, ctx, new_ctx, applied_here)
+                continue
             if filter_arg.upper().startswith('KEEPFILTERS'):
                 _kf_before = new_ctx
 
@@ -11081,7 +16949,7 @@ class DAXEngine:
                 _shifted_ctx = self._apply_dateadd_filter(filter_arg, _base)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx)
+                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx, applied_here)
                 continue
 
             # SAMEPERIODLASTYEAR
@@ -11091,7 +16959,7 @@ class DAXEngine:
                     f"DATEADD({filter_arg[19:-1].strip()}, -1, YEAR)", _base)
                 if _shifted_ctx is None:
                     return None          # period outside the date table -> BLANK
-                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx)
+                new_ctx = self._rebase_filter_delta(_base, _shifted_ctx, new_ctx, applied_here)
                 continue
 
             # USERELATIONSHIP(col1, col2) — activate a specific (usually inactive)
@@ -11109,16 +16977,17 @@ class DAXEngine:
                 continue
 
             # TREATAS — evaluated in the OUTER context (issue #49), applied
-            # to the cumulative new_ctx. _fn_treatas returns a
+            # to the cumulative new_ctx. _treatas_filter returns a
             # ('__TREATAS__', (table, column), values) marker, which this branch
             # never recognised (it looked for a dict), so EVERY
             # CALCULATE(e, TREATAS(...)) applied no filter and returned the
             # unfiltered total (issue #85). The values replace the column's
             # filter like any filter argument -- KEEPFILTERS intersects -- and
-            # an empty table filters to nothing.
+            # an empty table filters to nothing. The filter alone: its rows
+            # are TREATAS as a table (_fn_treatas, #263).
             _tkf, _tinner = self._peel_call(filter_arg, ('KEEPFILTERS',))
             if _tinner.upper().startswith('TREATAS'):
-                result = self._eval_expr(_tinner, ctx)
+                result = self._treatas_filter_of(_tinner, ctx)
                 if (isinstance(result, tuple) and len(result) == 3
                         and result[0] == '__TREATAS__'):
                     (_tt, _tc), _tvals = result[1], result[2]
@@ -11199,24 +17068,22 @@ class DAXEngine:
                     # that wrong number.
                     return None
                 if isinstance(result, list) and result:
-                    # Time-intelligence returns list of date-row dicts
-                    first = result[0]
-                    if isinstance(first, dict) and '__table__' in first:
-                        tbl_name = first['__table__']
-                        col_name = first['__column__']
-                        date_vals = [r['__value__'] for r in result]
-                        # Remove the date table's other filters -- only where
-                        # Power BI does (issue #78); elsewhere they intersect.
-                        keys_to_remove = ([k for k in new_ctx.filter_context
-                                           if k.startswith(f"{tbl_name}.")]
-                                          if (tbl_name, col_name) in self._clearing_date_columns(ctx)
-                                          else [])
-                        # Derived, not rebuilt: a fresh DAXContext dropped the
-                        # ALL(T) snapshot (and the grouping, the selection, ...),
-                        # so a filter ALL had removed came back (#87).
-                        new_ctx = new_ctx.without_filters(keys_to_remove).with_filters(
-                            {f"{tbl_name}.{col_name}": date_vals})
+                    new_ctx = self._apply_date_rows(result, ctx, new_ctx, applied_here)
                 continue
+
+            # A boolean filter that is not one column against a value is the
+            # table filter FILTER(ALL(<its columns>), <boolean>) and goes on
+            # as one (#264); one column against a value is the
+            # predicate below (_calculate_filter_spec), and an && of such
+            # predicates on one table one predicate each (_split_filter_specs).
+            _bkf, _binner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+            _spec: list = []
+            if self._is_boolean_filter(_binner, ctx):
+                _one = self._calculate_filter_spec(filter_arg, ctx)
+                _spec = [_one] if _one else self._split_filter_specs(_bkf, _binner, ctx)
+                if not _spec:
+                    filter_arg = self._boolean_filter_table(_bkf, self._strip_parens(_binner), ctx)
+                    _bkf, _binner = self._peel_call(filter_arg, ('KEEPFILTERS',))
 
             # FILTER(table, condition) or other table-returning expressions
             # Evaluate the filter arg — if it returns a list of row dicts,
@@ -11229,8 +17096,32 @@ class DAXEngine:
             # ALLSELECTED() had already widened, so
             # CALCULATE(MAX(col), ALLSELECTED(), VALUES(T[dim])) restored
             # only 133/231 grouped cells.
-            result = self._eval_expr(filter_arg, ctx)
+            if _FILTER_CALL_RE.match(_binner):
+                # its rows' errors come here, not up (#265)
+                self._filter_err_sink = (_row_errs, _orig_arg)
+                try:
+                    result = self._eval_expr(filter_arg, ctx)
+                finally:
+                    self._filter_err_sink = None
+            elif _spec:
+                result = None            # one column against a value: below
+            else:
+                result = self._eval_expr(filter_arg, ctx)
+                if isinstance(result, (bool, int, float, str, date)):
+                    # A scalar is a True/False expression whatever it is
+                    # written as (VAR ... RETURN, a name): never no filter
+                    # (#264, _is_boolean_filter).
+                    filter_arg = self._boolean_filter_table(
+                        _bkf, self._strip_parens(_binner), ctx)
+                    _bkf, _binner = self._peel_call(filter_arg, ('KEEPFILTERS',))
+                    self._filter_err_sink = (_row_errs, _orig_arg)
+                    try:
+                        result = self._eval_expr(filter_arg, ctx)
+                    finally:
+                        self._filter_err_sink = None
             if isinstance(result, list) and not result:
+                if _row_errs:
+                    self._raise_surviving_filter_error(ctx, _rest, _row_errs)
                 # An EMPTY filter table removes every row, so the expression is
                 # BLANK. Falling through here treated it as "no filter at all"
                 # and returned the GRAND TOTAL: Agents_Performance's five
@@ -11315,8 +17206,17 @@ class DAXEngine:
                     continue
                 if isinstance(first, dict) and '__table__' in first:
                     groups: dict = {}
+                    se_cut = None
                     if '__row__' in first:
-                        # Multi-column row dict from ALL(Table) + FILTER
+                        # Multi-column row dict from ALL(Table) + FILTER. The
+                        # rows of FILTER(T, <condition>): a storage-engine scan
+                        # of T reads what the condition reads for them, not
+                        # each column they filter (_SeRowsValues). KEEPFILTERS
+                        # too: it intersects with the filters in force, which
+                        # are filters of their own (build_b243d.py r_keep
+                        # 0.215399503707886, r_filter_related_calc's value)
+                        se_cut = self._se_rows_filter_cut(_binner, ctx)
+                        own_t = se_cut[0] if se_cut is not None else None
                         for row_item in result:
                             tbl_name = row_item['__table__']
                             for col_name, val in row_item.items():
@@ -11324,7 +17224,8 @@ class DAXEngine:
                                     continue
                                 key = f"{tbl_name}.{col_name}"
                                 if key not in groups:
-                                    groups[key] = []
+                                    groups[key] = ([] if tbl_name != own_t or se_cut is None
+                                                   else _se_rows_tagged([], *se_cut))
                                 groups[key].append(val)
                     else:
                         # Single-column row dict from ALL(Table[Col]) or VALUES
@@ -11359,6 +17260,10 @@ class DAXEngine:
                         # Orders[Region] = "N", KEEPFILTERS(FILTER(ALL(Orders),
                         # Orders[Revenue] > 100)) leaves no order -- BLANK).
                         keep = filter_arg.upper().startswith('KEEPFILTERS')
+                        if se_cut is not None and tbls != {se_cut[0]}:
+                            # rows of another table than the condition's
+                            groups = {k: list(v) for k, v in groups.items()}
+                            se_cut = None
                         snaps: dict = {}
                         if not keep:
                             # a filter on combinations keeps its other tables' part
@@ -11373,6 +17278,11 @@ class DAXEngine:
                         # REMOVEFILTERS(Dim[Region]) leaves Dim filtered by zone,
                         # 3 rows), and they reach the facts that share them.
                         expanded = self._table_filter_expansion(new_ctx, result, groups, tbls)
+                        if se_cut is not None:
+                            # the related tables' columns the rows filter are
+                            # the same filter: no cut of their own
+                            expanded = {k: (_se_rows_tagged(v, *se_cut) if type(v) is list else v)
+                                        for k, v in expanded.items()}
                         written = {**expanded, **groups}
                         if keep:
                             for key, vals in list(written.items()):
@@ -11399,6 +17309,8 @@ class DAXEngine:
                                 spec = _intersect_tuple_filters(prev, spec)
                             if key in applied_here:
                                 spec = _intersect_tuple_filters(applied_here[key], spec)
+                            elif se_cut is not None:
+                                spec = _se_rows_tagged(spec, *se_cut)
                             combos[key] = applied_here[key] = spec
                         if combos:
                             new_ctx = new_ctx.with_filters(combos)
@@ -11415,18 +17327,26 @@ class DAXEngine:
                             for key, vals in list(groups.items()):
                                 # the filter left after the modifiers (#87)
                                 outer = new_ctx.filter_context.get(key)
-                                if outer is not None:
+                                if outer is not None and key not in applied_here:
                                     groups[key] = _keep_scope_tag(outer, {"all": [outer, vals]})
+                        # Either intersects what another filter argument of
+                        # this call wrote on the column, a time-intelligence
+                        # table among them (#294: TOTALYTD(SUM(F[v]),
+                        # Cal[Date], FILTER(ALL(Cal[Date]), Cal[Date] <=
+                        # DATE(2024, 1, 3))) under January 3 2024 was 11775,
+                        # January 1..3 of both years, not 8696).
+                        for key, vals in list(groups.items()):
+                            if key in applied_here:
+                                vals = {"all": [applied_here[key], vals]}
+                            groups[key] = applied_here[key] = vals
                         new_ctx = new_ctx.with_filters(groups)
                 continue
 
             # Any boolean predicate: =, <>, >, >=, <, <=, IN {...}, with NOT and
-            # KEEPFILTERS peeled. Handled BEFORE the legacy equality regex below,
-            # which would otherwise match the wrapper text of NOT(T[C] = v) and
-            # register a filter on a column named "NOT(T".
-            spec = self._calculate_filter_spec(filter_arg, ctx)
-            if spec:
-                key, value, keep = spec
+            # KEEPFILTERS peeled, on one column against one value (worked out
+            # above, _spec; an && of such predicates on one table is one each,
+            # _split_filter_specs).
+            for key, value, keep in _spec:
                 if keep and key not in applied_here:
                     # KEEPFILTERS: the predicate INTERSECTS the outer filter on
                     # the same column instead of overriding it. An empty
@@ -11448,17 +17368,9 @@ class DAXEngine:
                     value = {"all": [applied_here[key], value]}
                 applied_here[key] = value
                 new_ctx = new_ctx.with_filters({key: value})
-                continue
-
-            # Simple column = value filter: Table[Col] = value
-            eq_match = re.match(r"'?([^'\[\]]+)'?\s*\[([^\]]+)\]\s*=\s*(.*)", filter_arg)
-            if eq_match:
-                tbl_name = eq_match.group(1).strip()
-                col_name = eq_match.group(2).strip()
-                val = self._eval_expr(eq_match.group(3).strip(), ctx)
-                if val is not None:
-                    new_ctx = new_ctx.with_filters({ctx.model_key(tbl_name, col_name): [val]})
-                continue
+            # (The legacy `Table[Col] = (.*)` fallback that stood here read
+            # TM[d] = 0 || TM[n] = -7 as TM[d] = (0 || ...); every boolean is
+            # handled above now, #264.)
 
         if _kf_before is not None:
             keep_keys |= self._written_keys(_kf_before, new_ctx)
@@ -11473,7 +17385,9 @@ class DAXEngine:
                     keep_keys={k for k in new_ctx.filter_context
                                if not k.startswith(_TUPLE_FILTER_PREFIX)
                                or k in applied_here})
-        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx, keep_keys)
+        new_ctx = self._drop_marked_date_table_filters(ctx, new_ctx, keep_keys, _start.filter_context)
+        if _row_errs:
+            self._raise_surviving_filter_error(ctx, _rest, _row_errs)
 
         # CALCULATE performs the row->filter context transition: inside its
         # expression the iteration row's filters are real filters, plain
@@ -11483,6 +17397,20 @@ class DAXEngine:
         # SELECTEDVALUE(T[C]) sees a column reference, exactly like Desktop).
         _prev_outer = getattr(new_ctx, '_outer_ctx', None)
         _prev_row = new_ctx._current_row
+        _se_prev = new_ctx._se_fuse
+        if len(args) > 1 or _dates is not None or _prev_outer is not None:
+            # filters of its own (TOTALxTD's dates among them,
+            # #296), or a transition: the aggregations of its
+            # expression are a scan of their own (_se_scope,
+            # #339), read with the home table of the measure
+            # it is in
+            new_ctx._se_fuse = (new_ctx, self._se_scope(
+                base_expr, new_ctx, self._home_tables[-1] if self._home_tables else None))
+            if (_prev_outer is not None and len(args) == 1 and _dates is None
+                    and ctx._se_row_scope is not None):
+                # a transition of an ADDCOLUMNS row: scanned with the row's
+                # other columns (_fn_addcolumns)
+                new_ctx._se_fuse = (new_ctx, self._se_merge_scopes(new_ctx._se_fuse[1], ctx._se_row_scope))
         new_ctx._outer_ctx = None
         new_ctx._current_row = None
         try:
@@ -11490,6 +17418,50 @@ class DAXEngine:
         finally:
             new_ctx._outer_ctx = _prev_outer
             new_ctx._current_row = _prev_row
+            new_ctx._se_fuse = _se_prev
+
+    def _apply_date_rows(self, result: list, ctx: DAXContext, new_ctx: DAXContext,
+                         applied_here: dict) -> DAXContext:
+        """``new_ctx`` with a time-intelligence table (``result``, rows of
+        one date column) applied as a CALCULATE filter argument of ``ctx``:
+        the date table's other filters go first where Power BI clears them
+        (issue #78), elsewhere the dates intersect with them.
+
+        ``applied_here`` is _fn_calculate's record of what this call's own
+        filter arguments wrote. They all apply (Microsoft's CALCULATE
+        reference: the filter arguments are combined with AND), so the dates
+        INTERSECT with what another argument of the call wrote on the same
+        column, keep what it wrote on the table's other columns, and are
+        recorded for the arguments after them. Neither was done: the dates
+        replaced an earlier argument's filter on the date column, and a later
+        argument there replaced the dates (#294).
+        CALCULATE(SUM(F[v]), DATESYTD(Cal[Date]), Cal[Date] <= DATE(2024, 1,
+        3)) under Cal[Date] = DATE(2024, 1, 3) was 11775, every order up to
+        January 3 of either year with the blank row's, where January 1..3 2024
+        add up to 8696 (exact arithmetic over build_b256.py's model, each row
+        a distinct power of two); TOTALYTD's filter argument, applied through
+        here since #282, answered the same. Desktop intersects a
+        filter argument on another column of the table the same way
+        (build_b256b.py t_ytd_year_j3: TOTALYTD(SUM(F[v]), Cal[Date],
+        Cal[Year] = 2023) under January 3 2024 is BLANK)."""
+        first = result[0]
+        if not (isinstance(first, dict) and '__table__' in first):
+            return new_ctx
+        tbl_name = first['__table__']
+        col_name = first['__column__']
+        key = f"{tbl_name}.{col_name}"
+        value: Any = [r['__value__'] for r in result]
+        keys_to_remove = ([k for k in new_ctx.filter_context
+                           if k.startswith(f"{tbl_name}.") and k not in applied_here]
+                          if (tbl_name, col_name) in self._clearing_date_columns(ctx)
+                          else [])
+        if key in applied_here:
+            value = {"all": [applied_here[key], value]}
+        applied_here[key] = value
+        # Derived, not rebuilt: a fresh DAXContext dropped the ALL(T) snapshot
+        # (and the grouping, the selection, ...), so a filter ALL had removed
+        # came back (#87).
+        return new_ctx.without_filters(keys_to_remove).with_filters({key: value})
 
     _DATES_COLUMN_ARG_RE = re.compile(
         r"(?is)^\s*(?:DATEADD|SAMEPERIODLASTYEAR)\s*\(\s*(?:'(?:[^']|'')+'|[^'\[(),]+?)\s*\[[^\]]+\]\s*[,)]")
@@ -11656,7 +17628,8 @@ class DAXEngine:
         return hit
 
     def _drop_marked_date_table_filters(self, outer: DAXContext, new_ctx: DAXContext,
-                                        keep_keys: set | frozenset = frozenset()) -> DAXContext:
+                                        keep_keys: set | frozenset = frozenset(),
+                                        before: Optional[dict] = None) -> DAXContext:
         """A filter on a MARKED date table's date column removes the table's
         other filters.
 
@@ -11674,22 +17647,132 @@ class DAXEngine:
 
         "Written here" is identity: with_filters copies the outer dict, so a
         filter this CALCULATE did not touch is the same object as outside.
+        ``before`` is the filter set the filter arguments started from, when
+        it is not ``outer``'s: the row transition's filters on the rest of the
+        row's expanded table are no filter the CALCULATE wrote, and a date
+        filter clears them like any other (#291). Power BI
+        Desktop 2.152 (build_b256b.py): SUMX(F, CALCULATE(SUM(Cal[Bit]),
+        Cal[Date] = DATE(2024, 1, 2))) is 112, January 2's bit for each of the
+        14 rows (r_day_bits), where the rows' Cal[Year] and Cal[Bit] kept only
+        the two ordered that day: 16. So is SUMX(F, CALCULATE([XShipBits],
+        Cal[Date] = DATE(2024, 1, 2))) 16, the two rows SHIPPED that day
+        (r_meas_day; 0.9.147 BLANK).
+
+        Two filter arguments of the call on the date column intersect into an
+        {"all": [...]} filter, and that is a filter on the date column too
+        (#294). An "all" value used to be taken for KEEPFILTERS
+        and skipped -- KEEPFILTERS is ``keep_keys``'s -- so
+        CALCULATE(SUM(F[v]), Cal[Date] >= DATE(2024, 1, 2), Cal[Date] <=
+        DATE(2024, 1, 3)) under Cal[Year] = 2023 kept the year and was BLANK,
+        not January 2..3's 8672 (exact arithmetic over build_b256.py's model;
+        Power BI Desktop 2.152 answers 8672 too, build_b256c.py
+        d_two_preds_year, and so with two FILTER(ALL(Cal[Date]), ..)
+        arguments, d_two_filters_year).
         """
         clearing = self._clearing_date_columns(outer)
         if not clearing:
             return new_ctx
-        before, after = outer.filter_context, new_ctx.filter_context
+        if before is None:
+            before = outer.filter_context
+        after = new_ctx.filter_context
         written = {k for k, v in after.items() if k not in before or before[k] is not v}
         drop = set()
         triggers = written - set(keep_keys)
         # Marked date columns and DateTime relationship columns alike (#78).
         for table, date_col in sorted(clearing):
             key = f"{table}.{date_col}"
-            value = after.get(key)
-            if key not in triggers or (isinstance(value, dict) and 'all' in value):
+            if key not in triggers:
                 continue
             drop |= {k for k in after if k.split('.', 1)[0] == table and k not in written}
         return new_ctx.without_filters(sorted(drop)) if drop else new_ctx
+
+    def _raise_surviving_filter_error(self, ctx: DAXContext, rest: list, errs: list) -> None:
+        """Raise the first row error of a CALCULATE FILTER argument that the
+        other filters let through (#265); ``errs`` holds
+        ``(argument, row, error)`` as _fn_filter collected them, and is
+        emptied.
+
+        Power BI Desktop 2.152 intersects the filter arguments before an
+        error counts: an error that argument i raises on a row stands only if
+        a row of the table with those values survives the filter context
+        without argument i -- the outer filters it does not replace (all of
+        them under KEEPFILTERS) and the other arguments. build_b255.py:
+        CALCULATE(COUNTROWS(TM), TM[d] <> 0, FILTER(TM, MOD(TM[n], TM[d]) =
+        1)) is 2 (c4; 0.9.147 failed), with the boolean MOD(TM[n], TM[d]) = 1
+        2 (c3), and under an outer TM[d] <> 0 through KEEPFILTERS 2 (c10), but
+        CALCULATE(CALCULATE(COUNTROWS(TM), MOD(TM[n], TM[d]) = 1), TM[d] <> 0)
+        fails (c9: the boolean replaces the filter on TM[d]); build_b255b.py:
+        the argument's place does not matter (c13), FILTER(ALL(TM), ...)
+        (c14), two FILTER arguments (c15), CALCULATETABLE (c16), an || with
+        another argument (c17, 2), and a filter on another column counts --
+        TM[z] = 1 beside MOD(...) = 1 (c18), as the outer filter (c19), and
+        kept under KEEPFILTERS (c21) are all 2; alone it fails (c12)."""
+        if self._filter_errs_quiet:
+            errs.clear()                 # judging another argument: not this one's turn
+            return
+        surviving: dict = {}
+        pending = list(errs)
+        errs.clear()
+        for arg, row, exc in pending:
+            table = row.get('__table__') if isinstance(row, dict) else None
+            if not table or table not in ctx.tables:
+                _mark_row_error(exc)
+                raise exc
+            # the row's columns: a whole row, SUMMARIZE's combination (its
+            # __column__ names only the first), or one column's value
+            cols: tuple = tuple(k for k in row if not k.startswith('__'))
+            if cols:
+                vals: tuple = tuple(row[c] for c in cols)
+            else:
+                cols, vals = (row.get('__column__'),), (row.get('__value__'),)
+            key = (arg, table, cols)
+            seen = surviving.get(key)
+            if seen is None:
+                seen = surviving[key] = self._surviving_tuples(ctx, rest, arg, table, cols)
+            if vals in seen:
+                _mark_row_error(exc)
+                raise exc
+
+    def _surviving_tuples(self, ctx: DAXContext, rest: list, arg: str, table: str,
+                          cols: tuple) -> set:
+        """The value tuples over ``cols`` of ``table``'s rows that CALCULATE's
+        filters other than ``arg`` keep (_raise_surviving_filter_error): the
+        rows of CALCULATETABLE(table, <arg's columns' filters removed, unless
+        it is KEEPFILTERS>, <the other arguments>), evaluated where CALCULATE
+        is. Their own row errors are judged in their own turn."""
+        others = list(rest)
+        if arg in others:
+            others.remove(arg)
+        quoted = "'" + table.replace("'", "''") + "'"
+        refs = [f"{quoted}[{c.replace(']', ']]')}]" for c in cols]
+        mods = ([] if arg.lstrip().upper().startswith('KEEPFILTERS') else
+                [f"REMOVEFILTERS({r})" for r in refs])
+        targs = mods + others
+        # one column: its VALUES, which list the table's blank row where it is
+        # visible (an error FILTER(VALUES(T[c]), ...) raises there stands --
+        # Desktop 2.152, build_b210.py, issue #210); several: the rows, and
+        # the blank row with the first column's VALUES
+        tables = [f"VALUES({refs[0]})"] if len(cols) == 1 else [quoted, f"VALUES({refs[0]})"]
+        prev = self._filter_errs_quiet
+        self._filter_errs_quiet = True
+        seen: set = set()
+        try:
+            for i, tab in enumerate(tables):
+                expr = f"CALCULATETABLE({tab}, {', '.join(targs)})" if targs else tab
+                rows = self._eval_expr(expr, ctx)
+                for r in rows if isinstance(rows, list) else ():
+                    if not isinstance(r, dict):
+                        continue
+                    first = r.get('__value__') if '__column__' in r else r.get(cols[0])
+                    if len(cols) == 1:
+                        seen.add((first,))
+                    elif i == 0:
+                        seen.add(tuple(r.get(c) for c in cols))
+                    elif first is None:
+                        seen.add((None,) * len(cols))
+        finally:
+            self._filter_errs_quiet = prev
+        return seen
 
     def _pushdown_table_filter(self, args: list, ctx: DAXContext):
         """``CALCULATE(<aggregate of T>, FILTER(T, <condition on T's columns>))``
@@ -11802,6 +17885,16 @@ class DAXEngine:
         # (In-set, tuple) aliasing: one column is an In-set, several a tuple filter
         if any(self._inset_aliases(table, c, ctx)[len(cols) > 1] for c in cols):
             return None
+        if len(cols) == 1:
+            # FILTER over VALUES(T[c]) tries its conjuncts as written, FILTER
+            # over T its column predicates first (_filter_phases; Power BI
+            # Desktop 2.152, build_b255c.py c24): the rewrite writes them in
+            # FILTER(T)'s order, which over the values of the one column
+            # tries them on each value as FILTER(T) does on each row
+            on_t = self._filter_phases(cond, (table, None), ctx)
+            order = on_t[0] + on_t[1]
+            if order != self._top_conjuncts(cond):
+                cond = ' && '.join(f'({c})' for c in order)
         quoted = "'" + table.replace("'", "''") + "'"
         rows = (f"VALUES({quoted}[{cols[0]}])" if len(cols) == 1 else
                 f"SUMMARIZE({quoted}, {', '.join(f'{quoted}[{c}]' for c in cols)})")
@@ -11822,7 +17915,9 @@ class DAXEngine:
         if hit is None:
             row = {'__table__': table, **dict.fromkeys(tbl['columns'])}
             try:
-                self._eval_expr(cond, self._make_row_context(row, ctx))
+                # its conjuncts as the rewrite's FILTER tries them (#249)
+                self._filter_keep(cond, self._make_row_context(row, ctx),
+                                  self._filter_phases(cond, (table, None), ctx))
                 hit = False
             except Exception:  # noqa: BLE001 -- any error on BLANK: the rewrite would raise it
                 hit = True
@@ -11896,41 +17991,21 @@ class DAXEngine:
         """
         kf, inner = self._peel_call(filter_arg, ('KEEPFILTERS',))
         keep = bool(kf)
-        negate = False
-        while True:
-            wrapper, peeled = self._peel_call(inner, ('NOT',))
-            if not wrapper:
-                break
-            negate = not negate
-            inner = peeled
+        shape = self._simple_filter_shape(inner, ctx)
+        if shape is None:
+            # Not one column against one value: CALCULATE's filter loop
+            # applies it as FILTER(ALL(<its columns>), <boolean>)
+            # (#264, _boolean_filter_table).
+            return ()
+        kind, negate, tbl, col, op, val_text = shape
 
         # ISBLANK(T[C]) / NOT ISBLANK(T[C]): applied no filter at all, so the
         # unfiltered total came back (issue #82).
-        isb, isb_inner = self._peel_call(inner, ('ISBLANK',))
-        if isb:
-            cm = _WHOLE_TCOL_RE.match(isb_inner)
-            if cm:
-                key = ctx.model_key((cm.group(1) or cm.group(2) or '').strip(), cm.group(3).strip())
-                return (key, {"is_blank": not negate}, keep)
-            return ()
+        if kind == 'isblank':
+            key = ctx.model_key(tbl, col)
+            return (key, {"is_blank": not negate}, keep)
 
-        m = _CALC_PRED_RE.match(inner)
-        rev = None if m else _CALC_PRED_REV_RE.match(inner)
-        if rev:
-            # Literal-first form (issue #39): ``2024 = T[Year]``. Flip the
-            # comparison so the column stays on the left; = and <> are
-            # symmetric. Without this the argument fell off the end of the
-            # filter loop, applied NOTHING, and returned the grand total.
-            val_text, op, tbl, col = (rev.group(1).strip(), rev.group(2),
-                                      rev.group(3).strip(),
-                                      rev.group(4).strip())
-            op = {'=': '=', '<>': '<>', '>': '<', '<': '>',
-                  '>=': '<=', '<=': '>='}[op]
-        if m or rev:
-            if m:
-                tbl, col, op, val_text = (m.group(1).strip(),
-                                          m.group(2).strip(),
-                                          m.group(3), m.group(4).strip())
+        if kind == 'cmp':
             val = self._eval_expr(val_text, ctx, var_scope)
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
@@ -11955,17 +18030,352 @@ class DAXEngine:
                 return (key, [val], keep)
             return (key, {"op": op, "value": val}, keep)
 
-        in_parts = self._split_in_scan(inner)
-        if in_parts:
-            left = in_parts[0].strip()
-            lm = re.match(r"^'?([^'\[\]]+?)'?\s*\[([^\]]+)\]$", left)
-            if lm:
-                vals = self._in_set_values(in_parts[1], ctx, var_scope)
-                if vals is None:
-                    return ()
-                key = ctx.model_key(lm.group(1).strip(), lm.group(2).strip())
-                return (key, {"not_in" if negate else "in": vals}, keep)
-        return ()
+        # kind == 'in'
+        vals = self._in_set_values(val_text, ctx, var_scope)
+        if vals is None:
+            return ()
+        key = ctx.model_key(tbl, col)
+        return (key, {"not_in" if negate else "in": vals}, keep)
+
+    def _strip_parens(self, s: str) -> str:
+        """``s`` without parentheses that wrap the whole of it."""
+        s = s.strip()
+        while True:
+            kind, data = self._plan_head(s)
+            if kind != _P_PAREN:
+                return s
+            s = data.strip()
+
+    def _simple_filter_shape(self, inner: str, ctx: DAXContext) -> Optional[tuple]:
+        """A CALCULATE boolean filter that is ONE column of a table against a
+        value the same on every row -- ``(kind, negate, table, column, op,
+        value_text)`` with kind 'cmp' (T[c] op V or V op T[c], the operator
+        then flipped), 'in' (T[c] IN V) or 'isblank' -- else None. NOT and
+        parentheses are peeled ((T[d] <> 0) is T[d] <> 0). V reads no column
+        from the row and no measure (_value_side).
+
+        ``_CALC_PRED_RE`` -- `T[c] op (.+)$` -- read anything after the first
+        operator as the value: TM[d] <> 0 && TM[n] = 7 filtered TM[d] <> (0 &&
+        TM[n] = 7), and a boolean not starting with a column applied no filter
+        at all (#264; Power BI Desktop 2.152, build_b255.py
+        k1-k5). Memoized per model (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('filter-shape', inner)
+        if key in cache:
+            hit: Optional[tuple] = cache[key]
+            return hit
+        out = self._simple_filter_shape_uncached(inner, ctx)
+        cache[key] = out
+        return out
+
+    def _simple_filter_shape_uncached(self, inner: str, ctx: DAXContext) -> Optional[tuple]:
+        s = self._strip_parens(inner)
+        negate = False
+        while True:
+            wrapper, peeled = self._peel_call(s, ('NOT',))
+            if not wrapper:
+                break
+            negate = not negate
+            s = self._strip_parens(peeled)
+        isb, isb_inner = self._peel_call(s, ('ISBLANK',))
+        if isb:
+            cm = self._model_column_match(isb_inner, ctx)
+            if not cm:
+                return None
+            return ('isblank', negate, cm[0], cm[1], None, None)
+        kind, data = self._plan_head(s)
+        if kind == _P_IN:
+            cm = self._model_column_match(data[0], ctx)
+            if not cm or not self._value_side(data[1], ctx):
+                return None
+            return ('in', negate, cm[0], cm[1], None, data[1].strip())
+        if kind != _P_CMP:
+            return None
+        split = DAXEngine._cmp_split(s)          # a chain groups left to right (#274)
+        if split:
+            op, left, right = split
+            if op == '==':
+                return None          # strict equality: per value, as FILTER reads it
+            cm = self._model_column_match(left, ctx)
+            if cm and self._value_side(right, ctx):
+                return ('cmp', negate, cm[0], cm[1], op, right)
+            cm = self._model_column_match(right, ctx)
+            if cm and self._value_side(left, ctx):
+                # Literal-first form (issue #39): ``2024 = T[Year]``. Flip the
+                # comparison so the column stays on the left.
+                flipped = {'=': '=', '<>': '<>', '>': '<', '<': '>', '>=': '<=', '<=': '>='}[op]
+                return ('cmp', negate, cm[0], cm[1], flipped, left)
+            return None
+        return None
+
+    @staticmethod
+    def _model_col(t: str, c: str, ctx: DAXContext) -> Optional[tuple]:
+        """``(table, column)`` as the model spells them when ``t[c]`` is a
+        column of the model, else None. The model's own spelling is checked
+        first, so it never looks the names up again (issue #226)."""
+        tbl = ctx.tables.get(t)
+        if tbl is not None and c in tbl['columns']:
+            return t, c
+        mt, mc = ctx.model_column(t, c)
+        tbl = ctx.tables.get(mt)
+        if tbl is not None and ctx._find_col_idx(tbl['columns'], mc) >= 0:
+            return mt, tbl['columns'][ctx._find_col_idx(tbl['columns'], mc)]
+        return None
+
+    def _model_column_match(self, text: str, ctx: DAXContext) -> Optional[tuple]:
+        """``(table, column)`` when ``text`` is exactly a reference to a
+        column of the model (_model_col), else None."""
+        cm = _WHOLE_TCOL_RE.match(text)
+        if not cm:
+            return None
+        return self._model_col((cm.group(1) or cm.group(2) or '').strip(), cm.group(3).strip(), ctx)
+
+    # Functions that return a scalar, never a table: as a CALCULATE filter
+    # argument each is a True/False expression (_is_boolean_filter). Logical
+    # and information functions, the pure scalar ones (_SHIELD_PURE_FNS),
+    # lookups and aggregates -- IF / SWITCH / IFERROR cannot return a table.
+    _BOOL_FILTER_FNS = _SHIELD_PURE_FNS | frozenset({
+        'ISEVEN', 'ISODD', 'IF.EAGER', 'CONTAINSROW', 'CONTAINS', 'ISEMPTY', 'ISONORAFTER',
+        'HASONEVALUE', 'HASONEFILTER', 'ISFILTERED', 'ISCROSSFILTERED', 'ISINSCOPE',
+        'SELECTEDVALUE', 'RELATED', 'LOOKUPVALUE', 'CALCULATE', 'SUM', 'SUMX', 'AVERAGE',
+        'AVERAGEX', 'MIN', 'MINX', 'MAX', 'MAXX', 'COUNT', 'COUNTX', 'COUNTA', 'COUNTAX',
+        'COUNTROWS', 'COUNTBLANK', 'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK', 'MEDIAN', 'MEDIANX',
+        'PRODUCT', 'PRODUCTX'})
+
+    def _is_boolean_filter(self, inner: str, ctx: Optional[DAXContext] = None) -> bool:
+        """Is a CALCULATE filter argument a True/False expression, not a
+        table: a comparison, IN, && / ||, NOT, arithmetic, a literal, or a
+        call of a function that returns a scalar (_BOOL_FILTER_FNS)?
+
+        Every such argument is FILTER(ALL(<its columns>), <it>)
+        (#264) or refused (_boolean_filter_table). Recognising
+        only comparisons and a short list of boolean functions let
+        CALCULATE(COUNTROWS(TM), IF(TM[d] = 0, TRUE(), FALSE())),
+        SWITCH(...), COALESCE(TM[d] = 0, FALSE()), CONTAINSROW({0}, TM[d])
+        and IFERROR(MOD(...) = 1, FALSE()) through as no filter at all: the
+        unfiltered 4. A scalar the argument evaluates to anyway is caught in
+        _fn_calculate. A bare column is one too: Power BI Desktop 2.152
+        (build_b255c.py k37) answers CALCULATE(COUNTROWS(TM), TM[d]) with 2,
+        the rows whose d is no 0 and no BLANK, where the column's visible
+        values were applied (4). A bare TEXT column is one as well, its
+        values converted to TRUE / FALSE (_text_column_filter)."""
+        kind, data = self._plan_head(self._strip_parens(inner))
+        if kind == _P_TCOL:
+            return True
+        if kind in (_P_LOGICAL, _P_NOT, _P_CMP, _P_IN, _P_BINARY, _P_CONCAT, _P_NEG, _P_CONST,
+                    _P_POW):
+            return True
+        if kind == _P_FUNC:
+            return data[0] in self._BOOL_FILTER_FNS
+        return False
+
+    def _split_filter_specs(self, kf: str, inner: str, ctx: DAXContext) -> list:
+        """A CALCULATE boolean filter that is an && (or AND()) of predicates,
+        each one column of ONE table against a value (_simple_filter_shape),
+        as one filter spec per predicate (_calculate_filter_spec, KEEPFILTERS
+        kept on each) -- else [].
+
+        The same filter, not an approximation: FILTER(ALL(T[a], T[b]), pa &&
+        pb) keeps the rows of T whose a passes pa and whose b passes pb, as
+        the two column filters do (every row's (a, b) is one of ALL's
+        combinations); both replace the outer filters on a and b, and under
+        KEEPFILTERS both intersect them. Two predicates on one column
+        intersect, as two filter arguments on it do. The combination filter
+        built and tested every combination: CALCULATE(COUNTROWS(T), T[n] >
+        10 && T[v] < 500) over 300,000 rows took 25 times as long as T[n] >
+        10, T[v] < 500. Columns of two tables are refused, as Desktop refuses
+        them (_boolean_filter_table)."""
+        parts = self._top_conjuncts(self._strip_parens(inner))
+        if len(parts) < 2:
+            return []
+        tables = set()
+        for p in parts:
+            shape = self._simple_filter_shape(p, ctx)
+            if shape is None:
+                return []
+            tables.add(shape[2])
+        if len(tables) != 1:
+            return []
+        out = []
+        for p in parts:
+            spec = self._calculate_filter_spec(f"KEEPFILTERS({p})" if kf else p, ctx)
+            if not spec:
+                return []
+            out.append(spec)
+        return out
+
+    def _boolean_filter_table(self, kf: str, inner: str, ctx: DAXContext) -> str:
+        """A CALCULATE boolean filter that is not one column against a value,
+        as the table filter it means: FILTER(ALL(<the columns it reads from
+        the row>), <boolean>), KEEPFILTERS kept (#264;
+        Microsoft Learn's CALCULATE: a boolean filter is a FILTER over ALL of
+        its columns). Power BI Desktop 2.152 (build_b255.py; 0.9.147 in
+        brackets): CALCULATE(COUNTROWS(TM), TM[d] <> 0 && TM[n] = 7) is 1 (3,
+        k1), the conditions swapped 1 (BLANK, k2), TM[d] = 0 || TM[n] = -7 3 (1,
+        k3), CALCULATE(COUNTROWS(TC), TC[n] + TC[d] = 3) 1 (2: no filter, k4),
+        MOD(TC[d], 2) = 1 1 (2, k5); build_b255b.py: the ALL is over the
+        columns' existing combinations (k6, 2), a column inside an aggregate is
+        none of them (k12, 1), the outer filters on the columns are replaced
+        and the others kept (k18 BLANK, k19 1), KEEPFILTERS intersects (k17
+        BLANK), T[n] = T[d] + 5 compares per row (k20, 1).
+
+        Desktop refuses, and so does this (#271):
+          * a measure read outside an aggregate (k7 TM[d] < [m_cnt], k10
+            [m_zero] = 0, k22): "A function 'PLACEHOLDER' has been used in a
+            True/False expression that is used as a table filter expression.
+            This is not allowed." -- an aggregate is fine (k8, 4);
+          * columns of two tables (k9): "The expression contains columns from
+            multiple tables, but only columns from a single table can be used
+            in a True/False expression that is used as a table filter
+            expression.";
+          * no column (k11 TRUE()): "The True/False expression does not specify
+            a column. Each True/False expressions used as a table filter
+            expression must refer to exactly one column."
+        (Desktop's English messages; it answered in Norwegian.) Also refused:
+        a CALCULATE outside an aggregate (build_b255c.py k24, CALCULATE(
+        COUNTROWS(TM), TM[d] = CALCULATE(MAX(TM[d]), ALL(TM))): "A function
+        'CALCULATE' has been used in a True/False expression that is used as
+        a table filter expression. This is not allowed."). IFERROR does not
+        catch these refusals (k25)."""
+        try:
+            return self._boolean_filter_table_checked(kf, inner, ctx)
+        except _DAXEvaluationError as exc:
+            raise _uncatchable(exc)
+
+    def _boolean_filter_table_checked(self, kf: str, inner: str, ctx: DAXContext) -> str:
+        """_boolean_filter_table, its refusals raised as they are."""
+        from pbix_mcp.errors import DAXEvaluationError
+        called = self._filter_disallowed_call(inner, ctx)
+        if called:
+            raise DAXEvaluationError(_PLACEHOLDER_FILTER_MSG.replace('PLACEHOLDER', called))
+        row_qual, row_bare, _in_qual, _in_bare, _idents, _trans = _local_deps(inner)
+        cols: list = []
+        for name in row_bare:
+            if self._measure_exists(name, ctx):
+                raise DAXEvaluationError(_PLACEHOLDER_FILTER_MSG)
+            owners = self._bare_owners(name, ctx)
+            home = self._home_tables[-1] if self._home_tables else None
+            if home in owners:
+                owners = [home]
+            if len(owners) == 1:
+                cols.append(ctx.model_column(owners[0], name))
+        for t, c in row_qual:
+            mc = self._model_col(t, c, ctx)
+            if mc is not None:
+                cols.append(mc)
+            elif self._measure_exists(c, ctx):
+                raise DAXEvaluationError(_PLACEHOLDER_FILTER_MSG)
+            else:
+                # as a reference evaluated anywhere (_exec_plan's _P_TCOL):
+                # a filter on a column that is not there was dropped and
+                # CALCULATE returned the unfiltered total
+                raise DAXEvaluationError(
+                    f"Column '{c}' in table '{t}' cannot be found or may not be used in "
+                    f"this expression")
+        cols = list(dict.fromkeys(cols))
+        if not cols:
+            raise DAXEvaluationError(
+                "The True/False expression does not specify a column. Each True/False "
+                "expressions used as a table filter expression must refer to exactly one column.")
+        if len({t for t, _c in cols}) > 1:
+            raise DAXEvaluationError(
+                "The expression contains columns from multiple tables, but only columns from a "
+                "single table can be used in a True/False expression that is used as a table "
+                "filter expression.")
+        refs = ", ".join("'" + t.replace("'", "''") + "'[" + c.replace(']', ']]') + "]"
+                         for t, c in cols)
+        cond = inner
+        if len(cols) == 1:
+            kind, _data = self._plan_head(inner)
+            if kind == _P_TCOL and self._col_num_type(ctx, cols[0][0], cols[0][1]) == 'S':
+                cond = self._text_column_filter(refs, ctx)
+        text = f"FILTER(ALL({refs}), {cond})"
+        return f"KEEPFILTERS({text})" if kf else text
+
+    def _text_column_filter(self, ref: str, ctx: DAXContext) -> str:
+        """A bare text column ``ref`` as a CALCULATE boolean filter: each of
+        its values converted to TRUE / FALSE, a value that is no number and
+        no TRUE / FALSE an error (#280). Power BI Desktop
+        2.152 (build_b255d.py) fails CALCULATE(COUNTROWS(TS), TS[s]) over
+        "1", "x", "3" with "Cannot convert value 'x' of type Text to type
+        True/False." (k41; its Norwegian in English), and also under an outer
+        filter on the column, which the boolean filter replaces (k45); the
+        engine read the column's visible values as a filter (3 and 1). "1"
+        passed (the error names "x"): a number's text is that number, TRUE
+        when it is no 0. The condition returned keeps the values that are
+        TRUE, as an IN over their texts."""
+        trues: list = []
+        for row in self._eval_expr(f"ALL({ref})", ctx) or []:
+            v = row.get('__value__') if isinstance(row, dict) else row
+            if v is None or v == '':
+                continue
+            low = str(v).strip().lower()
+            if low in ('true', 'false'):
+                ok = low == 'true'
+            else:
+                n = _arith_text_number(str(v), getattr(ctx, 'culture', None))
+                if n is None:
+                    raise _DAXEvaluationError(
+                        f"Cannot convert value '{v}' of type Text to type True/False.")
+                ok = n != 0
+            if ok:
+                trues.append('"' + str(v).replace('"', '""') + '"')
+        return f"{ref} IN {{{', '.join(trues)}}}" if trues else "FALSE()"
+
+    def _filter_disallowed_call(self, inner: str, ctx: DAXContext) -> Optional[str]:
+        """The function a CALCULATE boolean filter uses that Desktop refuses,
+        the first in the text outside an aggregate: 'PLACEHOLDER' for a
+        measure (build_b255b.py k7, k10), 'CALCULATE' for that call
+        (build_b255c.py k24); None when there is none. Inside an aggregate a
+        measure is fine (k23: TM[d] < MAXX(ALL(TM), [m_cnt]) is 2), and so a
+        CALCULATE is taken to be; CALCULATETABLE has not been asked about
+        (build_b255d.py k39, k44) and is let through. Memoized per model
+        (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('filter-disallowed', inner)
+        if key in cache:
+            hit: Optional[str] = cache[key]
+            return hit
+        out = cache[key] = self._filter_disallowed_scan(inner, ctx)
+        return out
+
+    def _filter_disallowed_scan(self, inner: str, ctx: DAXContext) -> Optional[str]:
+        skip = 0
+        stack: list = []
+        for m in _DEP_TOKEN_RE.finditer(_strip_line_comments(inner)):
+            t = m.group(0)
+            c0 = t[0]
+            if c0.isspace() or c0 == '"':
+                continue
+            if t == '(':
+                stack.append('')
+                continue
+            if t == ')':
+                if stack and stack.pop() in _ROWREF_SKIP_FNS:
+                    skip -= 1
+                continue
+            if t.endswith('('):
+                name = t[:-1].strip().upper()
+                if not skip and name == 'CALCULATE':
+                    return name
+                stack.append(name)
+                if name in _ROWREF_SKIP_FNS:
+                    skip += 1
+                continue
+            if skip or not t.endswith(']'):
+                continue
+            if c0 == '[':
+                if self._measure_exists(_unbracket(t[1:-1]), ctx):
+                    return 'PLACEHOLDER'
+                continue
+            tpart, _, cpart = t.partition('[')
+            tpart = tpart.strip()
+            if tpart.startswith("'"):
+                tpart = tpart[1:-1].replace("''", "'")
+            if self._model_col(tpart, _unbracket(cpart[:-1]), ctx) is None \
+                    and self._measure_exists(_unbracket(cpart[:-1]), ctx):
+                return 'PLACEHOLDER'
+        return None
 
     @staticmethod
     def _two_col_refs(filter_arg: str) -> list:
@@ -11974,28 +18384,53 @@ class DAXEngine:
         pairs = re.findall(r"'?([^'\[\],(]+)'?\s*\[([^\]]+)\]", filter_arg)
         return [(t.strip(), c.strip()) for t, c in pairs]
 
+    # What the relationship modifiers leave on the relationships of the list
+    # they derive (never on the model's own), for a nested CALCULATE to read:
+    # the relationship a USERELATIONSHIP made active, those it deactivated for
+    # it, and those a CROSSFILTER(..., None) switched off, with whether they
+    # were active before it, or whether it undid a USERELATIONSHIP (_REL_MARKS).
+    _UR_ON, _UR_OFF, _XF_NONE, _XF_WAS, _XF_UR = _REL_MARKS
+
     def _apply_userelationship(self, filter_arg: str, ctx: DAXContext) -> DAXContext:
         """USERELATIONSHIP(col1, col2): make the relationship joining col1 and
         col2 active for the wrapped expression, deactivating any other active
         relationship between the same two tables (only one may be active per
-        pair). No-op (graceful) if no matching relationship exists."""
+        pair). No-op (graceful) if no matching relationship exists.
+
+        A no-op too on a relationship an enclosing CALCULATE switched off with
+        CROSSFILTER(..., None): that wins at any depth, and the pair's active
+        relationship stays active (#293). Power BI Desktop 2.152
+        (build_b256b.py): CALCULATE(CALCULATE(SUM(F[v]), USERELATIONSHIP(
+        F[Ship], Cal[Date])), CROSSFILTER(F[Ship], Cal[Date], None), Cal[Date]
+        = DATE(2024, 1, 2)) is 96, the rows F[Order] puts on the day
+        (x_nested_ur_in; x_meas_none through a measure), not F[Ship]'s 24 nor
+        the 16383 of no relationship."""
         refs = [ctx.model_column(t, c) for t, c in self._two_col_refs(filter_arg)]   # any case (#226)
         if len(refs) < 2:
             return ctx
         (t1, c1), (t2, c2) = refs[0], refs[1]
         target = {(t1, c1), (t2, c2)}
         pair = {t1, t2}
+        rels = ctx.relationships
+        if any(rel.get(self._XF_NONE) and {(rel.get('FromTable'), rel.get('FromColumn')),
+                                           (rel.get('ToTable'), rel.get('ToColumn'))} == target
+               for rel in rels):
+            return ctx
         new_rels, changed = [], False
-        for rel in ctx.relationships:
+        for rel in rels:
             r = dict(rel)
             rk = {(r.get('FromTable'), r.get('FromColumn')),
                   (r.get('ToTable'), r.get('ToColumn'))}
             rpair = {r.get('FromTable'), r.get('ToTable')}
             if rk == target:
                 r['IsActive'] = 1
+                r[self._UR_ON] = 1
+                r.pop(self._UR_OFF, None)
                 changed = True
             elif rpair == pair and r.get('IsActive'):
                 r['IsActive'] = 0  # deactivate the sibling active relationship
+                r[self._UR_OFF] = 1
+                r.pop(self._UR_ON, None)
             new_rels.append(r)
         if not changed:
             return ctx
@@ -12005,36 +18440,195 @@ class DAXEngine:
         """CROSSFILTER(col1, col2, direction): override the cross-filter
         direction of the col1<->col2 relationship for the wrapped expression.
         direction: None -> inactive-for-filtering (0), OneWay -> single (1),
-        Both -> bidirectional (2)."""
+        Both -> bidirectional (2); OneWay_LeftFiltersRight /
+        OneWay_RightFiltersLeft see _crossfilter_behavior.
+
+        None on a relationship that a USERELATIONSHIP of an enclosing
+        CALCULATE activated undoes that USERELATIONSHIP: the relationship it
+        deactivated is active again (#293). Power BI Desktop
+        2.152 (build_b256b.py): CALCULATE(CALCULATE(SUM(F[v]), CROSSFILTER(
+        F[Ship], Cal[Date], None)), USERELATIONSHIP(F[Ship], Cal[Date]),
+        Cal[Date] = DATE(2024, 1, 2)) is 96, the rows F[Order] puts on the day
+        (x_nested_none_in), where the engine had no relationship left: 16383.
+
+        Another direction on a relationship an enclosing CALCULATE switched
+        off with None takes the None back: the relationship is as it was
+        before it (#293). Desktop (build_b256c.py):
+        CALCULATE(CALCULATE(SUM(F[v]), CROSSFILTER(F[Order], Cal[Date],
+        Both)), CROSSFILTER(F[Order], Cal[Date], None), Cal[Date] = DATE(2024,
+        1, 2)) is 96, F[Order]'s rows again (n_none_both; the engine kept it
+        off: 16383), and with a USERELATIONSHIP of the inactive F[Ship] beside
+        the Both, F[Ship] joins: 24 (n_none_ur_both, _rel_modifiers_in_order).
+        A relationship that was active comes back only while no other one of
+        its pair is (not asked of Desktop) -- unless the None had undone an
+        enclosing USERELATIONSHIP: then the other direction is that
+        USERELATIONSHIP again, and the relationship the None had brought back
+        is inactive once more (#293). Desktop
+        (build_b256d.py): CALCULATE(CALCULATE(CALCULATE(SUM(F[v]),
+        CROSSFILTER(F[Ship], Cal[Date], Both)), CROSSFILTER(F[Ship], Cal[Date],
+        None)), USERELATIONSHIP(F[Ship], Cal[Date]), Cal[Date] = DATE(2024, 1,
+        2)) is 24, F[Ship]'s rows (n_ur_none_both; the engine kept F[Order]:
+        96). With no USERELATIONSHIP the inactive F[Ship] stays inactive:
+        the same with its outer USERELATIONSHIP left out is 96
+        (n_none_both_ship)."""
         refs = [ctx.model_column(t, c) for t, c in self._two_col_refs(filter_arg)]   # any case (#226)
         if len(refs) < 2:
             return ctx
         (t1, c1), (t2, c2) = refs[0], refs[1]
-        # third argument = direction keyword
-        inner = filter_arg[filter_arg.find('(') + 1:filter_arg.rfind(')')]
-        args = self._split_args(inner)
-        direction = args[2].strip().upper().strip("'\"") if len(args) >= 3 else 'BOTH'
-        xf = {'NONE': 0, 'ONEWAY': 1, 'BOTH': 2}.get(direction, 2)
+        direction = self._crossfilter_direction(filter_arg)
         target = {(t1, c1), (t2, c2)}
         new_rels, changed = [], False
+        undo_pair: Optional[set] = None
+        revived: Optional[dict] = None
+        revived_ur = False
         for rel in ctx.relationships:
             r = dict(rel)
             rk = {(r.get('FromTable'), r.get('FromColumn')),
                   (r.get('ToTable'), r.get('ToColumn'))}
             if rk == target:
+                xf = self._crossfilter_behavior(direction, r, (t1, c1))
                 r['CrossFilteringBehavior'] = xf
                 # direction None makes the relationship stop propagating filters
                 if xf == 0:
+                    if r.pop(self._UR_ON, None):
+                        undo_pair = {r.get('FromTable'), r.get('ToTable')}
+                        r[self._XF_UR] = 1
+                    if not r.get(self._XF_NONE):
+                        r[self._XF_WAS] = 1 if r.get('IsActive') else 0
                     r['IsActive'] = 0
+                    r[self._XF_NONE] = 1
+                elif r.pop(self._XF_NONE, None):
+                    if r.pop(self._XF_WAS, 0):
+                        revived = r
+                    if r.pop(self._XF_UR, None):
+                        revived_ur = True
                 changed = True
             new_rels.append(r)
         if not changed:
             return ctx
+        if undo_pair is not None:
+            for r in new_rels:
+                if r.get(self._UR_OFF) and {r.get('FromTable'), r.get('ToTable')} == undo_pair:
+                    del r[self._UR_OFF]
+                    if not r.get(self._XF_NONE):
+                        r['IsActive'] = 1
+        if revived is not None:
+            pair = {revived.get('FromTable'), revived.get('ToTable')}
+            if revived_ur:
+                # the None had undone an enclosing USERELATIONSHIP: taking the
+                # None back is that USERELATIONSHIP again (#293)
+                revived['IsActive'] = 1
+                revived[self._UR_ON] = 1
+                for r in new_rels:
+                    if r is not revived and r.get('IsActive') \
+                            and {r.get('FromTable'), r.get('ToTable')} == pair:
+                        r['IsActive'] = 0
+                        r[self._UR_OFF] = 1
+                        r.pop(self._UR_ON, None)
+            elif not any(r is not revived and r.get('IsActive')
+                         and {r.get('FromTable'), r.get('ToTable')} == pair for r in new_rels):
+                revived['IsActive'] = 1
         return ctx.with_relationships(new_rels)
+
+    def _crossfilter_direction(self, filter_arg: str) -> str:
+        """CROSSFILTER's third argument, upper case; BOTH when it is absent."""
+        inner = filter_arg[filter_arg.find('(') + 1:filter_arg.rfind(')')]
+        args = self._split_args(inner)
+        return args[2].strip().upper().strip("'\"") if len(args) >= 3 else 'BOTH'
+
+    @staticmethod
+    def _crossfilter_behavior(direction: str, rel: dict, left: tuple) -> int:
+        """The CrossFilteringBehavior CROSSFILTER(left, right, direction) gives
+        ``rel``: NONE 0, ONEWAY 1, BOTH (and an unknown word) 2.
+
+        OneWay_LeftFiltersRight and OneWay_RightFiltersLeft name the side that
+        filters by argument position, left being the first column's. On a
+        many-to-one relationship the one side filtering the many side is
+        OneWay, and the many side alone filtering the one side is Desktop's
+        error, raised before anything is evaluated (#290). Power
+        BI Desktop 2.152 (build_b256b.py), with USERELATIONSHIP(F[Ship],
+        Cal[Date]): CALCULATE(SUM(Cal[Bit]), .., CROSSFILTER(F[Ship],
+        Cal[Date], OneWay_RightFiltersLeft), F[v] = 8) is 127, every day
+        (x_rfl_bits; the engine read the word as Both: 8), and
+        OneWay_LeftFiltersRight there is the error (x_lfr_bits, x_lfr_sum;
+        x_lfr_order_sum on the active F[Order]), reported before the measure
+        is evaluated: IF(FALSE(), <it>, 1) fails and IFERROR around it does
+        not catch it (build_b256c.py c_iffalse_lfr, c_iferr_lfr;
+        _bind_error, DAXEngine._static_refusal). A one-to-one or
+        many-to-many relationship keeps the old reading, Both: no Desktop
+        answer."""
+        if direction == 'NONE':
+            return 0
+        if direction == 'ONEWAY':
+            return 1
+        if direction in ('ONEWAY_LEFTFILTERSRIGHT', 'ONEWAY_RIGHTFILTERSLEFT'):
+            cards = (rel.get('FromCardinality') or 2, rel.get('ToCardinality') or 1)
+            many = ((rel.get('FromTable'), rel.get('FromColumn')) if cards == (2, 1)
+                    else (rel.get('ToTable'), rel.get('ToColumn')) if cards == (1, 2) else None)
+            if many is None:
+                return 2
+            if (left == many) == (direction == 'ONEWAY_LEFTFILTERSRIGHT'):
+                raise _bind_error(
+                    "The CROSSFILTER function cannot be used to enable only the many side of the "
+                    "many-to-one relationship to filter the one side.")
+            return 1
+        return 2
+
+    def _check_relationship_modifiers(self, mods: list, ctx: DAXContext) -> None:
+        """Desktop's errors for relationship modifiers of ONE CALCULATE (or
+        CALCULATETABLE) that contradict each other, whatever order or column
+        order they are written in. Power BI Desktop 2.152 (build_b256.py /
+        build_b256b.py; the texts are Desktop's, translated from its Norwegian
+        UI):
+
+        - USERELATIONSHIP and CROSSFILTER(..., None) on one relationship
+          (#283): d_userel_none_ship, x_none_first (None written
+          first), x_none_cols_rev (CROSSFILTER's columns reversed) and
+          x_none_active (on the active F[Order]) are all the error; 0.9.147
+          let the last one written win (16383, 24). None on the OTHER
+          relationship of the pair is no conflict: d_none_order_userel 24.
+          Across nested CALCULATEs it is no error either
+          (_apply_userelationship / _apply_crossfilter).
+        - two CROSSFILTERs on one relationship (#292):
+          CROSSFILTER(F[Order], Cal[Date], None) beside CROSSFILTER(F[Order],
+          Cal[Date], Both) is the error (x_two_cf; 0.9.147: 16383). Two
+          USERELATIONSHIPs of one pair are not: x_two_ur is 96.
+
+        Desktop reports both before evaluating the measure: IF(FALSE(), <it>,
+        1) fails, and IFERROR around it in the same expression does not catch
+        it (build_b256c.py c_iffalse_conflict, c_iferr_conflict,
+        c_iffalse_two_cf, c_iferr_two_cf). So they are
+        _bind_error's, and _static_refusal runs this over every CALCULATE of
+        a measure's expression before it is evaluated."""
+        ur: set = set()
+        none: set = set()
+        xf: set = set()
+        for a in mods:
+            word = a[:15].upper()
+            if not (word.startswith('USERELATIONSHIP') or word.startswith('CROSSFILTER')):
+                continue
+            refs = self._two_col_refs(a)
+            if len(refs) < 2:
+                continue
+            k = frozenset(ctx.model_column(t, c) for t, c in refs[:2])
+            if word.startswith('USERELATIONSHIP'):
+                ur.add(k)
+                continue
+            if k in xf:
+                raise _bind_error(
+                    "The cross-filtering direction of a relationship cannot be set (using the CROSSFILTER "
+                    "function) more than once in a single CALCULATE function.")
+            xf.add(k)
+            if self._crossfilter_direction(a) == 'NONE':
+                none.add(k)
+        if ur & none:
+            raise _bind_error(
+                "The USERELATIONSHIP and CROSSFILTER functions are used in a single CALCULATE function "
+                "to specify incompatible settings.")
 
     @staticmethod
     def _rebase_filter_delta(base: DAXContext, shifted: DAXContext,
-                             target: DAXContext) -> DAXContext:
+                             target: DAXContext, applied_here: Optional[dict] = None) -> DAXContext:
         """Apply the filter delta between ``base`` and ``shifted`` to ``target``.
 
         CALCULATE evaluates every filter argument in the OUTER filter context
@@ -12042,11 +18636,23 @@ class DAXEngine:
         ctx) — but its result must land on ``target``, the context the
         preceding filter arguments already built, or those arguments would be
         silently discarded.
+
+        ``applied_here`` (_fn_calculate's record of what this call's filter
+        arguments wrote): the filter arguments of one CALCULATE are combined
+        with AND (Microsoft's CALCULATE reference), so the shifted dates
+        intersect another argument's filter on their column, leave what it
+        wrote on the table's other columns, and are recorded for the
+        arguments after them (#294). CALCULATE(SUM(F[v]),
+        DATEADD(Cal[Date], -1, DAY), Cal[Date] < DATE(2024, 1, 2)) under
+        Cal[Date] = DATE(2024, 1, 3) asks for January 2 and before it: no
+        day, BLANK (exact arithmetic over build_b256.py's model); 0.9.147
+        answered 3103, every order before January 2 with the blank row's.
         """
+        held = applied_here if applied_here is not None else {}
         removed = [k for k in base.filter_context
                    if k not in shifted.filter_context
-                   and k in target.filter_context]
-        changed = {}
+                   and k in target.filter_context and k not in held]
+        changed: dict = {}
         for k, v in shifted.filter_context.items():
             old = base.filter_context.get(k)
             if old is v:
@@ -12056,7 +18662,11 @@ class DAXEngine:
                     continue
             except (TypeError, ValueError):
                 pass
+            if k in held:
+                v = {"all": [held[k], v]}
             changed[k] = v
+            if applied_here is not None:
+                applied_here[k] = v
         out = target.without_filters(removed) if removed else target
         if changed:
             out = out.with_filters(changed)
@@ -12472,6 +19082,11 @@ class DAXEngine:
             # Order-preserving dedup: Desktop iterates VALUES in data order, and
             # hash-set order made CONCATENATEX output nondeterministic.
             values = self._values_with_blank(ref[0], ref[1], ctx)
+            # a Fixed Decimal column's values are Currency (issue #248;
+            # Desktop 2.152, build_b254.py l_scalars: CALCULATE(VALUES(TR[v]),
+            # TR[id] = 10) is C0.0002) -- these rows are made per call
+            if self._currency_column(ref, ctx):
+                values = [_Currency(v) if type(v) is float else v for v in values]
             # Return as row-dict list so CONCATENATEX / FILTER / iterators work
             return [{'__table__': ref[0], '__column__': ref[1], '__value__': v} for v in values]
         return []
@@ -12494,7 +19109,11 @@ class DAXEngine:
             # blank row's, and then the answer is BLANK, not alt (issue #82).
             values = self._values_with_blank(ref[0], ref[1], ctx)
             if len(values) == 1:
-                return values[0]
+                # a Fixed Decimal column's value is a Currency (issue #248;
+                # Desktop 2.152, build_b254.py l_scalars: CALCULATE(
+                # SELECTEDVALUE(TR[v]), TR[id] = 10) is C0.0002)
+                v = values[0]
+                return _Currency(v) if type(v) is float and self._currency_column(ref, ctx) else v
         default = self._eval_expr(args[1].strip(), ctx) if len(args) > 1 else None
         return default
 
@@ -12804,7 +19423,14 @@ class DAXEngine:
             return self._format_datetime_pattern(val, str(fmt))
         if fmt and isinstance(val, (int, float)) and not isinstance(val, bool):
             group_sep, dec_sep = _culture_seps(culture)
-            out = _format_number(float(val), str(fmt), group_sep, dec_sep)
+            # a Currency formats its exact decimal (issue #248,
+            # #306, #315) and an Int64 its
+            # exact digits, past 2**53 too: Power BI Desktop 2.152
+            # (build_b257b.py z53_format, #334) ends
+            # FORMAT(9007199254740993, "0") in 993, float() made it 992
+            num = (_cur_decimal(val) if type(val) is _Currency
+                   else val if type(val) is int else float(val))
+            out = _format_number(num, str(fmt), group_sep, dec_sep)
             if out is not None:
                 return out
         return _concat_str(val)
@@ -12852,56 +19478,274 @@ class DAXEngine:
                 return row_item[key]
         return _NO_CELL
 
+    # the iterated tables _fe_fold_order reads a kind of, by their text:
+    # (kind, the conditions of the FILTERs around the column's values)
+    _FE_KINDS: dict = {}
+
+    def _fe_table_kind(self, table_arg: str) -> tuple:
+        """('values', ()) for VALUES / DISTINCT / ALL / ALLSELECTED /
+        ALLNOBLANKROW of one column, ('filter', conditions) for a FILTER
+        (nested too) of such a table, with the conditions of every FILTER
+        layer, else (None, ()) -- memoized by text."""
+        hit = self._FE_KINDS.get(table_arg)
+        if hit is not None:
+            got: tuple = hit
+            return got
+        kind: tuple = (None, ())
+        items = _se_items(table_arg.strip())
+        if len(items) == 1 and items[0][0] == 'call':
+            fn, rest = items[0][1], items[0][2]
+            if fn == 'FILTER':
+                parts = self._split_args(rest)
+                if len(parts) == 2:
+                    inner = self._fe_table_kind(parts[0])
+                    if inner[0] is not None:
+                        kind = ('filter', inner[1] + (parts[1].strip(),))
+            elif fn in ('VALUES', 'DISTINCT', 'ALL', 'ALLSELECTED', 'ALLNOBLANKROW'):
+                sub = _se_items(rest)
+                if len(sub) == 1 and sub[0][0] == 'ref' and sub[0][1] is not None:
+                    kind = ('values', ())
+        if len(self._FE_KINDS) > 20_000:
+            self._FE_KINDS.clear()
+        self._FE_KINDS[table_arg] = kind
+        return kind
+
+    def _fe_fold_order(self, table_arg: str, rows: list, row_expr: str, ctx: DAXContext) -> list:
+        """The order in which SUMX / AVERAGEX add the values the formula
+        engine computes over ``rows`` (one column's values): Power BI
+        Desktop reads a column's values in its data-ID order -- BLANK first,
+        then ascending for a value-encoded column, the dictionary's order
+        for a hash-encoded one -- where it iterates them on its own, and the
+        rows as the storage engine returned them otherwise
+        (#345).
+
+        Power BI Desktop 2.152 (build_b243c.py, Agents):
+        SUMX / AVERAGEX(FILTER(VALUES(DimEmployee[EmployeeKey]), ...),
+        [MOMTD % Total Sales]) add the employees in ascending key order
+        (o_filter_sumx 0.655902430415154, o_adjusted 0.968030277523212),
+        while over VALUES / ALL / ALLSELECTED of the key itself they add in
+        DimEmployee's storage order, the blank member last (o_values_sumx,
+        o_all_sumx, o_values_avgx; build_b243b.py gb_sumx_emp, gb_avgx_emp:
+        the order the rows come in). AVERAGEX(VALUES(FactSales[SalesAmount]),
+        FactSales[SalesAmount]) adds the 26,965 values in the dictionary's
+        order (x_values 0.475217667357356; first appearance in storage
+        order gives 0.475217667366, ascending 0.475217667336).
+
+        build_b243d.py (Agents) settles the rest:
+        - Inside an IF branch whose condition reads the data, VALUES & co.
+          of the key add in data-ID order with the blank member FIRST:
+          IF([_ShowValueForDates], SUMX(ALLSELECTED(EmployeeKey), [MTD Total
+          Sales])) (i_sumx_if 0.561099998652935; blank last gives
+          0.561100002378225, storage order 0.561100009828806), the same
+          AVERAGEX (i_avgx_if), the previous month's (i_pm_sumx_if,
+          build_b243c.py pm_avgx) and SUMX(VALUES(...), [MOMTD % Total
+          Sales]) (i_values_if, i_values_else 0.797591686248779). A SWITCH
+          branch is one too (i_switch, the same value as i_sumx_if). An IF
+          whose condition is a constant is no branch (i_avgx_iftrue: storage
+          order), nor is an IF around a VAR defined outside it (i_var_if).
+        - A FILTER whose conditions read nothing but the column itself
+          keeps the order of the table it filters: FILTER(VALUES(key),
+          TRUE()) and FILTER(VALUES(key), NOT ISBLANK(key)) add in storage
+          order (v_key_filter_t 0.797591596841812, v_key_filter_k
+          0.655902370810509); a condition that reads a measure gives the
+          data-ID order (o_filter_sumx).
+        - VALUES of a hash-encoded column adds in the dictionary's order
+          with a measure too: SUMX(VALUES(DimStore[StoreName]), [MTD Total
+          Sales]) (h_store_values 0.561099994927645, the same as its FILTER,
+          h_store_filter), and DimEmployee[LastName] (h_values_meas =
+          h_filter_meas, the blank member first), FactSales[UnitPrice]
+          (h_up_meas).
+
+        A FILTER whose condition reads another column or a context function
+        is taken as a measure's (not probed). Every table without a decoded
+        layout keeps the rows' order (not probed). A value the order does
+        not know comes last, in the rows' order."""
+        if len(rows) < 3:
+            return rows
+        first = rows[0]
+        if not (type(first) is dict and '__column__' in first and '__value__' in first
+                and '__row__' not in first and '__parts__' not in first):
+            return rows
+        kind, conds = self._fe_table_kind(table_arg)
+        if kind is None:
+            return rows
+        tname = ctx.model_table(str(first.get('__table__')))
+        tbl = ctx.tables.get(tname)
+        col = first['__column__']
+        if not isinstance(tbl, dict) or not all(
+                type(r) is dict and r.get('__column__') == col for r in rows):
+            return rows
+        if kind == 'filter' and all(self._fe_column_only(c, tname, col, ctx) for c in conds):
+            # conditions of the column alone: the filtered table's order
+            # (build_b243d.py v_key_filter_t, v_key_filter_k)
+            kind = 'values'
+        if kind == 'values' and self._if_branch and _FE_ORDER_IN_IF:
+            kind = 'filter'
+        enc = _se_scan.column_encoding(tbl, col)[0]
+        raw = _se_scan.dictionary_raw(tbl, col) if enc == 'hash' else None
+        if kind == 'values' and raw is None:
+            return rows
+        vals = [r['__value__'] for r in rows]
+        if raw is not None:
+            rank = self._fe_dictionary_rank(tbl, tname, col, raw, ctx)
+            big = len(rank)
+            keys: list = [-1 if v is None else rank.get(v, big) for v in vals]
+        elif enc == 'value' and _se_scan.column_runs(tbl, col) is not None:
+            # data IDs ascend with the values; BLANK first
+            keys = [(v is not None, 0 if v is None else v) for v in vals]
+        else:
+            return rows
+        try:
+            order = sorted(range(len(rows)), key=keys.__getitem__)
+        except TypeError:
+            return rows
+        return [rows[i] for i in order]
+
+    def _fe_column_only(self, cond: str, tname: str, col: str, ctx: DAXContext) -> bool:
+        """Does FILTER condition ``cond`` read nothing but column ``col`` of
+        ``tname`` (and literals, row functions of it)?"""
+        try:
+            cols = self._se_expr_columns(cond, tname, ctx)
+        except (RecursionError, ValueError, TypeError):
+            return False
+        return cols is not None and set(cols) <= {col}
+
+    @staticmethod
+    def _fe_dictionary_rank(tbl: dict, tname: str, col: str, raw: list,
+                            ctx: DAXContext) -> dict:
+        """value -> its data ID, for a hash-encoded column whose decoded
+        dictionary is ``raw`` (se_scan.dictionary_raw). Memoized on the
+        model's cache, kind 'se-dict', two units an entry: a dict slot of
+        about 100 bytes, its value shared with the rows. The entry is
+        checked against ``raw`` itself, which the layout keeps: a DateTime,
+        Decimal or Boolean dictionary is rebuilt (se_scan.dictionary_values)
+        only when the entry is built, not on every iteration over it."""
+        cache = ctx._filter_idx_cache
+        key = (id(tbl), 'se-dict', tname, col)
+        hit = cache.get(key)
+        if hit is not None and hit[0] is raw:
+            held: dict = hit[1]
+            return held
+        dict_values = _se_scan.dictionary_values(tbl, col) or []
+        rank: dict = {}
+        for i, v in enumerate(dict_values):
+            rank.setdefault(v, i)
+        _put_filter_entry(cache, key, (raw, rank), 4 + 2 * len(rank))
+        return rank
+
     def _fn_sumx(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMX(table_expression, expression) — iterate over table rows, sum expression."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
+        # over one table's own columns: the pieces of their runs, as
+        # Desktop's storage engine adds them (_se_iter_plan, issue #243)
+        plan = self._se_iter_plan(args[0], row_expr, ctx)
+        table_ref, probe = self._se_iter_table(args[0], plan, ctx)
+        got: Any = self._se_iter_column(plan, probe, table_ref, ctx)
+        if got is not _MISSING:
+            return got[0]
         if isinstance(table_ref, list):
+            if not table_ref:
+                self._win_empty_scan(row_expr, ctx)     # #247
+            elif plan is None:
+                # the order the formula engine adds in (#345)
+                table_ref = self._fe_fold_order(args[0], table_ref, row_expr, ctx)
             total: float = 0
             seen = False
             dates = True          # every value a date: the sum is a date (#146)
+            some_date = False
             # every value a Fixed Decimal (Currency) -- a Currency column's or
             # a _Currency -- their exact sum, as SUM adds them
             # (_currency_total; Desktop, issue #241)
             column = self._currency_ref(row_expr, table_ref, ctx)
             exact = True
+            # a computed Currency among the results: they add as counts, an
+            # Int64 beside them too (issue #248; Desktop 2.152, build_b254.py
+            # x_sumx1: SUMX(TCur, TCur[v] * 2) is an exact Currency; x_sumx2:
+            # SUMX(TCur, IF(TCur[v] > 0, TCur[v], 0)) too)
+            typed = False
+            # their counts, added as they come: a list of _Currency results
+            # would hold one GC-tracked object per row, and the collector's
+            # passes over them cost a 300,000-row SUMX a fifth more. The
+            # Int64s are not kept either: before the first Currency ``total``
+            # is their exact sum (an int, as no Double came), which the first
+            # Currency takes over; after it each adds its count. Keeping every
+            # Int64 in case a Currency came cost SUMX(P, IF(P[k] > 5, 1, 0))
+            # an append per row.
+            typed_counts = 0
             currency: list = []
-            for row_item in table_ref:
-                cell = self._row_cell(row_expr, row_item)
-                if cell is not _NO_CELL:
-                    result = cell
-                elif isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                    result = self._eval_expr(row_expr, row_ctx)
-                    result = self._resolve_row_result(result, row_item, row_ctx)
-                else:
-                    result = self._eval_expr(row_expr, ctx)
-                if isinstance(result, (datetime, date)):
-                    # Power BI Desktop 2.152 (build_b146.py, issue #146):
-                    # SUMX(Dt, Dt[Date] - DATE(2024, 1, 1)) is the DateTime
-                    # 1911-03-18 (4095 days). Dates were skipped.
-                    total += _as_number(result) or 0
-                    seen = True
-                    exact = False
-                elif isinstance(result, (int, float)):
-                    total += result
-                    seen = True
-                    dates = False
-                    if exact:
-                        if column or type(result) is _Currency:
-                            currency.append(result)
+            results: Optional[list] = [] if probe is not None else None
+            se = self._se_value_space(row_expr, table_ref, ctx, args[0])
+            if se:
+                _SE_STATE.on = True
+            try:
+                for row_item in table_ref:
+                    cell = self._row_cell(row_expr, row_item)
+                    if cell is not _NO_CELL:
+                        result = cell
+                    elif isinstance(row_item, dict) and '__table__' in row_item:
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                        result = self._eval_expr(row_expr, row_ctx)
+                        result = self._resolve_row_result(result, row_item, row_ctx)
+                    else:
+                        result = self._eval_expr(row_expr, ctx)
+                    if results is not None:
+                        results.append(result)
+                    if isinstance(result, (datetime, date)):
+                        some_date = True
+                        # Power BI Desktop 2.152 (build_b146.py, issue #146):
+                        # SUMX(Dt, Dt[Date] - DATE(2024, 1, 1)) is the DateTime
+                        # 1911-03-18 (4095 days). Dates were skipped. (A Double
+                        # total from here on, see below.)
+                        total = float(total) + (_as_number(result) or 0)
+                        seen = True
+                        exact = False
+                    elif isinstance(result, (int, float)):
+                        seen = True
+                        dates = False
+                        if not exact:
+                            # the total is a Double once it is not exact: a
+                            # Currency adds to it as a Double (_Currency's +),
+                            # and any other row costs what it did in 0.9.147
+                            total += result
+                            continue
+                        t = type(result)
+                        if t is _Currency:
+                            if not typed and not column:
+                                # the Int64s so far, exactly (see above)
+                                typed_counts = int(total) * 10000
+                            typed_counts += _cur_count(result)
+                            typed = True
+                            # the running Double total takes its float: through
+                            # _Currency's + it would add as Currency, row by row
+                            total += float(result)
                         else:
-                            exact = False
-                            currency = []
+                            total += result
+                            if column:
+                                currency.append(result)
+                            elif t is int or t is bool:
+                                if typed:
+                                    typed_counts += int(result) * 10000
+                            else:
+                                exact = False
+            finally:
+                if se:
+                    _SE_STATE.on = False
             # SUMX over nothing is BLANK, matching SUM and Desktop
             # (SUMX(FILTER({1,2,3}, FALSE()), 1) is BLANK, not 0).
             if not seen:
                 return None
-            if exact:
+            if exact and typed:
+                return _cur_make(_wrap64(typed_counts + sum(map(_cur_count_any, currency))))
+            if exact and column:
                 return _currency_total(currency)
+            if (not exact and plan is not None and probe is not None and not some_date
+                    and results is not None):
+                got = self._se_iter_total(plan, probe, table_ref, results, ctx)
+                if got is not _MISSING and got[1]:
+                    return got[0]
             return _DAX_EPOCH_DT + timedelta(days=total) if dates else total
         return None
 
@@ -12913,23 +19757,38 @@ class DAXEngine:
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
+            if not table_ref:
+                self._win_empty_scan(row_expr, ctx)     # #247
             max_val = None
-            for row_item in table_ref:
-                cell = self._row_cell(row_expr, row_item)
-                if cell is not _NO_CELL:
-                    max_val = _extremum(max_val, cell, True)
-                elif isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                    result = self._eval_expr(row_expr, row_ctx)
-                    result = self._resolve_row_result(result, row_item, row_ctx)
-                    max_val = _extremum(max_val, result, True)
-                else:
-                    result = self._eval_expr(row_expr, ctx)
-                    max_val = _extremum(max_val, result, True)
+            se = self._se_value_space(row_expr, table_ref, ctx, args[0])
+            if se:
+                _SE_STATE.on = True
+            try:
+                for row_item in table_ref:
+                    cell = self._row_cell(row_expr, row_item)
+                    if cell is not _NO_CELL:
+                        max_val = _extremum(max_val, cell, True)
+                    elif isinstance(row_item, dict) and '__table__' in row_item:
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                        result = self._eval_expr(row_expr, row_ctx)
+                        result = self._resolve_row_result(result, row_item, row_ctx)
+                        max_val = _extremum(max_val, result, True)
+                    else:
+                        result = self._eval_expr(row_expr, ctx)
+                        max_val = _extremum(max_val, result, True)
+            finally:
+                if se:
+                    _SE_STATE.on = False
+            # a Fixed Decimal column's value is a Currency (issue #248;
+            # Desktop 2.152, build_b254.py a_iter: MAXX(TCur3, TCur3[v]) C0.2)
+            if type(max_val) is float and self._currency_ref(row_expr, table_ref, ctx):
+                return _Currency(max_val)
             return max_val
         # Fallback: if table_ref is a column ref, get max of column
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
             values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]
+            if values and self._currency_column(table_ref, ctx):
+                return _Currency(max(values))
             return max(values) if values else None
         return None
 
@@ -12941,22 +19800,36 @@ class DAXEngine:
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
         if isinstance(table_ref, list):
+            if not table_ref:
+                self._win_empty_scan(row_expr, ctx)     # #247
             min_val = None
-            for row_item in table_ref:
-                if isinstance(row_item, dict) and '__table__' in row_item:
-                    # _make_row_context handles both single-column (ALL(T[c]))
-                    # and multi-column (bare-table ALL(T)/FILTER(T)) row dicts;
-                    # the old __column__/__value__ access KeyError'd on the latter.
-                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                    result = self._eval_expr(row_expr, row_ctx)
-                    result = self._resolve_row_result(result, row_item, row_ctx)
-                    min_val = _extremum(min_val, result, False)
-                else:
-                    result = self._eval_expr(row_expr, ctx)
-                    min_val = _extremum(min_val, result, False)
+            se = self._se_value_space(row_expr, table_ref, ctx, args[0])
+            if se:
+                _SE_STATE.on = True
+            try:
+                for row_item in table_ref:
+                    if isinstance(row_item, dict) and '__table__' in row_item:
+                        # _make_row_context handles both single-column (ALL(T[c]))
+                        # and multi-column (bare-table ALL(T)/FILTER(T)) row dicts;
+                        # the old __column__/__value__ access KeyError'd on the latter.
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                        result = self._eval_expr(row_expr, row_ctx)
+                        result = self._resolve_row_result(result, row_item, row_ctx)
+                        min_val = _extremum(min_val, result, False)
+                    else:
+                        result = self._eval_expr(row_expr, ctx)
+                        min_val = _extremum(min_val, result, False)
+            finally:
+                if se:
+                    _SE_STATE.on = False
+            # a Fixed Decimal column's value is a Currency (issue #248)
+            if type(min_val) is float and self._currency_ref(row_expr, table_ref, ctx):
+                return _Currency(min_val)
             return min_val
         if isinstance(table_ref, tuple) and len(table_ref) == 2:
             values = [v for v in ctx.get_column_data(table_ref[0], table_ref[1]) if isinstance(v, (int, float))]
+            if values and self._currency_column(table_ref, ctx):
+                return _Currency(min(values))
             return min(values) if values else None
         return None
 
@@ -12965,34 +19838,91 @@ class DAXEngine:
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
+        # over one table's own columns: the storage engine's sum over the
+        # count (Power BI Desktop 2.152, build_b243b.py av_x, av_xp; #243)
+        plan = self._se_iter_plan(args[0], row_expr, ctx)
+        table_ref, probe = self._se_iter_table(args[0], plan, ctx)
+        got: Any = self._se_iter_column(plan, probe, table_ref, ctx)
+        if got is not _MISSING:
+            return got[0] / got[1]
         values = []
+        # computed Currency values: their counts' total, and their floats
+        # apart from the other numbers (see _fn_sumx) -- whether those are
+        # Int64s alone is asked once at the end, so a row that yields no
+        # Currency costs no more than an append
+        cur_counts = 0
+        cur_vals: list = []
         if isinstance(table_ref, list):
-            for row_item in table_ref:
-                cell = self._row_cell(row_expr, row_item)
-                if cell is not _NO_CELL:
-                    result = cell
-                elif isinstance(row_item, dict) and '__table__' in row_item:
-                    row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                    result = self._eval_expr(row_expr, row_ctx)
-                    result = self._resolve_row_result(result, row_item, row_ctx)
-                else:
-                    result = self._eval_expr(row_expr, ctx)
-                if isinstance(result, (datetime, date)):
-                    # A date averages as its serial, and the average is a
-                    # number: Power BI Desktop 2.152 (build_b146.py, issue
-                    # #146), AVERAGEX(Dt, Dt[Date]) is 45337. Dates were skipped.
-                    result = _as_number(result)
-                if isinstance(result, (int, float)):
-                    values.append(result)
-            # a Currency column's values add exactly, as in SUMX (#241)
-            if values and self._currency_ref(row_expr, table_ref, ctx):
-                return _currency_total(values) / len(values)
-        # correctly rounded, as AVERAGE (issue #246)
-        return _sum_numbers(values) / len(values) if values else None
+            if not table_ref:
+                self._win_empty_scan(row_expr, ctx)     # #247
+            if plan is None and table_ref:
+                # the order the formula engine adds in (#345)
+                table_ref = self._fe_fold_order(args[0], table_ref, row_expr, ctx)
+            results: Optional[list] = [] if probe is not None else None
+            some_date = False
+            se = self._se_value_space(row_expr, table_ref, ctx, args[0])
+            if se:
+                _SE_STATE.on = True
+            try:
+                for row_item in table_ref:
+                    cell = self._row_cell(row_expr, row_item)
+                    if cell is not _NO_CELL:
+                        result = cell
+                    elif isinstance(row_item, dict) and '__table__' in row_item:
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                        result = self._eval_expr(row_expr, row_ctx)
+                        result = self._resolve_row_result(result, row_item, row_ctx)
+                    else:
+                        result = self._eval_expr(row_expr, ctx)
+                    if results is not None:
+                        results.append(result)
+                    if isinstance(result, (datetime, date)):
+                        some_date = True
+                        # A date averages as its serial, and the average is a
+                        # number: Power BI Desktop 2.152 (build_b146.py, issue
+                        # #146), AVERAGEX(Dt, Dt[Date]) is 45337. Dates were skipped.
+                        result = _as_number(result)
+                    if isinstance(result, (int, float)):
+                        if type(result) is _Currency:
+                            cur_counts += _cur_count(result)
+                            cur_vals.append(float(result))
+                        else:
+                            values.append(result)
+            finally:
+                if se:
+                    _SE_STATE.on = False
+            # a Currency column's values add exactly, as in SUMX (#241), and
+            # the average is a Currency rounded half away from zero, of
+            # computed Currency values too, beside Int64s (issue #248; Desktop
+            # 2.152, build_b254.py r_avgx, a_iter: AVERAGEX(TCur3, TCur3[v] *
+            # 2) is C0.2667)
+            if cur_vals or values:
+                if self._currency_ref(row_expr, table_ref, ctx):
+                    values += cur_vals
+                    return _cur_avg(_wrap64(sum(map(round, map(_CURRENCY_SCALE, values)))), len(values))
+                if cur_vals:
+                    if set(map(type, values)) <= {int, bool}:
+                        return _cur_avg(_wrap64(cur_counts + int(sum(values)) * 10000),
+                                        len(values) + len(cur_vals))
+                    # a Double beside them: the Double average of every value
+                    values += cur_vals
+                elif (plan is not None and probe is not None and not some_date
+                        and results is not None):
+                    got = self._se_iter_total(plan, probe, table_ref, results, ctx)
+                    if got is not _MISSING and got[1]:
+                        return got[0] / got[1]
+        # Anything else is added by the formula engine, left to right in the
+        # iteration's order, as SUMX adds it: Power BI Desktop 2.152's
+        # AVERAGEX(ALLSELECTED(DimEmployee[EmployeeKey]), [MTD Total Sales])
+        # is the fold of the members' values in DimEmployee's order, the
+        # blank member last, over their count (build_b243b.py gb_avgx_emp
+        # 73514.796034732862609; the correctly rounded sum of 0.9.147, issue
+        # #246, gave ...28189528; #342) -- the order
+        # _fe_fold_order put the rows in (#345).
+        return _fe_sum(values) / len(values) if values else None
 
-    def _fn_countx(self, args_str: str, ctx: DAXContext) -> Any:
+    def _fn_countx(self, args_str: str, ctx: DAXContext, scan_empty: bool = True) -> Any:
         """COUNTX(table_expression, expression) — count non-blank results per row."""
         args = self._split_args(args_str)
         if len(args) < 2:
@@ -13001,6 +19931,8 @@ class DAXEngine:
         row_expr = args[1].strip()
         count = 0
         if isinstance(table_ref, list):
+            if not table_ref and scan_empty:
+                self._win_empty_scan(row_expr, ctx)     # #247
             for row_item in table_ref:
                 cell = self._row_cell(row_expr, row_item)
                 if cell is not _NO_CELL:
@@ -13020,7 +19952,10 @@ class DAXEngine:
 
     def _fn_countax(self, args_str: str, ctx: DAXContext) -> Any:
         """COUNTAX(table_expression, expression) — count non-blank results (like COUNTX but counts text too)."""
-        # In DAX, COUNTAX counts non-blank values of any type; functionally same as COUNTX here
+        # In DAX, COUNTAX counts non-blank values of any type; functionally same as COUNTX here.
+        # Over an empty table it refuses the window functions of its
+        # expression as COUNTX does (build_b253d.py b_countax_empty,
+        # issue #247; DAXEngine._win_empty_scan).
         return self._fn_countx(args_str, ctx)
 
     def _fn_countblank(self, args_str: str, ctx: DAXContext) -> Any:
@@ -13051,6 +19986,11 @@ class DAXEngine:
             values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
             if not values:
                 return None
+            if self._currency_column(ref, ctx):
+                # a Currency, a tie rounded toward +infinity (issue #248;
+                # Desktop 2.152, build_b254.py r_median, a_col)
+                return _cur_percentile(list(map(round, map(_CURRENCY_SCALE, values))),
+                                       Fraction(len(values) - 1, 2))
             return statistics.median(values)
         return None
 
@@ -13079,7 +20019,26 @@ class DAXEngine:
             if isinstance(result, (int, float)) and not isinstance(result, bool):
                 values.append(result)
         # MEDIANX over no rows is BLANK, so ISBLANK fires.
-        return statistics.median(sorted(values)) if values else None
+        if not values:
+            return None
+        cur = self._cur_numbers(values, row_expr, table_ref, ctx)
+        if cur is not None:
+            # a Currency, a tie rounded toward +infinity (issue #248; Desktop
+            # 2.152, build_b254b.py f_median: MEDIANX over -1 and 0 counts is
+            # 0, over -3 and 0 -1; build_b254.py a_iter)
+            return _cur_percentile(cur, Fraction(len(cur) - 1, 2))
+        return statistics.median(sorted(values))
+
+    def _cur_numbers(self, values: list, row_expr: str, table_ref, ctx: DAXContext):
+        """An iterator's numbers as Currency counts when they are Currency
+        values -- a Fixed Decimal column's (_currency_ref) or computed ones,
+        an Int64 beside them as its count -- else None."""
+        if self._currency_ref(row_expr, table_ref, ctx):
+            return [_cur_count(v) for v in values]
+        kinds = set(map(type, values))
+        if _Currency in kinds and kinds <= {_Currency, int}:
+            return [_cur_count_any(v) for v in values]
+        return None
 
     def _fn_mround(self, args_str: str, ctx: DAXContext) -> Any:
         """MROUND(number, multiple) — round to the nearest multiple of `multiple`.
@@ -13096,6 +20055,17 @@ class DAXEngine:
             return None
         if mult == 0:
             return 0                     # Desktop: MROUND(7, 0) is 0
+        if type(num) is _Currency and (num == 0 or (num > 0) == (mult > 0)):
+            # on the counts, half away from zero, a Currency (Power BI Desktop
+            # 2.152, build_b254.py f_round: MROUND(CURRENCY(1.2345), 0.05) is
+            # C1.25; #305)
+            s = _cur_sig_count(mult)
+            if s:
+                return _cur_make(_wrap64(_div_half_away(_cur_count(num), s) * s))
+            # a multiple of no whole count: the Double's, then a Currency
+            # (build_b248c.py h_fn_edges: MROUND(CURRENCY(1.2345), 0.00001)
+            # is C1.2345, where it was the Double 1.2345000000000002)
+            return _cur_double_multiple(num, mult, _half_away_whole)
         if num != 0 and (num > 0) != (mult > 0):
             # Desktop REFUSES a sign mismatch ("an argument to MROUND has the
             # wrong data type, or the result is too large or too small"), so
@@ -13162,7 +20132,7 @@ class DAXEngine:
             values.append(v)
         values = [v for v in values if v is not None]
         # the column's own order: text in the model's collation (#157)
-        values.sort(key=_order_key)
+        values = _order_sorted(values)
         if last:
             values.reverse()
         for v in values:
@@ -13239,19 +20209,886 @@ class DAXEngine:
         an error rather than a value.
         """
         from pbix_mcp.errors import DAXEvaluationError
+        if args_str.strip() and not _TEXT_LITERAL_RE.match(args_str.strip()):
+            # Desktop refuses it before running anything (#268;
+            # evaluate_measure checks the measures a query reaches up front,
+            # this is the same refusal wherever ERROR is reached otherwise)
+            err = DAXEvaluationError(_ERROR_CONST_MSG)
+            setattr(err, "_dax_uncatchable", True)
+            raise err
         msg = self._eval_expr(args_str.strip(), ctx) if args_str.strip() else ''
         raise DAXEvaluationError(f"DAX ERROR(): {msg}")
 
+    # ---- the logical operators and FILTER's conjuncts (issue #249) ----------
+    # Power BI Desktop 2.152 over ADOMD, build_b255.py (B255, 121 probes) and
+    # build_b255b.py (B255b, 78), over TM(n, d, z) = (7, 2, 1), (7, 0, 0),
+    # (-7, 2, 1), (7, BLANK, 0), where MOD(TM[n], TM[d]) is an error on the
+    # second and fourth rows (b234: MOD by 0 or BLANK):
+    #   * && || AND() OR() evaluate every operand when one of them reads the
+    #     current row of an iteration (a3, x1-x12, n1-n6 over GENERATESERIES,
+    #     DATATABLE, { } and ADDCOLUMNS tables, o2, o3, e1, e5, e9 ERROR("x"),
+    #     e15 TM[d] = 99 && MOD(7, 0) = 1), reads a measure there -- which
+    #     transitions the row (i12, i14, x18) -- or reads a table that the
+    #     filter context filters (b255b v4: CALCULATE([m_and_d], TM[d] = 0)
+    #     fails, x22, and the groups of SUMMARIZECOLUMNS, v1 / q_scol_z).
+    #   * Otherwise they stop at the deciding side: the scalars s1, s2, s8
+    #     and [m_and_d] with no filter (v2), and, in a row, operands that read
+    #     nothing that changes -- SUMX(TM, IF([m_zero] <> 0 && MOD(1,
+    #     [m_zero]) = 1, 1, 0)) is 0 (x19; m_zero is COUNTROWS(ALL(TM)) - 4),
+    #     as are IF(FALSE() && MOD(1, 0) = 1, 1, 0) (x20) and a measure built
+    #     on m_zero (x21).
+    #   * IF / SWITCH / IF.EAGER branches and VARs stay lazy (i1-i11, s4-s7).
+    # _logic_eager decides it from what the operands read (_local_deps).
+
+    def _logic_eager(self, parts: tuple, ctx: DAXContext, var_scope: dict | None,
+                     depth: int = 0, rows: bool = True) -> bool:
+        """Does a logical operator over ``parts`` evaluate every operand here
+        (see the note above)? A VAR operand counts as what its own
+        expression reads where it is defined. ``rows`` False asks about
+        the filters alone (_logic_hoisted)."""
+        deps = self._logic_deps(parts, ctx)
+        if deps is _NO_DEPS:
+            return False
+        row, mrow, tables, vars_ = deps
+        outer = ctx._outer_ctx
+        if rows and (row or mrow) and (ctx._current_row is not None or outer is not None):
+            return True
+        if tables:
+            # an iteration's row sits in its context's filters (the engine
+            # applies the transition eagerly); the filters the iteration was
+            # opened in are the ones that count here
+            fctx = ctx._row_root() if outer is not None else ctx
+            if fctx.filter_context:
+                for t in tables:
+                    if fctx.is_cross_filtered(t):
+                        return True
+        if vars_ and var_scope and depth < 8:
+            for name in vars_:
+                lv = var_scope.get(name)
+                if lv is None:
+                    low = name.lower()
+                    lv = next((v for k, v in var_scope.items() if k.lower() == low), None)
+                if isinstance(lv, _LazyVar):
+                    # where it is defined, so kept on the VAR: an iteration
+                    # asks for every row
+                    memo = lv.eager
+                    if memo is None:
+                        memo = lv.eager = [None, None]
+                    hit = memo[rows]
+                    if hit is None:
+                        hit = memo[rows] = self._logic_eager(
+                            (lv.expr,), lv.ctx, lv.scope, depth + 1, rows)
+                    if hit:
+                        return True
+        return False
+
+    # In a row, Power BI Desktop 2.152 (build_b255c.py) evaluates the operands
+    # that read nothing the row changes first, once, as a scalar && / || does,
+    # and one of them that decides decides for every row without the others:
+    # SUMX(TM, IF([m_zero] <> 0 && MOD(TM[n], TM[d]) = 1, 1, 0)) is 0 (h1),
+    # and so is the same with the operands swapped (h2), with FALSE() (h3) and
+    # with a VAR defined outside the iteration (w2); [m_zero] = 0 || MOD(...)
+    # = 1 counts 4 (h4). Only when none of them decides do the operands that
+    # read the row run, every one of them (a3; VARs defined in the row, w1).
+    # One that decides decides although another of them fails: SUMX(TM,
+    # IF(MOD(1, [m_zero]) = 1 && [m_zero] <> 0 && TM[d] <> 0, 1, 0)) is 0
+    # (build_b255d.py f6), where TM[d] = 99 && MOD(1, [m_zero]) = 1 fails
+    # (f5: none decides). Under a filter on a table the operands read, every
+    # operand runs on every row, as a scalar && does there (_logic_eager;
+    # b255c v7): CALCULATE(SUMX(TM, IF(SELECTEDVALUE(TM[d]) <> 0 &&
+    # MOD(TM[n], TM[d]) = 1, 1, 0)), TM[z] = 0) fails on MOD (f10; the
+    # operand as a VAR defined in the CALCULATE, f9), where without the
+    # filter the row-free operand decides (h1, w2).
+
+    def _logic_split(self, parts: tuple, ctx: DAXContext) -> Optional[tuple]:
+        """Per operand of a logical operator evaluated in a row: 0 when it
+        reads nothing the row changes (a constant, a measure over ALL, an
+        aggregate without a transition), 1 when it reads the row (a column of
+        it, or a measure / CALCULATE that transitions it and reads
+        something), 2 when it is that only through names that may be VARs
+        (decided where the VAR is defined, _logic_hoisted). None when the
+        order cannot matter: no operand reads the row, or every one does.
+        Memoized per model like _logic_deps (one-entry identity memo first)."""
+        cache = ctx._shield_cache
+        last = self._last_logic_split
+        if last[0] is parts and last[1] is cache:
+            same: Optional[tuple] = last[2]
+            return same
+        key = ('logic-split', parts)
+        hit = cache.get(key, _MISSING)
+        if hit is _MISSING:
+            flags = []
+            for text in parts:
+                r, m, _t, v = self._resolve_deps(_local_deps(text), ctx, set(), False)
+                flags.append(1 if (r or m) else 2 if v else 0)
+            f = tuple(flags)
+            hit = f if (0 in f or 2 in f) and (1 in f or 2 in f) else None
+            cache[key] = hit
+        self._last_logic_split = (parts, cache, hit)
+        out: Optional[tuple] = hit
+        return out
+
+    def _logic_hoisted(self, parts: tuple, split: tuple, ctx: DAXContext,
+                       var_scope: dict | None, stop: bool, infix: bool) -> bool:
+        """A logical operator in a row whose operands _logic_split tells
+        apart (see the note above): the operands that read nothing the row
+        changes first, in order, each stopping the rest as a scalar && does
+        (_logic_eager among themselves); then, when none decided, every
+        operand that reads the row. ``infix`` is the && / || form (DAX
+        truthiness, ``var_scope`` passed on), else AND() / OR()."""
+        truthy = self._dax_truthy if infix else bool
+        scope = var_scope if infix else None
+        names = var_scope if var_scope is not None else self._current_var_scope
+        root = ctx._row_root() if ctx._outer_ctx is not None else ctx
+        last = self._last_logic_filtered
+        if last[0] is parts and last[1] is names and last[2] is root:
+            filtered = last[3]           # the next row of the same iteration
+        else:
+            filtered = self._logic_eager(parts, ctx, names, rows=False)
+            self._last_logic_filtered = (parts, names, root, filtered)
+        if filtered:
+            # a filter reaches what they read: every operand, in order (f9, f10)
+            out = not stop
+            for p in parts:
+                if truthy(self._eval_expr(p, ctx, scope)) is stop:
+                    out = stop
+            return out
+        free: list = []
+        bound: list = []
+        for p, f in zip(parts, split):
+            if f == 2:
+                f = 1 if self._var_operand_reads_row(p, ctx, names) else 0
+            (bound if f else free).append(p)
+        failed: Optional[BaseException] = None
+        for p in free:
+            try:
+                decided = truthy(self._eval_expr(p, ctx, scope)) is stop
+            except (_VarEvalError, _ScalarColumnsError):
+                raise
+            except Exception as exc:  # noqa: BLE001 -- raised below unless another decides (f6)
+                if (getattr(exc, "_dax_uncatchable", False) or getattr(exc, "_pbix_deadline", False)):
+                    raise
+                if failed is None:
+                    failed = exc
+                continue
+            if decided:
+                return stop
+        if failed is not None:
+            raise failed
+        for i, p in enumerate(bound):
+            if truthy(self._eval_expr(p, ctx, scope)) is stop:
+                for q in bound[i + 1:]:
+                    truthy(self._eval_expr(q, ctx, scope))
+                return stop
+        return not stop
+
+    def _var_operand_reads_row(self, text: str, ctx: DAXContext, scope: dict | None) -> bool:
+        """Does an operand whose only reads are names (_logic_split's 2)
+        read the row: is one of them a VAR whose expression reads a row
+        where it was defined (_lazy_var_reads_row: w1's VARs in the row),
+        or a name no VAR in ``scope`` has? A VAR defined outside the
+        iteration reads no row of it, whatever filters reach what it reads
+        (build_b255c.py w2), as the same operand written inline is hoisted.
+        The names are memoized per model, the answer on the VAR."""
+        cache = ctx._shield_cache
+        key = ('var-operand-names', text)
+        names = cache.get(key)
+        if names is None:
+            names = cache[key] = tuple(self._resolve_deps(_local_deps(text), ctx, set(), False)[3])
+        for name in names:
+            lv = (scope or {}).get(name)
+            if lv is None and scope:
+                low = name.lower()
+                lv = next((v for k, v in scope.items() if k.lower() == low), None)
+            if lv is None:
+                return True
+            if isinstance(lv, _LazyVar) and self._lazy_var_reads_row(lv, 0):
+                return True
+        return False
+
+    def _lazy_var_reads_row(self, lv: '_LazyVar', depth: int) -> bool:
+        """Does the VAR ``lv``'s expression read a row where it is defined:
+        it is defined in a row (or an outer row) and reads a column of it, or
+        a measure / CALCULATE that transitions it, or such a VAR? Kept on the
+        VAR (one VAR object serves every row of an iteration it encloses)."""
+        hit = lv.rowread
+        if hit is not None:
+            return hit
+        out = False
+        c = lv.ctx
+        if c._current_row is not None or c._outer_ctx is not None:
+            cache = c._shield_cache
+            key = ('logic-deps', (lv.expr,))
+            deps = cache.get(key)
+            if deps is None:
+                r, m, t, v = self._resolve_deps(_local_deps(lv.expr), c, set(), False)
+                deps = (_NO_DEPS if not (r or m or t or v)
+                        else (r, m, frozenset(t), tuple(dict.fromkeys(v))))
+                cache[key] = deps
+            row, mrow, _tables, vars_ = deps
+            out = bool(row or mrow)
+            if not out and vars_ and depth < 8:
+                for name in vars_:
+                    inner = (lv.scope or {}).get(name)
+                    if inner is None and lv.scope:
+                        low = name.lower()
+                        inner = next((x for k, x in lv.scope.items() if k.lower() == low), None)
+                    if isinstance(inner, _LazyVar) and self._lazy_var_reads_row(inner, depth + 1):
+                        out = True
+                        break
+        lv.rowread = out
+        return out
+
+    def _logic_deps(self, parts: tuple, ctx: DAXContext) -> tuple:
+        """``(row, mrow, tables, vars)`` of the texts ``parts``, resolved
+        against the model and memoized in the model's analysis memo
+        (_shield_cache; it reads no filter): a column read from the row, a
+        measure or CALCULATE that transitions the row and reads something, the
+        tables read through aggregates or measures, and identifiers that may
+        be VARs."""
+        cache = ctx._shield_cache
+        last = self._last_logic_deps
+        if last[0] is parts and last[1] is cache:
+            # an iteration asks for the same operator on every row
+            same: tuple = last[2]
+            return same
+        key = ('logic-deps', parts)
+        hit: Optional[tuple] = cache.get(key)
+        if hit is not None:
+            self._last_logic_deps = (parts, cache, hit)
+            return hit
+        row = mrow = False
+        tables: set = set()
+        vars_: list = []
+        for text in parts:
+            r, m, t, v = self._resolve_deps(_local_deps(text), ctx, set(), False)
+            row, mrow = row or r, mrow or m
+            tables |= t
+            vars_ += [x for x in v if x not in vars_]
+        out = (_NO_DEPS if not (row or mrow or tables or vars_)
+               else (row, mrow, frozenset(tables), tuple(vars_)))
+        cache[key] = out
+        self._last_logic_deps = (parts, cache, out)
+        return out
+
+    def _resolve_deps(self, ld: tuple, ctx: DAXContext, seen: set, body: bool) -> tuple:
+        """_local_deps' names resolved against the model: ``(row, mrow,
+        tables, vars)``. In a measure ``body`` nothing is read from a row (the
+        reference transitioned it): a column counts as its table."""
+        row_qual, row_bare, in_qual, in_bare, idents, trans = ld
+        row = False
+        mrow = bool(trans)
+        tables: set = set()
+        vars_: list = []
+
+        def measure(name: str) -> bool:
+            nonlocal mrow
+            if not self._measure_exists(name, ctx):
+                return False
+            has, mt = self._measure_logic_deps(name, ctx, seen)
+            mrow = mrow or has
+            tables.update(mt)
+            return True
+
+        def column_table(t: str, c: str):
+            mc = self._model_col(t, c, ctx)
+            return mc[0] if mc is not None else None
+
+        for t, c in row_qual:
+            mt = column_table(t, c)
+            if mt is not None:
+                if body:
+                    tables.add(mt)
+                else:
+                    row = True
+            elif not measure(c):
+                row = row or not body
+        for name in row_bare:
+            if not measure(name):
+                if body:
+                    tables.update(self._bare_owners(name, ctx))
+                else:
+                    row = True
+        for t, c in in_qual:
+            mt = column_table(t, c)
+            if mt is not None:
+                tables.add(mt)
+            elif not measure(c):
+                mtab = _model_table_fast(ctx, t)
+                if mtab in ctx.tables:
+                    tables.add(mtab)
+        for name in in_bare:
+            if not measure(name):
+                tables.update(self._bare_owners(name, ctx))
+        for name in idents:
+            mt = _model_table_fast(ctx, name)
+            if mt in ctx.tables:
+                tables.add(mt)
+            elif not body and name.upper() not in _DEP_KEYWORDS:
+                vars_.append(name)
+        return row, mrow, tables, vars_
+
+    @staticmethod
+    def _bare_owners(name: str, ctx: DAXContext) -> list:
+        """The tables that have a column ``name`` (a bare [name] that is no
+        measure)."""
+        return [tn for tn, t in ctx.tables.items()
+                if ctx._find_col_idx(t.get('columns') or [], name) >= 0]
+
+    def _measure_logic_deps(self, name: str, ctx: DAXContext, seen: set) -> tuple:
+        """``(reads_anything, tables)`` of measure ``name``'s body and the
+        measures it references (memoized like _logic_deps). A measure over
+        ALL(T) only reads nothing (B255's m_zero). With calculation groups an
+        applied item may stand in for the body: such a measure reads
+        something."""
+        canon = name
+        if canon not in ctx.measures:
+            low = name.lower()
+            canon = next((m for m in ctx.measures if m.lower() == low), name)
+        cache = ctx._shield_cache
+        key = ('logic-mdeps', canon)
+        hit: Optional[tuple] = cache.get(key)
+        if hit is not None:
+            return hit
+        if canon in seen:
+            return True, frozenset()
+        seen.add(canon)
+        _r, m, t, _v = self._resolve_deps(
+            _local_deps(str(ctx.measures.get(canon) or '')), ctx, seen, True)
+        has = bool(m or t) or bool(_calc_registry(ctx.measures)[0])
+        out = (has, frozenset(t))
+        cache[key] = out
+        return out
+
+    _SELECTEDVALUE_COL_RE = re.compile(
+        r"(?is)\bSELECTEDVALUE\s*\(\s*((?:'(?:[^']|'')+'|[^\W\d][\w.]*)\s*\[[^\]]+\])\s*\)")
+
+    @staticmethod
+    def _plan_head(text: str) -> tuple:
+        """The first step of ``text``'s plan: ``(kind, data)``. The plan is
+        kept, as _eval_expr keeps it: a CALCULATE filter like T[g] = 1 is
+        never _eval_expr'd itself (the spec path applies it), and analyzing
+        it anew on every call cost a CALCULATE in a 20,000-row SUMX a quarter
+        of its time."""
+        plan = _PLAN_CACHE.get(text)
+        if plan is None:
+            if len(_PLAN_CACHE) > 200_000:
+                _PLAN_CACHE.clear()
+            plan = _PLAN_CACHE[text] = _analyze_expr(text)
+        step: tuple = plan[0]
+        return step
+
+    def _top_conjuncts(self, cond: str) -> tuple:
+        """FILTER's condition as its top-level conjuncts: && and AND() split,
+        through parentheses, not through VAR, || or NOT (issue #249)."""
+        hit: Optional[tuple] = _CONJUNCT_CACHE.get(cond)
+        if hit is not None:
+            return hit
+        out: list = []
+
+        def walk(e: str) -> None:
+            e = e.strip()
+            kind, data = self._plan_head(e)
+            if kind == _P_PAREN:
+                walk(data)
+                return
+            if kind == _P_LOGICAL and data[0] == '&&':
+                for p in data[1]:
+                    walk(p)
+                return
+            if kind == _P_FUNC and data[0] == 'AND':
+                a = self._split_args(data[1])
+                if len(a) == 2:
+                    walk(a[0])
+                    walk(a[1])
+                    return
+            out.append(e)
+
+        walk(cond)
+        res = tuple(out)
+        if len(_CONJUNCT_CACHE) > 200_000:
+            _CONJUNCT_CACHE.clear()
+        _CONJUNCT_CACHE[cond] = res
+        return res
+
+    def _filter_source_table(self, tbl_text: str, ctx: DAXContext) -> Optional[tuple]:
+        """``(table, columns)`` when a FILTER's table argument scans a model
+        table -- the table, ALL / VALUES / DISTINCT of it, ALL of some of its
+        columns, KEEPFILTERS / FILTER / CALCULATETABLE of such a scan, or
+        SUMMARIZE of its columns (the CALCULATE pushdown's rewrite); columns
+        is the frozenset of the scanned columns, None for all of them -- else
+        None: a GENERATESERIES, DATATABLE, { } or ADDCOLUMNS table, or a VAR.
+        Memoized per model."""
+        cache = ctx._shield_cache
+        key = ('filter-source', tbl_text)
+        if key in cache:
+            hit: Optional[tuple] = cache[key]
+            return hit
+        out: Optional[tuple] = None
+        s = tbl_text.strip()
+        kind, data = self._plan_head(s) if s else (_P_NONE, None)
+        if kind == _P_PAREN:
+            out = self._filter_source_table(data, ctx)
+        elif kind in (_P_MAYBEVAR, _P_TAIL):
+            name = s[1:-1].replace("''", "'") if len(s) > 1 and s[0] == s[-1] == "'" else s
+            mt = _model_table_fast(ctx, name)
+            out = (mt, None) if mt in ctx.tables else None
+        elif kind == _P_FUNC:
+            fname, fargs = data
+            args = [a.strip() for a in self._split_args(fargs)] if fargs.strip() else []
+            if fname in ('ALL', 'ALLNOBLANKROW', 'ALLSELECTED', 'ALLCROSSFILTERED', 'VALUES',
+                         'DISTINCT', 'RELATEDTABLE') and args:
+                owners = set()
+                cols: Optional[set] = set()
+                for a in args:
+                    mc = self._model_column_match(a, ctx)
+                    if mc is not None:
+                        owners.add(mc[0])
+                        if cols is not None:
+                            cols.add(mc[1])
+                    else:
+                        nm = a[1:-1].replace("''", "'") if len(a) > 1 and a[0] == a[-1] == "'" else a
+                        owners.add(_model_table_fast(ctx, nm))
+                        cols = None
+                if len(owners) == 1 and not (cols and fname == 'VALUES'):
+                    # VALUES of columns: no first step (Power BI Desktop
+                    # 2.152, build_b255c.py c24: COUNTROWS(FILTER(
+                    # VALUES(TM[d]), MOD(7, TM[d]) = 1 && TM[d] <> 0)) fails
+                    # on MOD's division by zero). DISTINCT and ALL of one
+                    # column have none either (build_b255d.py c32, c33):
+                    # _filter_scan_source, which FILTER asks.
+                    only = next(iter(owners))
+                    if only in ctx.tables:
+                        out = (only, frozenset(cols) if cols else None)
+            elif fname in ('FILTER', 'CALCULATETABLE', 'KEEPFILTERS') and args:
+                out = self._filter_source_table(args[0], ctx)
+            elif fname == 'SUMMARIZE' and len(args) > 1:
+                base = self._filter_source_table(args[0], ctx)
+                picked = [self._model_column_match(a, ctx) for a in args[1:]]
+                if base is not None and all(mc is not None and mc[0] == base[0] for mc in picked):
+                    out = (base[0], frozenset(mc[1] for mc in picked if mc is not None))
+        cache[key] = out
+        return out
+
+    def _filter_phases(self, cond: str, source: Optional[tuple], ctx: DAXContext) -> tuple:
+        """``(first, rest)``: FILTER's top-level conjuncts in the order they
+        are tried on a row, stopping at the first that is not TRUE. Power BI
+        Desktop 2.152 (issue #249; build_b255.py, build_b255b.py):
+
+          * on a scan of a model table, the conjuncts that are column
+            predicates (_column_predicate) come first, wherever they are
+            written: COUNTROWS(FILTER(TM, MOD(TM[n], TM[d]) = 1 && TM[d] <>
+            0)) is 2 (f1), as with a measure that is one, SELECTEDVALUE(TM[d])
+            <> 0 (b255b g2 / g3, 2) -- B255 e12, FILTER(TM, TM[d] = 99 &&
+            ERROR("x")), is BLANK;
+          * the others are tried left to right, and the first error raises:
+            MOD(TM[n], TM[d]) = 1 && ABS(TM[d]) > 0 fails (g1; AND() g8; a
+            BLANK conjunct g9; [m_mod] = 1 && ABS(TM[d]) > 0, g6), while
+            ABS(TM[d]) > 0 && MOD(...) = 1 is 2 (f9; (...) g11, [m_dnz] && ...
+            f8);
+          * any other table has no first step: over GENERATESERIES(-1, 2),
+            MOD(7, [Value]) = 1 && [Value] <> 0 fails (g5), the guard first
+            counts 1 (n7; DATATABLE n9, ADDCOLUMNS n10, SELECTCOLUMNS n11).
+
+        A conjunct is evaluated whole, so its own && / || evaluate every
+        operand on the row: || at the top (a2, f12, f15), NOT(... || ...)
+        (g12), (... && ...) = TRUE() (g13), VAR ... RETURN (f17, g15) and
+        IFERROR(... && ..., TRUE()) (r8, 4) are one conjunct each.
+
+        Of the others, those that read nothing the row changes (no column of
+        the row, no measure or CALCULATE that transitions it, no name that
+        may be a VAR) are tried before the rest, as && tries them in a row
+        (_logic_hoisted) -- after the column predicates: FILTER(TM, TM[d] =
+        99 && ERROR("x")) is BLANK (B255 e12). Power BI Desktop 2.152
+        (build_b255d.py) answers COUNTROWS(FILTER(TM, MOD(TM[n], TM[d]) = 1
+        && [m_zero] <> 0)) BLANK (f1; written order: MOD's error), and the
+        same over GENERATESERIES(-1, 2), a scan with no first step, BLANK
+        (f2). A scan of one column -- VALUES, DISTINCT or ALL of it -- has no
+        first step (_filter_scan_source; build_b255c.py c24, build_b255d.py
+        c32, c33, and a CALCULATE boolean filter on one column, c36), where
+        ALL of two columns has one (c39)."""
+        conj = self._top_conjuncts(cond)
+        if source is None and len(conj) < 2:
+            return (), conj
+        cache = ctx._shield_cache
+        key = ('filter-phases', cond, source)
+        hit: Optional[tuple] = cache.get(key)
+        if hit is not None:
+            return hit
+        flags = ([self._column_predicate(c, source, ctx) for c in conj] if source is not None
+                 else [False] * len(conj))
+        rest = [c for c, f in zip(conj, flags) if not f]
+        reads_row = []
+        for c in rest:
+            r, m, _t, v = self._resolve_deps(_local_deps(c), ctx, set(), False)
+            # RANKX(ALL(T), T[v]) and a nested FILTER over another table that
+            # reads T[v] read the row, though _local_deps counts their columns
+            # as no read of it (_scan_constant): they stay where written
+            reads_row.append(bool(r or m or v) or not self._scan_constant(c, source, ctx))
+        out = (tuple(c for c, f in zip(conj, flags) if f),
+               tuple([c for c, rr in zip(rest, reads_row) if not rr]
+                     + [c for c, rr in zip(rest, reads_row) if rr]))
+        cache[key] = out
+        cache[('filter-free', cond, source)] = frozenset(
+            c for c, rr in zip(rest, reads_row)
+            if not rr and not self._volatile_text(c, ctx, set()))
+        return out
+
+    def _filter_free_memo(self, cond: str, source: Optional[tuple], ctx: DAXContext,
+                          rest: tuple) -> Optional[dict]:
+        """A fresh memo for one FILTER scan of its row-free conjuncts
+        (_filter_phases): ``{conjunct: None}`` for those of ``rest``, or None
+        when there are none. Such a conjunct reads nothing the row changes,
+        so its value -- or its error -- is the same on every row of the
+        scan: _filter_keep evaluates it once, at the first row that reaches
+        it, and reuses the answer. Evaluated on every row, a row-free
+        aggregate tried after the column predicates made the scan quadratic:
+        COUNTROWS(FILTER(T, T[v] * 2 > 1990 && MAXX(ALL(T), T[v]) > 0)) over
+        2,000 rows took 11 s where 0.9.147, trying the conjuncts as written,
+        stopped at the column predicate (review of issue #249). A conjunct
+        that calls RAND or RANDBETWEEN, itself or through a measure, is
+        evaluated on every row."""
+        if not rest:
+            return None
+        cache = ctx._shield_cache
+        key = ('filter-free', cond, source)
+        free = cache.get(key)
+        if free is None:
+            self._filter_phases(cond, source, ctx)
+            free = cache.setdefault(key, frozenset())
+        if not free:
+            return None
+        memo = {c: None for c in rest if c in free}
+        return memo or None
+
+    # a column given whole to these reads no row (_scan_constant)
+    _COLUMN_ARG_FNS = frozenset({
+        'SUM', 'AVERAGE', 'COUNT', 'COUNTA', 'COUNTBLANK', 'DISTINCTCOUNT', 'DISTINCTCOUNTNOBLANK',
+        'MEDIAN', 'PRODUCT', 'MAXA', 'MINA', 'AVERAGEA', 'STDEV.S', 'STDEV.P', 'VAR.S', 'VAR.P',
+        'HASONEVALUE', 'HASONEFILTER', 'ISFILTERED', 'ISCROSSFILTERED', 'ISINSCOPE', 'VALUES',
+        'DISTINCT', 'ALL', 'ALLSELECTED', 'ALLNOBLANKROW', 'REMOVEFILTERS', 'ALLCROSSFILTERED'})
+    # iterators whose second argument is evaluated in their own rows only
+    _ROW_BINDING_FNS = frozenset({
+        'SUMX', 'AVERAGEX', 'MINX', 'MAXX', 'COUNTX', 'COUNTAX', 'PRODUCTX', 'MEDIANX',
+        'CONCATENATEX', 'FILTER', 'STDEVX.S', 'STDEVX.P', 'VARX.S', 'VARX.P', 'GEOMEANX',
+        'PERCENTILEX.INC', 'PERCENTILEX.EXC'})
+
+    def _scan_constant(self, conj: str, source: Optional[tuple], ctx: DAXContext) -> bool:
+        """May a row-free conjunct (_filter_phases) be evaluated once for a
+        whole FILTER scan (_filter_free_memo)? _local_deps counts a column
+        inside an aggregate or iterator as no read of the row, which is
+        right for ordering the conjuncts but not for reusing a value: in
+        RANKX(ALL(T), T[v]) the expression is also evaluated for the
+        current row, and COUNTROWS(FILTER(ALL(U), U[k] = T[v])) reads the
+        scan's T[v]. So every column reference must be one of: a column
+        given whole to an aggregate that takes a column (SUM(T[v]),
+        SELECTEDVALUE(T[g]), VALUES(T[g]), MIN / MAX with one argument); a
+        reference inside the expression of an iterator (SUMX, MAXX, FILTER,
+        ...) over a scan of the column's own table; or, on a scan of a model
+        table, a qualified column of another table. EARLIER / EARLIEST and a
+        bare [column] elsewhere say no."""
+        src = _strip_line_comments(conj)
+        frames: list = []          # [name, arg index, tokens in the arg, arg start, first arg, whole]
+        unsafe = False
+
+        def bound(col_tables: list) -> bool:
+            for f in reversed(frames):
+                if f[0] in self._ROW_BINDING_FNS and f[1] == 1 and f[4] is not None:
+                    scan = self._filter_source_table(f[4], ctx)
+                    if scan is not None and scan[0] in col_tables:
+                        return True
+            return False
+
+        for m in _DEP_TOKEN_RE.finditer(src):
+            t = m.group(0)
+            c0 = t[0]
+            if c0.isspace():
+                continue
+            top = frames[-1] if frames else None
+            if top is not None and top[5] and t not in (',', ')'):
+                return False       # a column was not the whole argument
+            if t == ',' and top is not None:
+                if top[1] == 0:
+                    top[4] = src[top[3]:m.start()]
+                top[1] += 1
+                top[2] = 0
+                top[3] = m.end()
+                top[5] = False
+                continue
+            if t == ')':
+                if frames:
+                    f = frames.pop()
+                    if f[6] and f[1] > 0:
+                        return False          # MIN / MAX of two values
+                    if frames:
+                        frames[-1][2] += 1
+                continue
+            if t == '(' or t.endswith('('):
+                name = '' if t == '(' else t[:-1].strip().upper()
+                if name in ('EARLIER', 'EARLIEST'):
+                    return False
+                if top is not None:
+                    top[2] += 1
+                frames.append([name, 0, 0, m.end(), None, False, False])
+                continue
+            if top is not None:
+                top[2] += 1
+            if not t.endswith(']') or c0 == '"':
+                continue
+            if c0 == '[':
+                name = _unbracket(t[1:-1])
+                if self._measure_exists(name, ctx):
+                    continue
+                tables = self._bare_owners(name, ctx)
+                qualified = False
+            else:
+                tpart, _, cpart = t.partition('[')
+                tpart = tpart.strip()
+                if tpart.startswith("'"):
+                    tpart = tpart[1:-1].replace("''", "'")
+                mc = self._model_col(tpart, _unbracket(cpart[:-1]), ctx)
+                if mc is None:
+                    if self._measure_exists(_unbracket(cpart[:-1]), ctx):
+                        continue
+                    return False
+                tables = [mc[0]]
+                qualified = True
+            if top is not None and top[2] == 1 and (
+                    top[0] in self._COLUMN_ARG_FNS
+                    or (top[0] == 'SELECTEDVALUE' and top[1] == 0)
+                    or (top[0] in ('MIN', 'MAX') and top[1] == 0)):
+                top[5] = True                         # if nothing else is in the argument
+                top[6] = top[0] in ('MIN', 'MAX')
+                continue
+            if bound(tables):
+                continue
+            if qualified and source is not None and source[0] not in tables:
+                continue
+            unsafe = True
+            break
+        return not unsafe
+
+    _VOLATILE_RE = re.compile(r'(?i)\bRAND(?:BETWEEN)?\s*\(')
+
+    def _volatile_text(self, text: str, ctx: DAXContext, seen: set) -> bool:
+        """Does ``text`` call RAND or RANDBETWEEN, itself or in the body of a
+        measure it references (recursively)?"""
+        if self._VOLATILE_RE.search(text):
+            return True
+        row_qual, row_bare, in_qual, in_bare, _i, _t = _local_deps(text)
+        names = list(row_bare) + list(in_bare) + [c for _t2, c in row_qual] + [c for _t2, c in in_qual]
+        for name in names:
+            if not self._measure_exists(name, ctx):
+                continue
+            canon = name if name in ctx.measures else next(
+                (m for m in ctx.measures if m.lower() == name.lower()), name)
+            if canon in seen:
+                continue
+            seen.add(canon)
+            if self._volatile_text(str(ctx.measures.get(canon) or ''), ctx, seen):
+                return True
+        return False
+
+    # the functions whose scan of ONE column has no first step (_filter_phases)
+    _ONE_COLUMN_SCANS = frozenset({'VALUES', 'DISTINCT', 'ALL'})
+
+    def _filter_scan_source(self, tbl_text: str, ctx: DAXContext) -> Optional[tuple]:
+        """_filter_source_table for FILTER's first step: None as well when
+        the scan, through FILTER / CALCULATETABLE / KEEPFILTERS and
+        parentheses, is VALUES, DISTINCT or ALL of one column (Power BI
+        Desktop 2.152, build_b255d.py c32: COUNTROWS(FILTER(DISTINCT(TM[d]),
+        MOD(7, TM[d]) = 1 && TM[d] <> 0)) fails on MOD, as ALL(TM[d]) does,
+        c33; ALL(TM[n], TM[d]) tries TM[d] <> 0 first, c39, 2)."""
+        src = self._filter_source_table(tbl_text, ctx)
+        if src is None or src[1] is None or len(src[1]) != 1:
+            return src
+        s = tbl_text.strip()
+        for _ in range(16):
+            kind, data = self._plan_head(s) if s else (_P_NONE, None)
+            if kind == _P_PAREN:
+                s = data.strip()
+                continue
+            if kind != _P_FUNC:
+                return src
+            fname, fargs = data
+            if fname in ('FILTER', 'CALCULATETABLE', 'KEEPFILTERS'):
+                a = self._split_args(fargs) if fargs.strip() else []
+                if not a:
+                    return src
+                s = a[0].strip()
+                continue
+            return None if fname in self._ONE_COLUMN_SCANS else src
+        return src
+
+    def _is_table_column(self, text: str, source: tuple, ctx: DAXContext) -> bool:
+        """Is ``text`` exactly a reference to a column the scan ``source``
+        (_filter_source_table) reads?"""
+        mc = self._model_column_match(text, ctx)
+        return mc is not None and mc[0] == source[0] and (source[1] is None or mc[1] in source[1])
+
+    def _is_scan_column(self, text: str, source: tuple, ctx: DAXContext) -> bool:
+        """A column of the scan ``source`` (_is_table_column) or RELATED of
+        a column of another table: Power BI Desktop 2.152 (build_b255c.py
+        c28) applies COUNTROWS(FILTER(TM, MOD(TM[n], TM[d]) = 1 &&
+        RELATED(TD[lab]) = "two")) as a column predicate first, 2."""
+        if self._is_table_column(text, source, ctx):
+            return True
+        kind, data = self._plan_head(text.strip())
+        if kind != _P_FUNC or data[0] != 'RELATED':
+            return False
+        mc = self._model_column_match(data[1].strip(), ctx)
+        return mc is not None and mc[0] != source[0]
+
+    def _value_side(self, text: str, ctx: DAXContext) -> bool:
+        """Does ``text`` have one value for every row of an iteration -- no
+        column read from the row, no measure, no CALCULATE (both transition
+        the row)?"""
+        row_qual, row_bare, in_qual, in_bare, _idents, trans = _local_deps(text)
+        if row_qual or row_bare or trans:
+            return False
+        return not (any(self._measure_exists(n, ctx) for n in in_bare)
+                    or any(self._measure_exists(c, ctx) for _t, c in in_qual))
+
+    def _column_predicate(self, conj: str, source: tuple, ctx: DAXContext, depth: int = 0) -> bool:
+        """Is the conjunct a predicate on the columns the scan ``source``
+        reads (_filter_source_table) alone, one it can apply first
+        (_filter_phases)? T[c] op V and V op
+        T[c] with V the same on every row, T[c] IN V, ISBLANK(T[c]), a
+        boolean T[c], NOT, && / || / AND / OR of such predicates -- or a
+        measure whose body is one with SELECTEDVALUE(T[c]) read as T[c] (b255b
+        g2, g3, g17: [m_dnz], SELECTEDVALUE(TM[d]) <> 0)."""
+        s = conj.strip()
+        while True:
+            kind, data = self._plan_head(s)
+            if kind == _P_PAREN or kind == _P_NOT:
+                s = data.strip()
+                continue
+            if kind == _P_FUNC and data[0] == 'NOT':
+                s = data[1].strip()
+                continue
+            break
+        if kind == _P_LOGICAL:
+            return all(self._column_predicate(p, source, ctx, depth) for p in data[1])
+        if kind == _P_FUNC:
+            fname, fargs = data
+            if fname in ('AND', 'OR'):
+                a = self._split_args(fargs)
+                return len(a) >= 2 and all(self._column_predicate(x, source, ctx, depth) for x in a)
+            if fname == 'ISBLANK':
+                return self._is_table_column(fargs, source, ctx)
+            return False
+        if kind == _P_TCOL:
+            return self._is_table_column(s, source, ctx)
+        if kind in (_P_BRACKET1, _P_BRACKET2):
+            if depth or not self._measure_exists(data, ctx):
+                return False
+            canon = data if data in ctx.measures else next(
+                (m for m in ctx.measures if m.lower() == data.lower()), data)
+            body = str(ctx.measures.get(canon) or '')
+            if not body.strip():
+                return False
+            return self._column_predicate(self._SELECTEDVALUE_COL_RE.sub(r'\1', body),
+                                          source, ctx, depth + 1)
+        if kind == _P_IN:
+            # RELATED(...) IN V too: Power BI Desktop 2.152 (build_b255d.py
+            # c38) answers COUNTROWS(FILTER(TM, MOD(TM[n], TM[d]) = 1 &&
+            # RELATED(TD[key]) IN {2})) 2, as RELATED(...) = value (b255c c28)
+            return self._is_scan_column(data[0].strip(), source, ctx) and self._value_side(data[1], ctx)
+        if kind == _P_CMP:
+            split = DAXEngine._cmp_split(s)      # a chain groups left to right (#274)
+            if split:
+                left, right = split[1], split[2]
+                if self._is_scan_column(left, source, ctx):
+                    return self._value_side(right, ctx)
+                if self._is_scan_column(right, source, ctx):
+                    return self._value_side(left, ctx)
+                return False
+        return False
+
+    def _filter_keep(self, cond: str, row_ctx: DAXContext, phases: tuple,
+                     free: Optional[dict] = None) -> bool:
+        """Does FILTER keep the row? ``phases`` is _filter_phases' answer: the
+        conjuncts are tried in that order and the row goes at the first that
+        is not TRUE; an error raises where it arises. ``free`` is the scan's
+        memo of its row-free conjuncts (_filter_free_memo): each is
+        evaluated once, and its value or error reused on the other rows."""
+        first, rest = phases
+        if len(first) + len(rest) == 1 and not free:
+            return bool(self._eval_expr((first or rest)[0], row_ctx))
+        truthy, ev = self._dax_truthy, self._eval_expr
+        for c in first:
+            if not truthy(ev(c, row_ctx)):
+                return False
+        for c in rest:
+            if free is not None and c in free:
+                hit = free[c]
+                if hit is None:
+                    try:
+                        hit = (True, truthy(ev(c, row_ctx)))
+                    except Exception as exc:
+                        if getattr(exc, "_pbix_deadline", False):
+                            raise
+                        hit = (False, exc)
+                    free[c] = hit
+                if not hit[0]:
+                    raise hit[1]
+                if not hit[1]:
+                    return False
+            elif not truthy(ev(c, row_ctx)):
+                return False
+        return True
+
     def _fn_filter(self, args_str: str, ctx: DAXContext) -> Any:
-        """FILTER(table, condition) — returns filtered table rows."""
+        """FILTER(table, condition) — returns filtered table rows.
+
+        The condition's top-level conjuncts are tried as _filter_phases says
+        (issue #249). FILTER(FILTER(T, c1), c2) applies c2's column
+        predicates before c1 (Power BI Desktop 2.152, build_b255b.py g16:
+        COUNTROWS(FILTER(FILTER(TM, MOD(TM[n], TM[d]) = 1), TM[d] <> 0)) is 2;
+        g17 the same with [m_dnz]), and a CALCULATE argument's row errors go
+        to CALCULATE (#265, _filter_err_sink)."""
+        # what CALCULATE asked of this call only: nothing nested sees it
+        sink, self._filter_err_sink = self._filter_err_sink, None
+        pre_in, self._filter_pre = self._filter_pre, None
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
-        table_ref = self._eval_expr(args[0].strip(), ctx)
+        tbl_text = args[0].strip()
+        cond_expr = args[1].strip()
+        source = self._filter_scan_source(tbl_text, ctx)
+        phases = self._filter_phases(cond_expr, source, ctx)
+        if pre_in:
+            phases = (tuple(pre_in) + phases[0], phases[1])
+        head = self._plan_head(tbl_text)
+        nested = head[0] == _P_FUNC and head[1][0] == 'FILTER'
+        if phases[0] and source is not None and nested:
+            # FILTER(FILTER(T, c1), c2): c2's first step runs in the inner scan
+            self._filter_pre = phases[0]
+            self._filter_err_sink = sink     # and c1's row errors go where c2's go
+            try:
+                table_ref = self._eval_expr(tbl_text, ctx)
+            finally:
+                self._filter_pre = None
+                self._filter_err_sink = None
+            if not phases[1]:
+                return [r for r in table_ref if isinstance(r, dict) and '__table__' in r] \
+                    if isinstance(table_ref, list) else []
+            phases = ((), phases[1])
+        else:
+            # c1's row errors go where c2's go (a CALCULATE argument's, D3)
+            self._filter_err_sink = sink if nested else None
+            try:
+                table_ref = self._eval_expr(tbl_text, ctx)
+            finally:
+                self._filter_err_sink = None
         if not isinstance(table_ref, list):
             return []
-        filtered = []
-        cond_expr = args[1].strip()
+        filtered: list = []
+        if not table_ref:
+            self._win_empty_scan(cond_expr, ctx)        # #247
+            return filtered
+        # the row-free conjuncts, evaluated once for the scan (_filter_free_memo)
+        free = self._filter_free_memo(cond_expr, source, ctx, phases[1])
         # A condition that reads only columns of the row and constants has one
         # value per combination of those columns: it is evaluated once per
         # combination, the usual way, and reused for the other rows (issue
@@ -13260,44 +21097,116 @@ class DAXEngine:
         # row of 20,000 for three statuses).
         pure_cols: dict = {}       # table -> the row columns the condition reads, or None
         pure_memo: dict = {}
-        for row_item in table_ref:
-            if not (isinstance(row_item, dict) and '__table__' in row_item):
-                continue
-            if '__row__' in row_item:
-                tname = row_item['__table__']
-                if tname not in pure_cols:
-                    pure_cols[tname] = self._row_only_condition(cond_expr, tname, row_item)
-                cols = pure_cols[tname]
-                if cols is not None and all(c in row_item for c in cols):
-                    pkey = (tname, tuple(row_item[c] for c in cols))
-                    keep = pure_memo.get(pkey)
-                    if keep is None:
-                        keep = pure_memo[pkey] = bool(
-                            self._filter_whole_row(cond_expr, row_item, table_ref, ctx))
-                else:
-                    keep = bool(self._filter_whole_row(cond_expr, row_item, table_ref, ctx))
-            else:
-                # Single-column row dict from ALL(Table[Column]) or VALUES
-                # _make_row_context, not a bare with_filters: it also
-                # BINDS the row, which is what lets a column reference in
-                # the condition resolve to this row's value. Without the
-                # binding, `DimEmployee[EmployeeKey]` fell through to an
-                # unresolved ('Table','Column') marker, so ISBLANK said
-                # False and the BLANK (unknown) member survived
-                # `NOT ISBLANK(DimEmployee[EmployeeKey])` -- FILTER
-                # returned 262 rows where Desktop has 261, which pushed
-                # Rank MTD Asc to 128 against Desktop's 127. Every other
-                # iterator (MAXX/MINX/RANKX) already used this helper.
-                row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
-                keep = bool(self._eval_expr(cond_expr, row_ctx))
-            if keep:
-                filtered.append(row_item)
+        first_cols: dict = {}      # the same for each column predicate tried first
+        first_memo: dict = {}
+        # a storage-engine condition: Currency * Double on the values (issue
+        # #248, _se_filter_value_space)
+        se = self._se_filter_value_space(cond_expr, table_ref, ctx, args[0])
+        if se:
+            _SE_STATE.on = True
+        try:
+            for row_item in table_ref:
+                if not (isinstance(row_item, dict) and '__table__' in row_item):
+                    continue
+                try:
+                    if '__row__' in row_item:
+                        tname = row_item['__table__']
+                        if tname not in pure_cols:
+                            pure_cols[tname] = (self._row_only_condition(cond_expr, tname, row_item)
+                                                if not pre_in else None)
+                        cols = pure_cols[tname]
+                        if cols is not None and all(c in row_item for c in cols):
+                            pkey = (tname, tuple(row_item[c] for c in cols))
+                            keep = pure_memo.get(pkey)
+                            if keep is None:
+                                keep = pure_memo[pkey] = bool(self._filter_whole_row(
+                                    cond_expr, row_item, table_ref, ctx, phases, free))
+                        elif phases[0]:
+                            keep = self._filter_row_first_memo(cond_expr, row_item, tname, table_ref,
+                                                               ctx, phases, first_cols, first_memo, free)
+                        else:
+                            keep = bool(self._filter_whole_row(cond_expr, row_item, table_ref, ctx,
+                                                               phases, free))
+                    else:
+                        # Single-column row dict from ALL(Table[Column]) or VALUES
+                        # _make_row_context, not a bare with_filters: it also
+                        # BINDS the row, which is what lets a column reference in
+                        # the condition resolve to this row's value. Without the
+                        # binding, `DimEmployee[EmployeeKey]` fell through to an
+                        # unresolved ('Table','Column') marker, so ISBLANK said
+                        # False and the BLANK (unknown) member survived
+                        # `NOT ISBLANK(DimEmployee[EmployeeKey])` -- FILTER
+                        # returned 262 rows where Desktop has 261, which pushed
+                        # Rank MTD Asc to 128 against Desktop's 127. Every other
+                        # iterator (MAXX/MINX/RANKX) already used this helper.
+                        row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                        keep = self._filter_keep(cond_expr, row_ctx, phases, free)
+                except Exception as exc:
+                    if sink is None or getattr(exc, "_pbix_deadline", False):
+                        raise
+                    # CALCULATE decides whether this row's error stands (D3)
+                    sink[0].append((sink[1], row_item, exc))
+                    continue
+                if keep:
+                    filtered.append(row_item)
+        finally:
+            if se:
+                _SE_STATE.on = False
         return filtered
 
+    def _filter_row_first_memo(self, cond_expr: str, row_item: dict, tname: str,
+                               table_ref: list, ctx: DAXContext, phases: tuple,
+                               first_cols: dict, first_memo: dict,
+                               free: Optional[dict] = None) -> bool:
+        """_filter_whole_row for a condition whose column predicates come
+        first (_filter_phases): a column predicate that reads only columns of
+        the row and constants (_row_only_condition) has one value per
+        combination of those columns, so it is evaluated once per
+        combination; a row it rejects needs no context of its own, and one
+        they all keep is tried on the rest of the conjuncts. Evaluating them
+        on every row cost a FILTER whose guard is written on the right (it
+        used to stop at the left side) 14% over 100,000 rows (issue #249).
+        In the conjuncts' order, as _filter_keep tries them: a predicate's
+        error raises where it arises."""
+        first, rest = phases
+        hit = first_cols.get(tname)
+        if hit is None:
+            cols_each = [self._row_only_condition(c, tname, row_item) for c in first]
+            hit = first_cols[tname] = (all(c is not None for c in cols_each), cols_each)
+        memoizable, fc = hit
+        if not memoizable or not all(x in row_item for cols in fc for x in cols):
+            return bool(self._filter_whole_row(cond_expr, row_item, table_ref, ctx, phases, free))
+        row_ctx = None
+        for i, c in enumerate(first):
+            key = (tname, i, tuple(row_item[x] for x in fc[i]))
+            ok = first_memo.get(key)
+            if ok is None:
+                if row_ctx is None:
+                    row_ctx = self._whole_row_ctx(row_item, table_ref, ctx)
+                ok = first_memo[key] = self._dax_truthy(self._eval_expr(c, row_ctx))
+            if not ok:
+                return False
+        if not rest:
+            return True
+        if row_ctx is None:
+            row_ctx = self._whole_row_ctx(row_item, table_ref, ctx)
+        return self._filter_keep(cond_expr, row_ctx, ((), rest), free)
+
     def _filter_whole_row(self, cond_expr: str, row_item: dict, table_ref: list,
-                          ctx: DAXContext) -> Any:
+                          ctx: DAXContext, phases: tuple | None = None,
+                          free: Optional[dict] = None) -> Any:
         """FILTER's condition for one row of a whole table (a multi-column row
-        dict from the table or ALL(Table))."""
+        dict from the table or ALL(Table)), its conjuncts tried in the order
+        ``phases`` gives (_filter_phases; the whole condition at once when
+        None)."""
+        row_ctx = self._whole_row_ctx(row_item, table_ref, ctx)
+        if phases is None:
+            return self._eval_expr(cond_expr, row_ctx)
+        return self._filter_keep(cond_expr, row_ctx, phases, free)
+
+    def _whole_row_ctx(self, row_item: dict, table_ref: list, ctx: DAXContext) -> DAXContext:
+        """The context FILTER evaluates its condition in for one row of a
+        whole table (_filter_whole_row)."""
         table_name = row_item['__table__']
         extra_filters = {}
         for col_name, val in row_item.items():
@@ -13327,7 +21236,7 @@ class DAXEngine:
         # column as a column (_column_arg).
         row_ctx._current_row = row_item
         row_ctx._outer_ctx = ctx
-        return self._eval_expr(cond_expr, row_ctx)
+        return row_ctx
 
     # The parts a condition that reads only the row may hold: strings,
     # numbers, Table[Column] references, operators, and these words.
@@ -13399,7 +21308,7 @@ class DAXEngine:
     # =========================================================================
 
     @staticmethod
-    def _order_pairs(fn: str, args: list) -> list:
+    def _order_pairs(fn: str, args: list, default_desc: bool = True) -> list:
         """[(orderBy, descending)] of TOPN's or SAMPLE's ``orderBy [, order]
         [, orderBy [, order]]...`` arguments, paired by position: the argument
         after an orderBy is its order, ASC / 1 / TRUE / TRUE() ascending and
@@ -13409,25 +21318,44 @@ class DAXEngine:
         Power BI Desktop 2.152 (issues #211, #212; docs/reverse-engineering/
         experiments/2026-10-24-sample.md) refuses any other order before
         running the query -- 2, -1, 1 + 0, BLANK(), "ASC" and a column:
-        "Unexpected value for the ORDER argument in the function SAMPLE. Use
-        0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order"
+        "Unexpected value for ORDER argument in SAMPLE function. Use
+        0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order."
         -- and so SAMPLE(5, T, [a], [v]), SAMPLE(5, T, [a], [v], ASC) and
         TOPN(3, T, [a], [v]) too, where [v] stands in [a]'s order; SAMPLE(5,
         T, [v], 1, [a]) orders by [v] ascending, then [a] descending. TOPN
         read a word that was no order as the next orderBy; SAMPLE read ASC /
         DESC after its first orderBy and nothing else, so 1 and TRUE
-        descended there."""
+        descended there.
+
+        CONCATENATEX pairs its orders so too, but an orderBy without an order
+        ascends there (``default_desc`` False): Desktop's CONCATENATEX(TS,
+        TS[L], "", TS[G], DESC, TS[L]) over (1, p), (1, q), (2, r) is "rpq"
+        (build_b257b.py cx_trailing; b175 cx_doubles, ASC by default).
+
+        The refusal is no error IFERROR / ISERROR can catch (_uncatchable),
+        and its text is Desktop's own English: Power BI Desktop 2.152
+        (build_b257c.py e_cx_iferror, e_topn_iferror) fails
+        IFERROR(CONCATENATEX(TS, TS[L], "", TS[L], 2), "caught") and
+        IFERROR(COUNTROWS(TOPN(1, TS, TS[L], 2)), -1) with "Unexpected value
+        for ORDER argument in CONCATENATEX function. Use 0/FALSE/DESC for
+        descending order or 1/TRUE/ASC for ascending order." (and "... in
+        TOPN function. ..."). The engine's text was a word-for-word reading
+        of the Norwegian ("... for the ORDER argument in the function
+        CONCATENATEX."), and only the iterators' row-error mark kept IFERROR
+        from catching it -- not around TOPNSKIP (#330)."""
         pairs: list = []
         for i in range(0, len(args), 2):
-            desc = True
+            desc = default_desc
             if i + 1 < len(args):
                 word = ''.join(args[i + 1].split()).upper()
                 if word in _ASC_ORDER_WORDS:
                     desc = False
-                elif word not in _DESC_ORDER_WORDS:
-                    raise _DAXEvaluationError(
-                        f"Unexpected value for the ORDER argument in the function {fn}. "
-                        "Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order.")
+                elif word in _DESC_ORDER_WORDS:
+                    desc = True
+                else:
+                    raise _uncatchable(_DAXEvaluationError(
+                        f"Unexpected value for ORDER argument in {fn} function. "
+                        "Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order."))
             pairs.append((args[i].strip(), desc))
         return pairs
 
@@ -13488,33 +21416,54 @@ class DAXEngine:
             else:
                 vals = [self._eval_expr(e, ctx) for e, _d in pairs]
             keyed.append((tuple(_order_key(_scalarize(v)) for v in vals), row_item))
-        order = self._pair_order([key for key, _row in keyed], pairs)
+        # an Int64 past 2**53 among Doubles is a Double (#325):
+        # the order and the ties with the n-th row both read the met keys
+        keys = _meet_order_keys([key for key, _row in keyed])
+        order = self._pair_order(keys, pairs)
         if n >= len(order):
             return [keyed[j][1] for j in order]
-        cut = keyed[order[n - 1]][0]
+        cut = keys[order[n - 1]]
         out = [keyed[j][1] for j in order[:n]]
         for j in order[n:]:
-            if keyed[j][0] != cut:
+            if keys[j] != cut:
                 break
             out.append(keyed[j][1])                 # tied with the n-th row
         return out
 
     def _fn_addcolumns(self, args_str: str, ctx: DAXContext) -> Any:
-        """ADDCOLUMNS(table, name, expression, ...) — add computed columns to table."""
+        """ADDCOLUMNS(table, name, expression, ...) — add computed columns to table.
+
+        Over an empty table that knows its columns' types (_StaticRows), the
+        empty result knows them too, the new columns' after them
+        (_static_columns; #326, build_b257c.py
+        u_addcols_empty)."""
         args = self._split_args(args_str)
         if len(args) < 3:
             return []
         table_ref = self._eval_expr(args[0].strip(), ctx)
         if not isinstance(table_ref, list):
             return table_ref
+        if not table_ref and isinstance(table_ref, _StaticRows):
+            return self._static_columns(args[2::2], ctx, table_ref.num_kinds)
 
         # Parse name/expression pairs
         extended = []
+        # the extension columns of one row are scanned together where their
+        # aggregations transition the row (CALCULATE, a measure), as
+        # SUMMARIZECOLUMNS' are (Power BI Desktop 2.152, build_b243d.py
+        # f_addcols: ADDCOLUMNS(VALUES(FactSales[channelKey]), "v",
+        # CALCULATE(SUM(SalesAmount)) ..., "w", CALCULATE(SUM(TotalCost)) ...)
+        # gives channel 1's v 0.541100740432739, cut at TotalCost's runs, as
+        # build_b243c.py f_sc_two; alone 0.541100263595581; #339)
+        row_scope = (self._se_extensions_scope([(None, args[k + 1]) for k in range(1, len(args) - 1, 2)], ctx)
+                     if len(args) >= 5 and ctx._se_fuse is not None else None)
         for row_item in table_ref:
             # a copy of the same kind: ADDCOLUMNS keeps SUMMARIZE's rows rows of columns
             new_item = type(row_item)(row_item) if isinstance(row_item, dict) else row_item
             if isinstance(row_item, dict) and '__table__' in row_item:
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
+                if row_scope:
+                    row_ctx._se_row_scope = row_scope
             else:
                 row_ctx = ctx
             # Process name/expression pairs
@@ -13735,6 +21684,7 @@ class DAXEngine:
                if (rel := ctx._rel_index.get((table_name, nxt)))}
         wanted = [(i, c) for i, c in enumerate(tcols) if c in fks]
         src: Optional[list] = None
+        scope = self._se_extensions_scope(extensions, ctx)
         for row_dict, combo in zip(result, combos):
             filters: dict = {}
             if members is not None and wanted:
@@ -13747,8 +21697,52 @@ class DAXEngine:
                     filters.update({k: _row_value(v, src) for k, v in exp.items()})
             filters.update({key: _row_value([val], shadows[key]) for key, val in zip(keys, combo)})
             group_ctx = self._transitioned_ctx(ctx, filters)
+            if scope:
+                group_ctx._se_fuse = (group_ctx, scope)
             for ext_name, ext_expr in extensions:
                 row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
+
+    @staticmethod
+    def _se_merge_scopes(a: dict, b: dict) -> dict:
+        """The scope reading what scopes ``a`` and ``b`` read."""
+        if not b:
+            return a
+        out = dict(a)
+        for t, cols in b.items():
+            have = out.get(t)
+            out[t] = cols if have is None else (have | cols)
+        return out
+
+    def _se_joined_scope(self, extensions: list, ctx: DAXContext) -> dict:
+        """_se_extensions_scope of ``extensions`` joined to the scope in
+        force where it holds in ctx (_se_holds): what one query of several
+        columns scans together, keeping what the enclosing evaluation
+        scanned with them before (ROW's columns)."""
+        scope = self._se_extensions_scope(extensions, ctx)
+        fuse = ctx._se_fuse
+        if fuse is not None and fuse[1] and (fuse[0] is ctx or self._se_holds(ctx)):
+            return self._se_merge_scopes(fuse[1], scope)
+        return scope
+
+    def _se_extensions_scope(self, extensions: list, ctx: DAXContext) -> dict:
+        """The scope of aggregations scanned together (_se_scope) for one
+        group of SUMMARIZE / SUMMARIZECOLUMNS: every extension column's, as
+        one storage-engine query computes them all (#339). Power
+        BI Desktop 2.152 (build_b243c.py f_sc_two, Agents):
+        SUMMARIZECOLUMNS(FactSales[channelKey], "v", <SUM(SalesAmount)'s
+        fraction>, "w", <SUM(TotalCost)'s>) cuts channel 1's SalesAmount at
+        TotalCost's runs (0.541100740432739, where the sum alone, gb_ch, is
+        0.541100263595581). An extension's own aggregations were not scanned
+        together either: none opened a scope."""
+        if not extensions:
+            return {}
+        home = self._home_tables[-1] if self._home_tables else None
+        out: dict = {}
+        for _name, expr in extensions:
+            for t, cols in self._se_scope(expr, ctx, home).items():
+                have = out.get(t)
+                out[t] = cols if have is None else (have | cols)
+        return out
 
     def _summarize_expression(self, src: list, args: list, ctx: DAXContext) -> Any:
         """SUMMARIZE over a table EXPRESSION -- FILTER(T, ...), ALLSELECTED(
@@ -13852,6 +21846,7 @@ class DAXEngine:
                        ctx, part_rows[pi],
                        {f"{t}.{c}": [_part_value(p, c) for p in part_rows[pi]] for c in carried},
                        {t})}
+        scope = self._se_extensions_scope(extensions, ctx)
         for row_dict, (combo, grp) in zip(result, members.items()):
             filters: dict = {}
             for pi, (t, carried, whole) in enumerate(layout):
@@ -13888,6 +21883,8 @@ class DAXEngine:
                         'rows': [list(x) for x in combos]}
             filters.update({key: _row_value([val], shadows[key]) for key, val in zip(keys, combo)})
             group_ctx = self._transitioned_ctx(ctx, filters)
+            if scope:
+                group_ctx._se_fuse = (group_ctx, scope)
             for ext_name, ext_expr in extensions:
                 row_dict[ext_name] = self._eval_expr(ext_expr, group_ctx)
         return result
@@ -14005,7 +22002,9 @@ class DAXEngine:
             st = a.strip()
             if st.upper().startswith('NONVISUAL') and st.endswith(')'):
                 inner_f = st[st.index('(') + 1:-1].strip()
-                fres = self._eval_expr(inner_f, ctx)
+                # a filter table's error is not caught either
+                # (#267; build_b255d.py r34)
+                fres = self._treatas_filter_of(inner_f, ctx)
                 if (isinstance(fres, tuple) and len(fres) == 3
                         and fres[0] == '__TREATAS__'):
                     (_t, _c), _vals = fres[1], fres[2]
@@ -14048,6 +22047,8 @@ class DAXEngine:
         # Find group-by columns (column refs) vs name/expression pairs (string, expression)
         group_refs = []
         for arg in args:
+            # a filter table's error is no error IFERROR catches
+            # (#267; Power BI Desktop 2.152, build_b255d.py r34)
             ref = self._column_arg(arg, ctx)
             if isinstance(ref, tuple) and len(ref) == 2:
                 group_refs.append(ref)
@@ -14070,12 +22071,36 @@ class DAXEngine:
         if isinstance(result, list):
             result = self._summarizecolumns_blank_group(
                 result, group_refs, tail, ctx)
+            names = self._summarizecolumns_names(tail)
+            if names:
+                # A row whose every expression is BLANK is no row of the
+                # result (#269). Microsoft Learn (IGNORE):
+                # "Rows for which all expressions not using IGNORE return
+                # BLANK/NULL will be excluded". Power BI Desktop 2.152
+                # (build_b118.py, raw EVALUATE SUMMARIZECOLUMNS): by_zone with
+                # s_in_calc answers the one row (Z1, 4), with f_rows_allsel no
+                # row, by_month with d_sum_prev months 2 and 3 only. They were
+                # kept: COUNTROWS of the first was 2, of the second 2.
+                result = [r for r in result
+                          if not isinstance(r, dict) or any(r.get(n) is not None for n in names)]
         if rollup_subtotal and isinstance(result, list):
             sub = _ColumnsRow({'__table__': group_refs[0][0], '__row__': True})
             for _t, _c in group_refs:
                 sub[_c] = None
             result = result + [sub]
         return result
+
+    @staticmethod
+    def _summarizecolumns_names(tail: list) -> list:
+        """The names of SUMMARIZECOLUMNS' "name", <expression> pairs in
+        ``tail`` (what follows the group-by columns; filter tables come
+        before the first name)."""
+        rest = [a.strip() for a in tail]
+        while rest and not rest[0].startswith('"'):
+            rest.pop(0)
+        # spelled as _fn_summarize names the columns
+        return [rest[i].strip('"') for i in range(0, len(rest) - 1, 2)
+                if len(rest[i]) > 1 and rest[i].startswith('"') and rest[i].endswith('"')]
 
     def _summarizecolumns_blank_group(self, result: list, group_refs: list,
                                       tail: list, ctx: DAXContext) -> list:
@@ -14143,7 +22168,42 @@ class DAXEngine:
                     if meta in row_item:
                         new_row[meta] = row_item[meta]
             result.append(new_row)
+        if not result:
+            return self._static_columns(args[2::2], ctx)
         return result
+
+    _STATIC_KIND_OF = {'I': int, 'D': float, 'C': _Currency}
+
+    def _static_columns(self, exprs: list, ctx: DAXContext, before: tuple = ()) -> list:
+        """An empty SELECTCOLUMNS as a _StaticRows: the number type of each
+        column, for UNION to type its column by (#326: a UNION
+        with an empty Double side is a Double column, Power BI Desktop 2.152,
+        build_b257b.py ub_empty_*). A model column is typed by its cells
+        (DAXContext._number_kind) or as a Fixed Decimal column (_Currency),
+        any other expression by its static type (_static_type: ADDCOLUMNS(
+        <empty>, "w", 1) adds an Int64 column, build_b257c.py
+        u_addcols_empty). ``before`` are the types of the columns the table
+        already has (ADDCOLUMNS'). A plain empty list when none is known."""
+        kinds = list(before)
+        for e in exprs:
+            ref = self._parse_column_ref(e)
+            kind = None
+            if ref is not None:
+                tname = ctx.model_table(ref[0])
+                tbl = ctx.tables.get(tname)
+                if isinstance(tbl, dict):
+                    idx = ctx._find_col_idx(tbl.get('columns') or [], ref[1])
+                    if idx >= 0:
+                        kind = (_Currency if self._currency_column((tname, tbl['columns'][idx]), ctx)
+                                else ctx._number_kind(tbl, idx))
+            else:
+                kind = self._STATIC_KIND_OF.get(self._static_type(e, ctx))
+            kinds.append(kind)
+        if not any(kinds):
+            return []
+        out = _StaticRows()
+        out.num_kinds = tuple(kinds)
+        return out
 
     def _column_arg(self, expr: str, ctx: DAXContext) -> Any:
         """A function argument that may name a column: ``T[c]`` of a real
@@ -14221,8 +22281,12 @@ class DAXEngine:
         COUNTROWS(VALUES(TA[S])) is."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
+            values = _distinct_cells(ctx.get_column_data(ref[0], ref[1]))
+            # a Fixed Decimal column's values are Currency, as VALUES' (#248)
+            if self._currency_column(ref, ctx):
+                values = [_Currency(v) if type(v) is float else v for v in values]
             return [{'__table__': ref[0], '__column__': ref[1], '__value__': v}
-                    for v in _distinct_cells(ctx.get_column_data(ref[0], ref[1]))]
+                    for v in values]
         if isinstance(ref, list):
             # Deduplicate table rows as DAX compares their values: text
             # case-insensitively (Desktop: COUNTROWS(DISTINCT({"a", "A", "b"}))
@@ -14240,18 +22304,210 @@ class DAXEngine:
         return []
 
     def _fn_union(self, args_str: str, ctx: DAXContext) -> Any:
-        """UNION(table1, table2) — combine two tables."""
+        """UNION(table1, table2 [, table]...) — the rows of every table.
+
+        Every table counts: Microsoft's UNION reference takes two or more,
+        and only the first two were read, so COUNTROWS(UNION({1}, {2}, {3}))
+        was 2 (#337; exact arithmetic, 3).
+
+        A column that gets Int64 values from one table and Doubles from
+        another is a Double column, its Int64 values Doubles, also when the
+        Double side is empty (_unify_number_columns, _StaticRows;
+        #326); an Int64 column beside a Currency one is
+        Currency (build_b257c.py u_int_cur). Empty sides' types combine
+        column by column as the values do (_union_column_type), and a UNION
+        of empty sides is one (a _StaticRows) itself. A model table's own
+        rows hold a Fixed Decimal column's values as floats; such a side is
+        a Currency column too (_union_raw_currency): MINX(UNION(TS, TCU),
+        [G]) over the Int64 TS[G] and the Currency TCU[v] is a Currency
+        (Power BI Desktop 2.152, build_b257d.py u_raw_int_cur; we answered
+        a Double).
+
+        The result's columns are the first table's, matched by position
+        (Microsoft's UNION reference): a later table's rows are renamed to
+        the first table's column names (_union_named; #338).
+        They kept their own, so SUMX(UNION(TS, TCU), [G]) read BLANK on
+        TCU's rows, and a column the first table names [a] and the second
+        [b] could not be read as [a] at all."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
-        t1 = self._eval_expr(args[0].strip(), ctx)
-        t2 = self._eval_expr(args[1].strip(), ctx)
-        result = []
-        if isinstance(t1, list):
-            result.extend(t1)
-        if isinstance(t2, list):
-            result.extend(t2)
-        return result
+        sides: list = []
+        static: Optional[tuple] = None
+        for a in args:
+            t = self._eval_expr(a.strip(), ctx)
+            if isinstance(t, list):
+                sides.append(t)
+                if not t and isinstance(t, _StaticRows):
+                    k = t.num_kinds
+                    static = k if static is None else tuple(
+                        x if y is None or x is y else y if x is None
+                        else (_union_column_type({x, y}, None) or x)
+                        for x, y in itertools.zip_longest(static, k))
+        if len(sides) > 1:
+            sides = self._union_named(sides, ctx)
+        if ctx._cur_tcols and len(sides) > 1:
+            sides = self._union_raw_currency(sides, ctx)
+        result = list(itertools.chain.from_iterable(sides))
+        if not result and static is not None:
+            out = _StaticRows()
+            out.num_kinds = static
+            return out
+        return _unify_number_columns(result, static)
+
+    @classmethod
+    def _cell_names(cls, row: dict) -> Optional[list]:
+        """The column names of a flat row's cells, in order (_cell_keys), a
+        single-column row's own cell (``__value__``) named by its
+        ``__column__``; None for a row _cell_keys does not read."""
+        keys = cls._cell_keys(row)
+        if keys is None:
+            return None
+        if '__value__' in keys:
+            col = row.get('__column__')
+            return [col if k == '__value__' else k for k in keys]
+        return keys
+
+    def _union_named(self, sides: list, ctx: DAXContext) -> list:
+        """UNION's ``sides`` with every later side's rows named as the first
+        side's columns, by position (#338): Microsoft's UNION
+        reference gives the result table_expression1's column names and
+        matches the columns by position. UNION(TS, TCU) over TS(G, L) and
+        TCU(v, L) is a table of G and L, so SUMX(UNION(TS, TCU), [G]) adds
+        TCU's v too (exact arithmetic: 0 + 1 + 1 + 2 + 3 + 1 + 2.5 = 10.5;
+        the rows kept their own names and we answered 7).
+
+        The first side's rows are kept as they are, and so is every row
+        whose names already agree (UNION of a table with itself, or of
+        tables with the same columns): no copy. A renamed row is a copy
+        (_union_renamed), never the model's row written in place."""
+        first = sides[0]
+        if not first or not isinstance(first[0], dict):
+            return sides
+        r0 = first[0]
+        names = self._cell_names(r0)
+        if not names or len(set(names)) != len(names):
+            return sides
+        out = [first]
+        for s in sides[1:]:
+            out.append(self._union_renamed(s, names, r0, ctx) if s else s)
+        return out
+
+    def _union_renamed(self, rows: list, names: list, r0: dict, ctx: DAXContext) -> list:
+        """``rows``, one later side of a UNION, with each row whose columns
+        are named otherwise than ``names`` (the first side's, whose first
+        row is ``r0``) made a new row of those names, its cells by position
+        (_row_cells). Rows of another number of columns are left as they
+        are.
+
+        A renamed row is no row of any model table: its ``__table__`` is ''
+        and it has no ``__row__``, as a table constructor's row has none. A
+        UNION of columns of different lineage has no lineage (Microsoft's
+        UNION reference), so a context transition over the row must not
+        filter its old table by columns it no longer names, nor the first
+        table by a row that is not one of its own. A Fixed Decimal cell that
+        its table's rows hold as a float (mark_currency_columns) is made a
+        Currency here, since the row no longer says which table typed it
+        (_cur_lineage, _joined_typed). A single-column first side's rows
+        hold their cell as ``__value__`` too, a row constructor's as
+        ``__tuple__``; a renamed row does the same."""
+        width = len(names)
+        layouts: dict = {}
+        out: Optional[list] = None
+        tcols = ctx._cur_tcols
+        one_col = r0.get('__column__') if '__column__' in r0 else None
+        tup = '__tuple__' in r0
+        for i, r in enumerate(rows):
+            if not isinstance(r, dict):
+                if out is not None:
+                    out.append(r)
+                continue
+            lk = (type(r), tuple(r), r.get('__column__'))
+            got = layouts.get(lk)
+            if got is None:
+                keys = self._cell_keys(r)
+                rn = self._cell_names(r) if keys is not None else None
+                got = layouts[lk] = (keys, rn == names)
+            keys, same = got
+            if same:
+                if out is not None:
+                    out.append(r)
+                continue
+            cells = [r[k] for k in keys] if keys is not None else self._row_cells(r)
+            if len(cells) != width:
+                if out is not None:
+                    out.append(r)
+                continue
+            if tcols and keys is not None:
+                t = r.get('__table__')
+                for j, k in enumerate(keys):
+                    v = cells[j]
+                    if type(v) is not float:
+                        continue
+                    c = r.get('__column__') if k == '__value__' else k
+                    if not isinstance(c, str):
+                        continue
+                    if (t, c) in tcols and _cur_lineage(r, c):
+                        cells[j] = _Currency(v)
+                    elif '__joined__' in r:
+                        cells[j] = _joined_typed(ctx, r, c, v)
+            new: dict = {'__table__': ''}
+            new.update(zip(names, cells))
+            if one_col is not None and one_col in new:
+                new['__column__'] = one_col
+                new['__value__'] = new[one_col]
+            if tup:
+                new['__tuple__'] = tuple(cells)
+            if out is None:
+                out = list(rows[:i])
+            out.append(new)
+        return rows if out is None else out
+
+    def _union_raw_currency(self, sides: list, ctx: DAXContext) -> list:
+        """UNION's ``sides`` with the Fixed Decimal cells of model-table rows
+        typed as Currency (the rows hold them as floats, mark_currency_columns)
+        where another side has an Int64 or a Double in that column, so that
+        _unify_number_columns sees a Currency column there: beside an Int64
+        one it is Currency, beside a Double one Double (build_b257d.py
+        u_raw_int_cur, u_cur_dbl). Rows are copied, never written in place."""
+        cur: list = []
+        for s in sides:
+            pos: tuple = ()
+            r0 = s[0] if s else None
+            if type(r0) is dict and r0.get('__row__'):
+                tbl = ctx.tables.get(r0.get('__table__'))
+                names: frozenset = (tbl.get('currency_columns') if isinstance(tbl, dict) else None) or frozenset()
+                keys = self._cell_keys(r0) if names else None
+                if keys:
+                    pos = tuple((i, k) for i, k in enumerate(keys) if k in names)
+            cur.append(pos)
+        if not any(cur):
+            return sides
+        cells: dict = {}
+        out = list(sides)
+        for si, pos in enumerate(cur):
+            need = []
+            for p, k in pos:
+                for sj, other in enumerate(sides):
+                    if sj == si or not other or any(q == p for q, _k in cur[sj]):
+                        continue
+                    oc = cells.get(sj)
+                    if oc is None:
+                        oc = cells[sj] = self._rows_cells(other)
+                    if any(p < len(c) and type(c[p]) in (int, float) for c in oc):
+                        need.append(k)
+                        break
+            if need:
+                rows = []
+                for r in sides[si]:
+                    if type(r) is dict and any(type(r.get(k)) is float for k in need):
+                        r = dict(r)
+                        for k in need:
+                            if type(r.get(k)) is float:
+                                r[k] = _Currency(r[k])
+                    rows.append(r)
+                out[si] = rows
+        return out
 
     def _rows_in(self, rows: list, others: list) -> list:
         """For each of ``rows``: is it one of ``others``, as DAX compares two
@@ -14275,10 +22531,26 @@ class DAXEngine:
         cells are all BLANK, text or plain numbers are, for the same reason,
         their tuples, and NaN is made one object only where a cell is NaN:
         both are checked over all the cells at once, in C. Per row, _one_nan
-        and _row_exact_key took two thirds as long as reading the cells."""
+        and _row_exact_key took two thirds as long as reading the cells.
+
+        A column of Int64 values against one of Doubles compares as Doubles,
+        as an Int64 that meets a Double does (#325): Power BI
+        Desktop 2.152 (build_b257b.py), over TC[K] = 2**53, 2**53 + 1 and
+        TD[D] = 2**53.0, (2**53 + 4).0, COUNTROWS(EXCEPT(VALUES(TC[K]),
+        VALUES(TD[D]))) is 0 and INTERSECT's 2 (we answered 1 and 1), and
+        EXCEPT(VALUES(TD[D]), {2**53 + 1} as a column) keeps one row, not
+        two. Their Int64 cells are read as Doubles for the comparison only
+        (_int_as_double, _meet_number_rows), and only when both kinds meet."""
         plain = _plain_column_values(rows)
         other_plain = _plain_column_values(others) if plain is not None else None
         if plain is not None and other_plain is not None:
+            kinds = set(map(type, plain))
+            other_kinds = set(map(type, other_plain))
+            if (int in kinds and float in other_kinds) or (float in kinds and int in other_kinds):
+                # an Int64 column against a Double one: compared as Doubles
+                # (#325, _meet_number_rows)
+                plain = list(map(_int_as_double, plain))
+                other_plain = list(map(_int_as_double, other_plain))
             exact_values = set(other_plain)
             found = list(map(exact_values.__contains__, plain))
             if not all(found):
@@ -14301,6 +22573,12 @@ class DAXEngine:
         other_vals = self._rows_cells(others)
         cells = list(itertools.chain.from_iterable(vals_list))
         other_cells = list(itertools.chain.from_iterable(other_vals))
+        kinds = set(map(type, cells))
+        other_kinds = set(map(type, other_cells))
+        if (int in kinds and float in other_kinds) or (float in kinds and int in other_kinds):
+            vals_list, other_vals = _meet_number_rows(vals_list, other_vals)
+            cells = list(itertools.chain.from_iterable(vals_list))
+            other_cells = list(itertools.chain.from_iterable(other_vals))
         if any(map(operator.ne, cells, cells)) or any(map(operator.ne, other_cells, other_cells)):
             vals_list = list(map(_one_nan, vals_list))
             other_vals = list(map(_one_nan, other_vals))
@@ -14431,13 +22709,23 @@ class DAXEngine:
         for row_str in row_pattern:
             values = [v.strip().strip('"\'') for v in row_str.split(',')]
             if len(values) >= len(col_names):
-                row = {}
+                row: dict = {}
                 for j, cn in enumerate(col_names):
                     raw = values[j]
                     if col_types[j] == 'INTEGER':
-                        try: row[cn] = int(float(raw))
+                        # a whole literal is read exactly, past 2**53 too
+                        # (build_b257b.py z53_datatable_int, #334)
+                        try: row[cn] = _int_literal(raw)
                         except: row[cn] = 0
-                    elif col_types[j] in ('DOUBLE', 'CURRENCY'):
+                    elif col_types[j] == 'CURRENCY':
+                        # a Currency, the literal read as a Double and
+                        # converted as CURRENCY() converts one (issue #248;
+                        # Desktop 2.152, build_b254.py l_ctors:
+                        # DATATABLE("x", CURRENCY, {{0.00005}}) is C0.0001;
+                        # build_b254b.py a_fe_conv: 0.00035 is 4 counts)
+                        try: row[cn] = _cur_from_double(float(raw))
+                        except (ValueError, _DAXEvaluationError): row[cn] = _cur_make(0)
+                    elif col_types[j] == 'DOUBLE':
                         try: row[cn] = float(raw)
                         except: row[cn] = 0.0
                     elif col_types[j] == 'BOOLEAN':
@@ -14457,21 +22745,127 @@ class DAXEngine:
         row = {'__table__': '__row__'}
         i = 0
         first_name = None
-        while i + 1 < len(args):
-            col_name = self._eval_expr(args[i].strip(), ctx)
-            col_val = self._eval_expr(args[i + 1].strip(), ctx)
-            col_name_str = str(col_name) if col_name else f"col_{i}"
-            row[col_name_str] = col_val
-            if first_name is None:
-                first_name = col_name_str
-                row['__column__'] = col_name_str
-                row['__value__'] = col_val
-            i += 2
+        # its columns are one query's, scanned together, as SUMMARIZECOLUMNS'
+        # extension columns are (Power BI Desktop 2.152, build_b243d.py
+        # f_row_two: ROW("v", [Total Sales] - C, "w", [Total Discount] - C)
+        # cuts v at DiscountAmount's runs, 0.215398192405701; alone
+        # 0.215398073196411; #339)
+        prev = ctx._se_fuse
+        if len(args) >= 4 and prev is not None and ctx._current_row is None:
+            ctx._se_fuse = (ctx, self._se_joined_scope(
+                [(None, args[k + 1]) for k in range(0, len(args) - 1, 2)], ctx))
+        try:
+            while i + 1 < len(args):
+                col_name = self._eval_expr(args[i].strip(), ctx)
+                col_val = self._eval_expr(args[i + 1].strip(), ctx)
+                col_name_str = str(col_name) if col_name else f"col_{i}"
+                row[col_name_str] = col_val
+                if first_name is None:
+                    first_name = col_name_str
+                    row['__column__'] = col_name_str
+                    row['__value__'] = col_val
+                i += 2
+        finally:
+            ctx._se_fuse = prev
         return [row]
 
     def _fn_treatas(self, args_str: str, ctx: DAXContext) -> Any:
-        """TREATAS(table, column1, column2, ...) — apply table values as filter.
-        Returns a marker for CALCULATE to process."""
+        """TREATAS(table, column1, column2, ...) as a table: one row of its
+        target columns, which keep their lineage (_summarize_row), per row
+        of ``table``, in its order, carrying the filter CALCULATE applies
+        (_TreatasTable; CALCULATE and NONVISUAL read the filter alone,
+        _treatas_filter_of). The filter itself, ('__TREATAS__', (table,
+        column), values) or ('__TREATAS_TUPLES__', columns, rows), was the
+        result, and no reader of a table read a row of it: over B253's model
+        INDEX(1, TREATAS(VALUES(Dim[Region]), S[Reg]), ORDERBY(S[Reg])) was
+        BLANK where Power BI Desktop 2.152 reads S[Reg] off it, 'N'
+        (build_b253c.py d_treatas_set; d_treatas_bag_cols onto Dim[Region]
+        likewise; #263), and COUNTROWS(TREATAS(VALUES(
+        S[Reg]), Dim[Region])) was BLANK where the table holds the regions N
+        and S.
+
+        Repeated values are kept and values the target column lacks are
+        dropped (_treatas_present), as Power BI Desktop 2.152 answers
+        (build_b253d.py; #263): COUNTROWS(TREATAS(
+        SELECTCOLUMNS(ALL(S), "c", S[Reg]), Dim[Region])) is 4 and the
+        CONCATENATEX of its regions 'N,N,S,S' (e_treatas_count_rep,
+        f_treatas_cx_rows), but COUNTROWS(TREATAS({"X", "N"}, Dim[Region]))
+        is 1 (e_treatas_count_missing), INDEX(-1, TREATAS(VALUES(
+        Dim[Region]), S[Reg]), ORDERBY(S[Reg])) is 'S', not Dim's 'W' that
+        S[Reg] lacks (f_treatas_rel_missing), and SUMX(TREATAS(SELECTCOLUMNS(
+        ALL(S), "c", S[V]), Fact[Value]), Fact[Value]) is BLANK, none of
+        S[V]'s 30, 35, 40, 75 being a Fact[Value] (f_treatas_sumx_missing).
+        The engine kept every row: 2, 'W', 180."""
+        res = self._treatas_filter(args_str, ctx)
+        if (isinstance(res, tuple) and len(res) == 3
+                and res[0] in ('__TREATAS__', '__TREATAS_TUPLES__')):
+            if res[0] == '__TREATAS__':
+                cols, combos = [res[1]], [(v,) for v in res[2]]
+            else:
+                cols, combos = list(res[1]), list(res[2])
+            cols = [(ctx.model_table(t), c) for t, c in cols]
+            combos = self._treatas_present(cols, combos, ctx)
+            out = _TreatasTable(self._summarize_row(cols, tuple(combo)) for combo in combos)
+            out.marker = res
+            return out
+        return res
+
+    @staticmethod
+    def _treatas_present(cols: list, combos: list, ctx: DAXContext) -> list:
+        """The rows of ``combos`` each of whose values its target column of
+        ``cols`` holds -- a value a filter on that column alone would find in
+        some row of it (DAXContext._column_filter_keys against the column's
+        typed index, as CALCULATE's In-set filter selects rows), whatever the
+        filter context. A column not found keeps its values. Values the
+        target lacks are not part of TREATAS as a table (_fn_treatas)."""
+        if not combos:
+            return combos
+        checks: list = []
+        for t, c in cols:
+            tbl = ctx.tables.get(t)
+            if not tbl:
+                checks.append((None, -1, None, {}))
+                continue
+            idx = ctx._find_col_idx(tbl['columns'], c)
+            checks.append((tbl, idx, ctx._typed_index_map(tbl, idx) if idx >= 0 else None, {}))
+        out = []
+        for combo in combos:
+            for (tbl, idx, tmap, seen), v in zip(checks, combo):
+                if tmap is None:
+                    continue
+                sk: Optional[tuple] = (type(v), v)
+                try:
+                    hit = seen.get(sk)
+                except TypeError:
+                    sk, hit = None, None
+                if hit is None:
+                    hit = any(k in tmap for k in ctx._column_filter_keys(tbl, idx, (v,)))
+                    if sk is not None:
+                        seen[sk] = hit
+                if not hit:
+                    break
+            else:
+                out.append(combo)
+        return out
+
+    def _treatas_filter_of(self, text: str, ctx: DAXContext) -> Any:
+        """What ``text`` evaluates to, a TREATAS as the filter it applies
+        (_treatas_filter), not its rows (_fn_treatas)."""
+        s = text.strip()
+        if s[:7].upper() == 'TREATAS':
+            k = 7
+            while k < len(s) and s[k].isspace():
+                k += 1
+            call = self._extract_args(s[k:]) if s[k:k + 1] == '(' else None
+            if call is not None and k + len(call) == len(s):
+                return self._treatas_filter(call[1:-1], ctx)
+        return _treatas_marker(self._eval_expr(text, ctx))
+
+    def _treatas_filter(self, args_str: str, ctx: DAXContext) -> Any:
+        """The filter TREATAS(table, column1, column2, ...) applies: the
+        marker ('__TREATAS__', (table, column), values) or
+        ('__TREATAS_TUPLES__', columns, rows) CALCULATE processes, or
+        ``table`` when it gives no values."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
@@ -14497,16 +22891,78 @@ class DAXEngine:
                         f"TREATAS: the table has {len(vals)} column(s) for "
                         f"{len(target_cols)} target column(s)")
                 rows.append(tuple(vals))
+            convs = [self._treatas_converter(col, ctx) for col in target_cols]
+            if any(convs):
+                rows = [tuple(f(v) if f else v for f, v in zip(convs, r)) for r in rows]
             return ('__TREATAS_TUPLES__', target_cols, rows)
         if isinstance(table_ref, list) and target_cols:
-            # Extract values and return as filter marker
+            # Extract values and return as filter marker: a single-column
+            # row's value, or the one column of another row -- a one-column
+            # SELECTCOLUMNS' row has no __value__, and TREATAS(SELECTCOLUMNS(
+            # ALL(S), "c", S[Reg]), Dim[Region]) returned its rows unchanged:
+            # no filter on Dim[Region], no row of it (#263;
+            # build_b253c.py d_treatas_bag_cols)
             values = []
             for item in table_ref:
                 if isinstance(item, dict) and '__value__' in item:
                     values.append(item['__value__'])
+                elif isinstance(item, dict) and '__table__' in item:
+                    one = self._row_values(item)
+                    if len(one) == 1:
+                        values.append(one[0])
             if values and target_cols:
+                conv = self._treatas_converter(target_cols[0], ctx)
+                if conv is not None:
+                    values = list(map(conv, values))
                 return ('__TREATAS__', target_cols[0], values)
         return table_ref
+
+    def _treatas_converter(self, col, ctx: DAXContext):
+        """How TREATAS converts a value to the type of its target column
+        ``col`` = (table, column), or None to leave the values as they are.
+        A comparison converts no Currency or Int64 value to the other side's
+        type (an Int64 meeting a Double compares as a Double, _num_meet;
+        Currency = 0.10001 is FALSE), but TREATAS does: Power BI Desktop
+        2.152 (#336) --
+
+        * onto an Int64 column a Double rounds half away from zero:
+          TREATAS({9007199254740992.0}, TK[K]) keeps 2**53 alone, not
+          2**53 + 1 (build_b257.py c_treatas_id "b", c_treatas_col "bf"),
+          TREATAS({1.6}, TS[G]) is G = 2, {1.4} G = 1, {2.5} G = 3
+          (build_b257b.py tr_16 "r", tr_14 "pq", tr_25 none of 1, 1, 2), and
+          over TK[k] = 2, 3, 0 TREATAS({2.5}, TK[k]) the row of 3
+          (build_b254b.py d_treatas cell 4); a pair converts each value:
+          TREATAS({(9007199254740992.0, "c")}, TK[K], TK[L]) keeps nothing
+          (tr_two_cols);
+        * onto a Double column an Int64 is its Double: TREATAS(
+          {9007199254740993}, TD[D]) keeps 2**53.0 (tr_int_on_dbl); TRUE
+          and FALSE are 1.0 and 0.0 there and on a Currency column 1 and 0
+          (build_b257d.py t_true_dbl, t_true_cur), on an Int64 1 and 0;
+          text that is no number fails onto an Int64 (t_text_bad);
+        * onto a Currency column a number is rounded to 4 decimals, half
+          away from zero, from the Double product x * 10000 (build_b254.py
+          k_filter cell 5: TREATAS({0.10001}, TCur3[v]) keeps the two 0.1
+          rows; build_b254b.py d_treatas: 0.03125 is 0.0313, 0.09996 and
+          0.09995 are 0.1, 0.10005 is 0.1001), and a text its decimal
+          number (TREATAS({"0.1"}, TK[v]) keeps 0.1, d_treatas_text).
+
+        Values reach the filter as the column's own floats and ints, so they
+        meet its cells exactly."""
+        tname = ctx.model_table(col[0]) if isinstance(col[0], str) else col[0]
+        tbl = ctx.tables.get(tname)
+        if not isinstance(tbl, dict):
+            return None
+        idx = ctx._find_col_idx(tbl.get('columns') or [], col[1])
+        if idx < 0:
+            return None
+        if self._currency_column((tname, tbl['columns'][idx]), ctx):
+            return _treatas_currency
+        kind = ctx._number_kind(tbl, idx)
+        if kind is int:
+            return _treatas_int64
+        if kind is float:
+            return _treatas_double
+        return None
 
     def _fn_generate(self, args_str: str, ctx: DAXContext) -> Any:
         """GENERATE(table1, table2_expr) — like CROSS APPLY (inner join behavior)."""
@@ -14524,12 +22980,54 @@ class DAXEngine:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
             if isinstance(inner, list) and inner:
+                prefix = _inner_prefix(row_item) if isinstance(row_item, dict) else '_inner_'
                 for inner_item in inner:
                     merged = _generate_outer(row_item)
                     if isinstance(inner_item, dict):
-                        merged.update(_generate_inner(inner_item))
+                        merged.update(_generate_inner(inner_item, prefix))
                     result.append(merged)
         return result
+
+    def _lineage_blank_row(self, table_expr: str, ctx: DAXContext) -> Optional[dict]:
+        """A BLANK row (_blank_like) of the table ``table_expr`` returns, read
+        from the expression when it returned no row: a scan of a model table
+        (_filter_source_table: the table, FILTER / ALL / VALUES / ... of it),
+        SELECTCOLUMNS or ROW of named columns; None for any other table. The
+        right-hand / inner table of NATURALLEFTOUTERJOIN / GENERATEALL when
+        no row of it joined anywhere (#300)."""
+        s = table_expr.strip()
+        src = self._filter_source_table(s, ctx)
+        if src is not None:
+            t, cols = src
+            names = [c for c in ctx.tables[t]['columns'] if cols is None or c in cols]
+            row: dict
+            if cols is not None and len(names) == 1:
+                row = {'__table__': t, '__column__': names[0], '__value__': None}
+            elif cols is None:
+                row = {'__table__': t, '__row__': True, **{c: None for c in names}}
+            else:
+                row = _ColumnsRow({'__table__': t, '__row__': True, **{c: None for c in names}})
+            return _blank_like(row)
+        kind, data = self._plan_head(s) if s else (_P_NONE, None)
+        if kind == _P_FUNC and data[0] in ('SELECTCOLUMNS', 'ROW'):
+            args = [a.strip() for a in self._split_args(data[1])] if data[1].strip() else []
+            names_at = args[1::2] if data[0] == 'SELECTCOLUMNS' else args[0::2]
+            if data[0] == 'SELECTCOLUMNS' and len(args) % 2 == 0:
+                return None
+            if data[0] == 'ROW' and len(args) % 2 == 1:
+                return None
+            got = []
+            for a in names_at:
+                if len(a) < 2 or a[0] != '"' or a[-1] != '"':
+                    return None
+                got.append(a[1:-1].replace('""', '"'))
+            if not got:
+                return None
+            if data[0] == 'ROW':
+                return _blank_like({'__table__': '__row__', **{c: None for c in got},
+                                    '__column__': got[0], '__value__': None})
+            return _blank_like(_ColumnsRow({c: None for c in got}))
+        return None
 
     def _fn_generateall(self, args_str: str, ctx: DAXContext) -> Any:
         """GENERATEALL(table1, table2_expr) — like CROSS APPLY (includes empty inner)."""
@@ -14540,6 +23038,8 @@ class DAXEngine:
         if not isinstance(table_ref, list):
             return []
         result = []
+        alone: list = []             # positions of outer rows no inner row joined
+        template = None              # an inner row, the layout of the BLANK one
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
@@ -14547,62 +23047,199 @@ class DAXEngine:
                 row_ctx = ctx
             inner = self._eval_expr(args[1].strip(), row_ctx)
             if isinstance(inner, list) and inner:
+                prefix = _inner_prefix(row_item) if isinstance(row_item, dict) else '_inner_'
                 for inner_item in inner:
                     merged = _generate_outer(row_item)
                     if isinstance(inner_item, dict):
-                        merged.update(_generate_inner(inner_item))
+                        merged.update(_generate_inner(inner_item, prefix))
+                        if template is None:
+                            template = inner_item
                     result.append(merged)
             else:
                 # GENERATEALL keeps rows even when inner is empty
+                alone.append(len(result))
                 result.append(row_item if isinstance(row_item, dict) else {'__value__': row_item})
+        if alone:
+            # such a row's inner columns are BLANK: a BLANK row of the inner
+            # rows' layout, else of the inner table the expression names
+            # (_joined_cell; #300), where T[k] of it leaked
+            # a (table, column) marker and a bare [x] raised
+            blank = (_blank_like(template) if template is not None
+                     else self._lineage_blank_row(args[1], ctx))
+            if blank is not None:
+                for i in alone:
+                    kept = _generate_outer(result[i])
+                    kept.update(_generate_inner(blank, _inner_prefix(kept)))
+                    result[i] = kept
         return result
 
     def _fn_generateseries(self, args_str: str, ctx: DAXContext) -> Any:
-        """GENERATESERIES(start, end, step) — generate a single-column table [Value]."""
+        """GENERATESERIES(start, end[, step]) -- the one-column table [Value]
+        of start, start + step, ... up to end, as Power BI Desktop 2.152
+        computes it. The series' type is its start's and step's: Int64 when
+        both are, Currency when either is Currency and neither a Double, a
+        date-time when start is one, else Double.
+
+        * Int64 values step exactly, past 2**53 too, and every row is
+          materialized: GENERATESERIES(9007199254740991, 9007199254740996) is
+          6 distinct rows and COUNTROWS(GENERATESERIES(1, 1200000)) 1,200,000
+          (build_b257.py g_series_n, g_series_distinct, z_series_big;
+          #329). It stepped in floats, so the rows past 2**53
+          collapsed onto two values, and silently stopped at 1,000,000 rows.
+          The engine refuses a series of more than _GENERATESERIES_MAX_ROWS
+          rows with an error instead of cutting it short.
+        * A Double series ACCUMULATES the step in Double arithmetic and stops
+          past end, with no tolerance: GENERATESERIES(0, 0.3, 0.1) has 3 rows
+          (0.1 + 0.1 + 0.1 is 0.30000000000000004), (0, 0.7, 0.1) 8, (1, 1.3,
+          0.1) 3, (0, 1.7, 0.1) 17, (0.1, 0.3, 0.1) 2, and MAX(GENERATESERIES(
+          0, 1, 0.1)) is 0.9999999999999999 (build_b254.py l_ctors,
+          build_b254b.py e_gs, build_b257b.py g_float_*; #332).
+          A 1e-9 tolerance gave 4, 4, 18 and 3 of those.
+        * A Currency series adds whole counts of 1/10,000 and is Currency:
+          GENERATESERIES(CURRENCY(0.1), 0.3, CURRENCY(0.1)) is 3 Currency
+          rows up to 0.3, MAXX(GENERATESERIES(1, 2, CURRENCY(0.5)), [Value])
+          the Currency 2, where (1, 2, 0.5) is a Double series (e_gs).
+        * Dates and times step as their serials and stay date-times:
+          GENERATESERIES(DATE(2024, 1, 1), DATE(2024, 1, 3), 1) is 3 days, its
+          MAX & "" "1/3/2024", and (TIME(0, 0, 0), TIME(1, 0, 0), TIME(0, 15,
+          0)) 5 times (g_dates, g_dates_text, g_time). They were no rows.
+        * A step of 0 or less is an error (g_neg_step, g_zero_step); a
+          negative step built a descending series and 0 no rows. Its text
+          here, "The GenerateSeries function cannot have an IncrementValue
+          that is less than or equal to zero.", is our wording: Desktop's
+          Norwegian message reads, word for word, "... cannot have an
+          IncrementValue greater than or equal to zero", the opposite of
+          what it does, and its English original is not measured. An end
+          before the start is no rows (g_end_lt).
+        * A step given as BLANK is an error, not a step of 1: Desktop's
+          COUNTROWS(GENERATESERIES(1, 3, BLANK())) fails with (in Norwegian)
+          "The arguments in the GenerateSeries function cannot be blank."
+          (build_b257c.py g_blank_step; the English text is our wording).
+          So is a BLANK start or end: COUNTROWS(GENERATESERIES(BLANK(), 3))
+          and COUNTROWS(GENERATESERIES(1, BLANK())) + 0 fail with the same
+          message (build_b257d.py g_blank_start, g_blank_end), where we read
+          the BLANK as 0 and answered 4 and 0.
+        * Neither error is one IFERROR / ISERROR can catch (_uncatchable):
+          Desktop's IFERROR(COUNTROWS(GENERATESERIES(5, 1, -1)), -1) and
+          IFERROR(COUNTROWS(GENERATESERIES(1, 3, BLANK())), -1) fail the
+          query (build_b257c.py e_gs_iferror, g_blank_step), where we
+          answered -1 and 3 (#332), and so does IF(ISERROR(
+          COUNTROWS(GENERATESERIES(5, 1, -1))), 1, 0) (build_b257d.py
+          e_gs_iserror). A BLANK start or end is the blank step's error, and
+          is taken to escape IFERROR as that one does (not measured under
+          IFERROR). They are errors of the call that runs, not of the
+          measure's definition: IF(FALSE(), COUNTROWS(GENERATESERIES(5, 1,
+          -1)), 7) is 7 (e_gs_if_false)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return []
-        start_val = self._eval_expr(args[0].strip(), ctx)
-        end_val = self._eval_expr(args[1].strip(), ctx)
-        step_val = self._eval_expr(args[2].strip(), ctx) if len(args) >= 3 else 1
-        try:
-            start_val = float(start_val) if start_val is not None else 0
-            end_val = float(end_val) if end_val is not None else 0
-            step_val = float(step_val) if step_val is not None else 1
-        except (TypeError, ValueError):
+        raw = [_scalarize(self._eval_expr(args[0].strip(), ctx)),
+               _scalarize(self._eval_expr(args[1].strip(), ctx)),
+               _scalarize(self._eval_expr(args[2].strip(), ctx)) if len(args) >= 3 else 1]
+        if raw[0] is None or raw[1] is None or raw[2] is None:
+            raise _uncatchable(_DAXEvaluationError(
+                "The arguments in the GenerateSeries function cannot be blank."))
+        as_dt = isinstance(raw[0], (datetime, date))
+        nums: list = []
+        for v in raw:
+            if isinstance(v, bool):
+                v = int(v)
+            elif isinstance(v, (datetime, date)):
+                v = _as_number(v)
+            elif isinstance(v, str):
+                try:
+                    v = int(v.strip())
+                except ValueError:
+                    try:
+                        v = float(v.strip())
+                    except ValueError:
+                        return []
+            elif not isinstance(v, (int, float)):
+                return []
+            nums.append(v)
+        start, end, step = nums
+        if any(isinstance(v, float) and v != v for v in nums):
             return []
-        if step_val == 0:
-            return []
-        # Use int if all values are whole numbers
-        use_int = (start_val == int(start_val) and end_val == int(end_val)
-                   and step_val == int(step_val))
-        rows: list = []
-        current = start_val
-        max_rows = 1000000  # safety limit
-        if step_val > 0:
-            while current <= end_val + 1e-9 and len(rows) < max_rows:
-                val = int(current) if use_int else current
-                rows.append({'Value': val, '__table__': '__generateseries__',
-                             '__column__': 'Value', '__value__': val})
-                current += step_val
-        elif step_val < 0:
-            while current >= end_val - 1e-9 and len(rows) < max_rows:
-                val = int(current) if use_int else current
-                rows.append({'Value': val, '__table__': '__generateseries__',
-                             '__column__': 'Value', '__value__': val})
-                current += step_val
-        return rows
+        if not step > 0:
+            raise _uncatchable(_DAXEvaluationError(
+                "The GenerateSeries function cannot have an IncrementValue that is "
+                "less than or equal to zero."))
+        limit = _GENERATESERIES_MAX_ROWS
+
+        def too_many(n) -> _DAXEvaluationError:
+            return _DAXEvaluationError(
+                f"GENERATESERIES would return {n:,} rows; the engine materializes at most {limit:,}.")
+
+        values: list
+        kinds = (type(start), type(step))
+        if kinds == (int, int) and not as_dt:
+            if end < start:
+                return []
+            if isinstance(end, float) and not math.isfinite(end):
+                raise too_many(math.inf)
+            last = end if type(end) is int else math.floor(end)
+            n = (last - start) // step + 1
+            if n > limit:
+                raise too_many(n)
+            values = list(range(start, start + n * step, step))
+        elif _Currency in kinds and float not in kinds and not as_dt:
+            # whole counts of 1/10,000; an int is its count * 10,000
+            n0 = round(start * 10000) if type(start) is _Currency else start * 10000
+            ns = round(step * 10000) if type(step) is _Currency else step * 10000
+            end_f = float(end)
+            if not math.isfinite(end_f):
+                raise too_many(math.inf)
+            if end_f < n0 / 10000:
+                return []
+            est = int((end_f * 10000 - n0) // ns) + 2
+            if est > limit + 1:
+                raise too_many(est - 1)
+            values = []
+            c = n0
+            while c / 10000 <= end_f:
+                values.append(_Currency(c / 10000))
+                c += ns
+        else:
+            cur, end_f, step_f = float(start), float(end), float(step)
+            if not math.isfinite(end_f):
+                raise too_many(math.inf)
+            if end_f < cur:
+                return []
+            if (end_f - cur) / step_f > limit + 1:
+                raise too_many(int((end_f - cur) / step_f) + 1)
+            values = []
+            while cur <= end_f:
+                values.append(cur)
+                if len(values) > limit:
+                    raise too_many(len(values))
+                cur += step_f
+            if as_dt:
+                values = [_from_dax_serial(x) for x in values]
+        return [{'Value': v, '__table__': '__generateseries__', '__column__': 'Value', '__value__': v}
+                for v in values]
 
     # =========================================================================
     # Filter functions
     # =========================================================================
 
     def _fn_allexcept(self, args_str: str, ctx: DAXContext) -> Any:
-        """ALLEXCEPT(table, column1, column2, ...) — remove all filters except on specified columns."""
+        """ALLEXCEPT(table, column1, column2, ...) — remove all filters except on specified columns.
+
+        As a table, the distinct rows of the table's OTHER columns. Power BI
+        Desktop 2.152 (build_b253b.py group J; #260):
+        COUNTROWS(ALLEXCEPT(T3, T3[Cat])) is 3, T3's distinct (Reg, V)
+        (j_allexcept_count), CONCATENATEX of it over T3[Reg] & T3[V]
+        'N1,S2,S3' (j_allexcept_cols), and T3[Cat] is no column of it
+        (j_allexcept_dropped refuses S[Cat] there); INDEX over ALLEXCEPT(S,
+        S[Cat]) ordered by S[V] answers its S[Reg] 'N' (build_b253.py
+        i_allexcept_s). The engine returned, per distinct FULL row, a row of
+        the first column alone: 4, the column markers as text, ''. The
+        filters kept are as before: those on the kept columns and on other
+        tables."""
         args = self._split_args(args_str)
         if not args:
             return ('__ALLEXCEPT__', args_str.strip())
-        table_name = args[0].strip().strip("'")
+        table_name = ctx.model_table(args[0].strip().strip("'"))    # in any case (#226)
         # Columns to keep
         keep_cols = set()
         for i in range(1, len(args)):
@@ -14621,14 +23258,30 @@ class DAXEngine:
             new_ctx._filter_idx_cache = ctx._filter_idx_cache
             rows = new_ctx.get_filtered_rows(table_name)
             cols = tbl['columns']
-            if rows and len(cols) > 0:
-                result = []
-                seen = set()
+            rest = [(i, c) for i, c in enumerate(cols)
+                    if f"{table_name}.{c}" not in keep_cols]
+            if rows and rest:
+                result: list = []
+                seen: set = set()
                 for row in rows:
-                    key = tuple(str(row[i]) for i in range(len(cols)))
-                    if key not in seen:
+                    key = tuple(row[i] for i, _c in rest)
+                    try:
+                        if key in seen:
+                            continue
                         seen.add(key)
-                        result.append({'__table__': table_name, '__column__': cols[0], '__value__': row[0]})
+                    except TypeError:       # an unhashable cell: as text
+                        skey = tuple(str(v) for v in key)
+                        if skey in seen:
+                            continue
+                        seen.add(skey)
+                    if len(rest) == 1:
+                        result.append({'__table__': table_name, '__column__': rest[0][1],
+                                       '__value__': key[0]})
+                    else:
+                        rd = _ColumnsRow({'__table__': table_name, '__row__': True})
+                        for (_i, c), v in zip(rest, key):
+                            rd[c] = v
+                        result.append(rd)
                 return result
         return ('__ALLEXCEPT__', args_str.strip())
 
@@ -14777,27 +23430,90 @@ class DAXEngine:
     @staticmethod
     def _row_col(row, table_name: str, col_name: str, ctx: DAXContext) -> tuple:
         """``(True, value)`` when ``row``, an iterated row dict, holds column
-        ``col_name`` of ``table_name``; ``(False, None)`` otherwise."""
+        ``col_name`` of ``table_name``, also in a part joined onto it
+        (_joined_cell); ``(False, None)`` otherwise."""
         if not isinstance(row, dict):
             return False, None
+        own: Optional[dict] = row
         if '__parts__' in row:                    # a CROSSJOIN row (#108)
-            row = next((p for p in row['__parts__'] if p.get('__table__') == table_name), None)
-            if row is None:
-                return False, None
-        if row.get('__table__') != table_name:
+            own = next((p for p in row['__parts__'] if p.get('__table__') == table_name), None)
+        if own is not None and own.get('__table__') == table_name:
+            names = [col_name]
+            tbl = ctx.tables.get(table_name)
+            if tbl is not None:
+                ci = ctx._find_col_idx(tbl['columns'], col_name)
+                if ci >= 0 and tbl['columns'][ci] != col_name:
+                    names.append(tbl['columns'][ci])  # the model's spelling (#132)
+            for name in names:
+                if own.get('__column__') == name:
+                    v = own.get('__value__')
+                elif name in own and not name.startswith('__'):
+                    v = own[name]
+                else:
+                    continue
+                # a Fixed Decimal column reads as a Currency (issue #248)
+                if type(v) is float and (table_name, name) in ctx._cur_tcols and _cur_lineage(own, name):
+                    v = _Currency(v)
+                return True, v
+        if '__joined__' in row or '_inner___table__' in row:
+            return DAXEngine._joined_cell(row, table_name, col_name, ctx)
+        return False, None
+
+    @staticmethod
+    def _joined_cell(row, table_name: str, col_name: str, ctx: DAXContext) -> tuple:
+        """``(True, value)`` when ``row`` carries column ``col_name`` of
+        ``table_name`` in a part joined onto it: GENERATE's / GENERATEALL's
+        inner row (its keys prefixed ``_inner_``, _generate_inner), or the
+        right-hand row of NATURALINNERJOIN / NATURALLEFTOUTERJOIN
+        (``__joined__``, _fn_naturaljoin; BLANK for a left row no right row
+        matched); ``(False, None)`` otherwise.
+
+        Such a column was read off the outer / left row alone, which has no
+        such key, so the reference came back as a (table, column) marker:
+        CONCATENATEX(GENERATE(D, FILTER(T, T[g] = D[g])), T[k] & "") printed
+        "('T', 'k')" and SUMX(NATURALINNERJOIN(T, D), D[p] * 0.5) was BLANK
+        (#300). Power BI Desktop 2.152 (build_b248c.py
+        l_reads): MAXX(NATURALINNERJOIN(T3, D3), D3[pc]), the
+        NATURALLEFTOUTERJOIN and MAXX(GENERATE(VALUES(T3[k]), FILTER(D3,
+        D3[k] = EARLIER(T3[k]))), D3[pc]) are C0.25, SUMX(NATURALINNERJOIN(
+        T3, D3), D3[pc]) C2.5 -- the joined row's own value, a Currency."""
+        if not isinstance(row, dict):
             return False, None
-        names = [col_name]
         tbl = ctx.tables.get(table_name)
+        names = [col_name]
+        ci = -1
         if tbl is not None:
             ci = ctx._find_col_idx(tbl['columns'], col_name)
             if ci >= 0 and tbl['columns'][ci] != col_name:
-                names.append(tbl['columns'][ci])  # the model's spelling (#132)
-        for name in names:
-            if row.get('__column__') == name:
-                return True, row.get('__value__')
-            if name in row and not name.startswith('__'):
-                return True, row[name]
-        return False, None
+                names.append(tbl['columns'][ci])    # the model's spelling (#132)
+        # the BLANK right-hand row of a left row no right row matched has the
+        # table's columns, BLANK (GENERATEALL's BLANK inner row has them as
+        # keys, _blank_like)
+        blank_ok = tbl is None or ci >= 0
+        p = ''
+        while True:
+            for part in row.get(p + '__joined__') or ():
+                if part.get('__table__') == table_name:
+                    found, v = DAXEngine._row_col(part, table_name, col_name, ctx)
+                    if found:
+                        return found, v
+                    if part.get('__blank_right__') and blank_ok:
+                        return True, None
+            p += '_inner_'
+            if (p + '__table__') not in row:
+                return False, None
+            if row[p + '__table__'] != table_name:
+                continue
+            for name in names:
+                if row.get(p + '__column__') == name and (p + '__value__') in row:
+                    v = row[p + '__value__']
+                elif (p + name) in row and not name.startswith('__'):
+                    v = row[p + name]
+                else:
+                    continue
+                if type(v) is float and (table_name, name) in ctx._cur_tcols:
+                    v = _Currency(v)
+                return True, v
 
     def _fn_earlier(self, args_str: str, ctx: DAXContext) -> Any:
         """EARLIER(column[, n]) -- the column's value in the n-th row context
@@ -14825,13 +23541,29 @@ class DAXEngine:
         if not earliest and len(args) > 1:
             v = self._num_arg(args[1], ctx)
             n = int(v) if isinstance(v, (int, float)) else 1
-        hits = []
+        hits: list = []
+        foreign = False         # the innermost row context is another table's
         c: Optional[DAXContext] = ctx
         while c is not None:
             found, val = self._row_col(c._current_row, table_name, ref[1], ctx)
             if found:
                 hits.append(val)
+            elif c is ctx and c._current_row is not None:
+                foreign = True
             c = c._outer_ctx
+        if foreign and hits and (earliest or len(hits) >= n >= 1):
+            # The innermost row context is another table's (or holds no such
+            # column): it counts as the first, so the n-th row context over
+            # this table is the earlier one. Power BI Desktop 2.152
+            # (build_b248c.py l_reads): MAXX(GENERATE(VALUES(T3[k]),
+            # FILTER(D3, D3[k] = EARLIER(T3[k]))), D3[pc]) is C0.25 --
+            # EARLIER(T3[k]) in D3's rows is GENERATE's T3[k] row; it raised
+            # (#301). With two row contexts over T around
+            # D's (build_b248g.py g2_earlier_levels): SUMX(T, SUMX(FILTER(
+            # ALL(T), T[k] <= EARLIER(T[k])), COUNTROWS(FILTER(D, D[p] >
+            # EARLIER(T[c]))))) is 7 -- the inner SUMX's row; the outer one
+            # gave 3. EARLIEST is the outermost (g2_earliest 20).
+            return hits[-1] if earliest else hits[n - 1]
         if earliest and len(hits) > 1:
             return hits[-1]
         if not earliest and n >= 1 and len(hits) > n:
@@ -14845,21 +23577,54 @@ class DAXEngine:
     # =========================================================================
 
     def _fn_ceiling(self, args_str: str, ctx: DAXContext) -> Any:
-        """CEILING(number, significance) — round up to nearest multiple of significance."""
+        """CEILING(number, significance) — round up to nearest multiple of
+        significance, on the two numbers' 15-digit decimals
+        (_round_dec15_multiple, #333)."""
         args = self._split_args(args_str)
         val = self._num_arg(args[0], ctx)
         sig = self._num_arg(args[1], ctx) if len(args) > 1 else 1
+        tv, ts = type(val), type(sig)
+        if (tv is float or tv is int) and (ts is float or ts is int):
+            return _round_dec15_multiple(val, sig, True) if sig else val
+        if tv is _Currency and isinstance(sig, (int, float)) and sig != 0:
+            # on the counts, a Currency (Power BI Desktop 2.152, build_b254.py
+            # f_round: CEILING(CURRENCY(1.2345), 0.01) is C1.24; build_b254b.py
+            # f_fns: CEILING(CURRENCY(1.2345), 1) C2; #305)
+            s = _cur_sig_count(sig)
+            if s:
+                return _cur_make(_wrap64(-((-_cur_count(val)) // s) * s))
+            # a significance of no whole count: the Double's, then a Currency
+            # (build_b248c.py h_fn_edges: CEILING(CURRENCY(1.2345), 0.00001)
+            # is C1.2345)
+            return _cur_double_multiple(val, sig, math.ceil)
         if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
+            # a Currency significance (or one finer than a Currency's count):
+            # the typed arithmetic, as before (not measured)
             return math.ceil(val / sig) * sig
         return val
 
     def _fn_floor(self, args_str: str, ctx: DAXContext) -> Any:
-        """FLOOR(number, significance) — round down to nearest multiple of significance."""
+        """FLOOR(number, significance) — round down to nearest multiple of
+        significance, as CEILING rounds up (_fn_ceiling)."""
         args = self._split_args(args_str)
         val = self._num_arg(args[0], ctx)
         sig = self._num_arg(args[1], ctx) if len(args) > 1 else 1
+        tv, ts = type(val), type(sig)
+        if (tv is float or tv is int) and (ts is float or ts is int):
+            return _round_dec15_multiple(val, sig, False) if sig else val
+        if tv is _Currency and isinstance(sig, (int, float)) and sig != 0:
+            # on the counts, a Currency (Power BI Desktop 2.152, build_b254.py
+            # f_round: FLOOR(CURRENCY(1.2345), 0.01) is C1.23; build_b254b.py
+            # f_fns: FLOOR(CURRENCY(1.2345), 1) C1; #305)
+            s = _cur_sig_count(sig)
+            if s:
+                return _cur_make(_wrap64((_cur_count(val) // s) * s))
+            # a significance of no whole count, or past the range: the
+            # Double's, then a Currency (build_b248c.py h_fn_edges:
+            # FLOOR(CURRENCY(1.2345), 1E16) is C0, where it raised)
+            return _cur_double_multiple(val, sig, math.floor)
         if isinstance(val, (int, float)) and isinstance(sig, (int, float)) and sig != 0:
-            return math.floor(val / sig) * sig
+            return math.floor(val / sig) * sig      # as CEILING (not measured)
         return val
 
     def _fn_mod(self, args_str: str, ctx: DAXContext) -> Any:
@@ -14879,20 +23644,37 @@ class DAXEngine:
             return None
         if divisor is None or (isinstance(divisor, (int, float)) and divisor == 0):
             raise _DAXEvaluationError("Division by zero in function MOD: the divisor is 0 or BLANK.")
+        tv, td = type(val), type(divisor)
+        if (tv is _Currency or td is _Currency) and (tv is int or tv is _Currency) \
+                and (td is int or td is _Currency):
+            # Currency and Int64 sides: the counts' remainder, a Currency
+            # (Power BI Desktop 2.152, build_b254.py f_math: MOD(CURRENCY(5.5),
+            # 2) is C1.5; build_b248c.py h_fn_edges: MOD(5, CURRENCY(2)) C1);
+            # a Double side makes it a Double (build_b254b.py f_fns:
+            # MOD(CURRENCY(5.5), 0.3) is D0.1; h_fn_edges: MOD(5.5,
+            # CURRENCY(2)) D1.5; #305)
+            return _cur_make(_cur_count_any(val) % _cur_count_any(divisor))
         if isinstance(divisor, (int, float)):
+            if type(val) is _Currency or type(divisor) is _Currency:
+                return float(val) % float(divisor)
             return val % divisor
         return None
 
     def _fn_power(self, args_str: str, ctx: DAXContext) -> Any:
-        """POWER(base, exponent) — exponentiation."""
+        """POWER(base, exponent) -- the ^ operator's arithmetic (_dax_pow;
+        #321): Desktop's error for 0 ^ 0 names POWER
+        (build_b248c.py a_err_pow00), and POWER(0, -1), POWER(10, 400) and
+        POWER(-8, 0.5) are errors as their ^ forms are (b_pow2). POWER raised
+        Python's "math domain error" / "math range error", POWER(-8, 1 / 3)
+        among them, and a BLANK exponent made it BLANK."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
-        base = self._num_arg(args[0], ctx)
-        exp = self._num_arg(args[1], ctx)
-        if isinstance(base, (int, float)) and isinstance(exp, (int, float)):
-            return math.pow(base, exp)
-        return None
+        base = self._pow_operand(self._eval_expr(args[0].strip(), ctx), ctx)
+        exp = self._pow_operand(self._eval_expr(args[1].strip(), ctx), ctx)
+        if base is _MISSING or exp is _MISSING:
+            return None
+        return _dax_pow(base, exp)
 
 
     # ------------------------------------------------------------------
@@ -15339,7 +24121,13 @@ class DAXEngine:
                     if isinstance(v, (int, float)) and not isinstance(v, bool)]
         return None
 
-    def _iter_numbers(self, args_str: str, ctx: DAXContext):
+    def _iter_numbers(self, args_str: str, ctx: DAXContext, keep_currency: bool = False,
+                      scan_empty: bool = False):
+        """An iterator's numbers, as floats; with ``keep_currency``, the
+        Currency counts instead when they are Currency values (a tuple
+        ('currency', counts); _cur_numbers). With ``scan_empty``, an empty
+        table still refuses the window functions of the expression
+        (_win_empty_scan)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return None
@@ -15347,6 +24135,8 @@ class DAXEngine:
         row_expr = args[1].strip()
         if not isinstance(table_ref, list):
             return None
+        if not table_ref and scan_empty:
+            self._win_empty_scan(row_expr, ctx)     # issue #247
         values = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
@@ -15356,7 +24146,12 @@ class DAXEngine:
             else:
                 result = self._eval_expr(row_expr, ctx)
             if isinstance(result, (int, float)) and not isinstance(result, bool):
-                values.append(float(result))
+                values.append(result if keep_currency else float(result))
+        if keep_currency:
+            cur = self._cur_numbers(values, row_expr, table_ref, ctx) if values else None
+            if cur is not None:
+                return ('currency', cur)
+            return [float(v) for v in values]
         return values
 
     @staticmethod
@@ -15389,17 +24184,44 @@ class DAXEngine:
         if vals is None or k is None:
             return None
         f = self._percentile_inc if name.endswith("INC") else self._percentile_exc
+        ref = self._column_arg(parts[0], ctx)
+        if vals and isinstance(ref, tuple) and len(ref) == 2 and self._currency_column(ref, ctx):
+            # a Currency column: a Currency, a tie toward +infinity (issue
+            # #248; Desktop 2.152, build_b254b.py f_median:
+            # PERCENTILE.INC(TR[v], 0.25) over -7..7 counts is -3)
+            return self._cur_percentile_at(f, [_cur_count(v) for v in vals], k)
         return f(vals, k)
+
+    @staticmethod
+    def _cur_percentile_at(f, counts: list, k: float):
+        """PERCENTILE(X).INC/EXC ``f`` of Currency counts: the position
+        ``f`` interpolates at (found from positions 0..n-1), the counts
+        interpolated there exactly (_cur_percentile)."""
+        pos = f(list(range(len(counts))), k)
+        if pos is None:
+            return None
+        return _cur_percentile(counts, pos)
 
     def _fn_percentilex(self, name: str, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
         if len(parts) != 3:
             return None
-        vals = self._iter_numbers(",".join(parts[:2]), ctx)
-        k = self._num1(parts[2], ctx)
+        vals = self._iter_numbers(",".join(parts[:2]), ctx, keep_currency=True)
+        # k is evaluated once: IFERROR catches its error (#267;
+        # Power BI Desktop 2.152, build_b255d.py r30)
+        try:
+            k = self._num1(parts[2], ctx)
+        except Exception as exc:
+            self._tag_once_arg(exc)
+            raise
         if vals is None or k is None:
             return None
         f = self._percentile_inc if name.endswith("INC") else self._percentile_exc
+        if isinstance(vals, tuple):
+            # Currency values: a Currency, a tie toward +infinity (issue #248;
+            # Desktop 2.152, build_b254b.py f_median:
+            # PERCENTILEX.INC(TR, TR[v], 0.25) over -7..7 counts is -3)
+            return self._cur_percentile_at(f, vals[1], k)
         return f(vals, k)
 
     def _fn_geomean(self, args_str: str, ctx: DAXContext):
@@ -15409,13 +24231,16 @@ class DAXEngine:
         return math.exp(sum(math.log(v) for v in vals) / len(vals))
 
     def _fn_geomeanx(self, args_str: str, ctx: DAXContext):
-        vals = self._iter_numbers(args_str, ctx)
+        vals = self._iter_numbers(args_str, ctx, scan_empty=True)
         if not vals or any(v <= 0 for v in vals):
             return None
         return math.exp(sum(math.log(v) for v in vals) / len(vals))
 
     def _fn_stdevx(self, name: str, args_str: str, ctx: DAXContext):
-        vals = self._iter_numbers(args_str, ctx)
+        # over an empty table STDEVX.P refuses the window functions of its
+        # expression (build_b253d.py b_stdevxp_empty, issue #247);
+        # STDEVX.S / VARX.P / VARX.S are not measured and do not scan
+        vals = self._iter_numbers(args_str, ctx, scan_empty=name == 'STDEVX.P')
         if vals is None:
             return None
         sample = name.endswith(".S")
@@ -15426,13 +24251,37 @@ class DAXEngine:
         return math.sqrt(var) if "STDEV" in name else var
 
     def _fn_rank_eq(self, args_str: str, ctx: DAXContext):
+        """RANK.EQ(value, column[, order]) -- the first position of ``value``
+        among the column's numbers, high to low unless ``order`` is truthy;
+        BLANK when the value is not among them (Power BI Desktop 2.152,
+        build_b257b.py rankeq_missing: RANK.EQ(3, TS[G]) over 1, 1, 2).
+
+        The numbers keep their exact values (issue #252): read through
+        float(), 9007199254740993 found 9007199254740992's position --
+        Desktop's RANK.EQ(9007199254740993, TK[K], 1) over 2**53 - 1 ..
+        2**53 + 4 is 3, we answered 2 (build_b257.py r_rankeq_asc). A Double
+        on either side makes them all Doubles, as an Int64 that meets a
+        Double compares (#325): RANK.EQ(9007199254740992.0,
+        TK[K]) is 4 (r_rankeq_id), RANK.EQ(9007199254740993, TD[D], 1) over
+        the Doubles 2**53, 2**53 + 4 is 1 (build_b257b.py rankeq_dbl).
+        _column_numbers, which PERCENTILE and GEOMEAN read, stays a float
+        reader."""
         parts = self._split_args(args_str)
         if len(parts) < 2:
             return None
-        x = self._num1(parts[0], ctx)
-        vals = self._column_numbers(parts[1], ctx)
-        if x is None or not vals:
+        x = self._num_arg(parts[0], ctx)
+        if not isinstance(x, (int, float)) or isinstance(x, bool):
             return None
+        ref = self._column_arg(parts[1], ctx)
+        if not (isinstance(ref, tuple) and len(ref) == 2):
+            return None
+        vals = [v for v in ctx.get_column_data(ref[0], ref[1])
+                if isinstance(v, (int, float)) and not isinstance(v, bool)]
+        if not vals:
+            return None
+        if type(x) is float or float in set(map(type, vals)):
+            x = float(x)
+            vals = [float(v) for v in vals]
         order = None
         if len(parts) >= 3:
             order = self._num1(parts[2], ctx)
@@ -15448,20 +24297,33 @@ class DAXEngine:
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         vals = []
-        for v in ctx.get_column_data(ref[0], ref[1]):
+        raw = ctx.get_column_data(ref[0], ref[1])
+        numeric = True
+        for v in raw:
             if v is None:
                 continue
             if isinstance(v, bool):
                 vals.append(1.0 if v else 0.0)
+                numeric = False
             elif isinstance(v, (int, float)):
                 vals.append(float(v))
             else:
                 vals.append(0.0)
-        # a Currency column (numbers only) averages as in AVERAGE (#241)
+                numeric = False
+        # a Currency column (numbers only) averages as in AVERAGE (#241): a
+        # Currency rounded half away from zero (issue #248; Desktop 2.152,
+        # build_b254.py a_col: AVERAGEA(TCur3[v]) is C0.1333)
         if vals and self._currency_column(ref, ctx):
-            return _currency_total(vals) / len(vals)
-        # correctly rounded, as AVERAGE (issue #246)
-        return _sum_numbers(vals) / len(vals) if vals else None
+            return _cur_avg(_wrap64(sum(map(round, map(_CURRENCY_SCALE, vals)))), len(vals))
+        if vals and numeric:
+            # a column of numbers averages as AVERAGE: the storage engine's
+            # sum over the count (Power BI Desktop 2.152, build_b243b.py
+            # av_a = av_sa = 0.932840741194013 - C; issue #243)
+            got = self._se_column_total(ctx, ref, raw)
+            if got is not _MISSING and got[1]:
+                return got[0] / got[1]
+        # TRUE / FALSE and text count 1 / 0: whole numbers, exact in any order
+        return _fe_sum(vals) / len(vals) if vals else None
 
     def _fn_iso_ceiling(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
@@ -15704,7 +24566,9 @@ class DAXEngine:
         return float(sign * days)
 
     def _fn_isdatetime(self, args_str: str, ctx: DAXContext):
-        v = self._eval_expr(args_str.strip(), ctx)
+        # a one-row, one-column table is its value, as for the other type
+        # predicates (#313)
+        v = _scalarize(self._eval_expr(args_str.strip(), ctx))
         return isinstance(v, datetime)
 
     def _fn_containsrow(self, args_str: str, ctx: DAXContext):
@@ -15786,7 +24650,7 @@ class DAXEngine:
             vals = [self._resolve_row_result(self._eval_expr(e, row_ctx), r, row_ctx)
                     for e, _d in pairs]
             keyed.append(tuple(_order_key(_scalarize(v)) for v in vals))   # any value, as TOPN (#158)
-        order = self._pair_order(keyed, pairs)
+        order = self._pair_order(_meet_order_keys(keyed), pairs)
         lo, hi = int(skip), int(skip) + int(n)
         return [rows[j] for j in order[lo:hi]]
 
@@ -15803,9 +24667,32 @@ class DAXEngine:
         lcols = set(self._row_cols(left[0]).keys()) if left else set()
         rcols = set(self._row_cols(right[0]).keys()) if right else set()
         common = lcols & rcols
+        # The right-hand row rides along as ``__joined__``, so a reference to
+        # its table's columns reads it (_joined_cell; #300):
+        # the merged row is the left table's, and D[p] of NATURALINNERJOIN(T,
+        # D) leaked a (table, column) marker. A row of a join keeps the parts
+        # it joined already (NATURALINNERJOIN(NATURALINNERJOIN(T, D), E) reads
+        # D[p] and E[q]), the right-hand row's ones too. A left row no right
+        # row matched carries a BLANK right row of each of the right side's
+        # tables, and the right side's columns as BLANK keys (a bare [p]),
+        # read off the right table's rows or, when it has none, the table
+        # the expression names (_lineage_blank_row).
+        if right:
+            rfirst = right[0]
+            rnames = list(self._row_cols(rfirst))
+        else:
+            rfirst = self._lineage_blank_row(parts[1], ctx) if name == 'NATURALLEFTOUTERJOIN' else None
+            rnames = list(self._row_cols(rfirst)) if rfirst is not None else []
+        blank_right: tuple = ()
+        if isinstance(rfirst, dict):
+            blank_right = tuple({'__table__': t, '__blank_right__': True}
+                                for t in [rfirst.get('__table__')]
+                                + [p.get('__table__') for p in rfirst.get('__joined__') or ()]
+                                if isinstance(t, str) and t)
         out = []
         for lr in left:
             lvals = self._row_cols(lr)
+            ltable = lr.get('__table__')
             matches = [rr for rr in right
                        if all(self._row_cols(rr).get(c) == lvals.get(c)
                               for c in common)]
@@ -15814,9 +24701,31 @@ class DAXEngine:
                     merged = dict(lr)
                     for k, v in self._row_cols(rr).items():
                         merged.setdefault(k, v)
+                    joined = tuple(lr.get('__joined__') or ())
+                    if rr.get('__table__') != ltable:
+                        joined += (rr,)
+                    joined += tuple(rr.get('__joined__') or ())
+                    if joined:
+                        merged['__joined__'] = joined
                     out.append(merged)
             elif name == 'NATURALLEFTOUTERJOIN':
-                out.append(dict(lr))
+                merged = dict(lr)
+                for k in rnames:
+                    merged.setdefault(k, None)
+                # A right-hand table the left row reaches through active
+                # relationships reads the related row, not BLANK: Power BI
+                # Desktop 2.152 (build_b248g.py g1_nloj_read, g1_empty_nloj,
+                # g1_nij_sum cell 2; T[g] -> D[g]): CONCATENATEX(
+                # NATURALLEFTOUTERJOIN(T, FILTER(D, D[g] = "a")), T[k] & "/"
+                # & D[p], ..) is 1/0.1,2/0.1,3/0.2,4/0.2, and so is the join
+                # with FILTER(D, FALSE()); BLANK came for T's "b" rows. A bare
+                # [p] stays the BLANK key (not measured).
+                joined = tuple(lr.get('__joined__') or ()) + tuple(
+                    (self._related_lookup(lr, b['__table__'], ctx) or b)
+                    for b in blank_right if b['__table__'] != ltable)
+                if joined:
+                    merged['__joined__'] = joined
+                out.append(merged)
         return out
 
     def _fn_groupby(self, args_str: str, ctx: DAXContext):
@@ -15876,6 +24785,10 @@ class DAXEngine:
                 i += 3
             else:
                 i += 2
+            # an Int64 against a Double compares as a Double (#325;
+            # Power BI Desktop 2.152, build_b257b.py isonorafter_di:
+            # ISONORAFTER(9007199254740992.0, 9007199254740993, ASC) is TRUE)
+            v1, v2 = _num_meet(v1, v2)
             try:
                 if v1 == v2:
                     continue
@@ -17031,10 +25944,15 @@ class DAXEngine:
                 vals.append(0.0)
         if not vals:
             return None
-        return max(vals) if name == "MAXA" else min(vals)
+        got = max(vals) if name == "MAXA" else min(vals)
+        # a Fixed Decimal column's extremum is a Currency, as MAX's and MIN's
+        # (Power BI Desktop 2.152, build_b254.py a_col: MAX(TCur3[v]) is
+        # C0.2; issue #248's lineage rule -- MAXA itself is not measured,
+        # build_b248c.py l_reads asks)
+        return _Currency(got) if self._currency_column(ref, ctx) else got
 
     def _fn_productx(self, args_str: str, ctx: DAXContext):
-        vals = self._iter_numbers(args_str, ctx)
+        vals = self._iter_numbers(args_str, ctx, scan_empty=True)     # issue #247
         if not vals:
             return None
         out = 1.0
@@ -17045,7 +25963,10 @@ class DAXEngine:
     # ---- type predicates -------------------------------------------------
 
     def _fn_type_pred(self, name: str, args_str: str, ctx: DAXContext):
-        v = self._eval_expr(args_str.strip(), ctx)
+        # a one-row, one-column table is its value (Power BI Desktop 2.152,
+        # build_b254.py l_scalars: ISCURRENCY(CALCULATE(VALUES(TR[v]), TR[id]
+        # = 10)) is TRUE; #313)
+        v = _scalarize(self._eval_expr(args_str.strip(), ctx))
         if name == "ISBOOLEAN":
             return isinstance(v, bool)
         if name == "ISSTRING":
@@ -17088,6 +26009,10 @@ class DAXEngine:
                 i += 3
             else:
                 i += 2
+            # an Int64 against a Double compares as a Double (#325;
+            # Power BI Desktop 2.152, build_b257b.py isafter_id:
+            # ISAFTER(9007199254740993, 9007199254740992.0, ASC) is FALSE)
+            v1, v2 = _num_meet(v1, v2)
             try:
                 if v1 == v2:
                     continue
@@ -17106,8 +26031,8 @@ class DAXEngine:
         if not (isinstance(ref, tuple) and len(ref) == 2):
             return None
         t, c = ref
-        vals = sorted(set(v for v in ctx.get_column_data(t, c)
-                          if v is not None), key=_order_key)
+        vals = _order_sorted(list(set(v for v in ctx.get_column_data(t, c)
+                                      if v is not None)))
         seq = vals if name == "FIRSTNONBLANKVALUE" else list(reversed(vals))
         # an iteration over the column's values: ALLSELECTED inside restores
         # them all (#118)
@@ -17122,30 +26047,44 @@ class DAXEngine:
     # ---- misc scalars ----------------------------------------------------
 
     def _fn_convert(self, args_str: str, ctx: DAXContext):
+        """CONVERT(value, type). A one-row, one-column table is its value
+        (Power BI Desktop 2.152, build_b254.py l_scalars: CONVERT(CALCULATE(
+        VALUES(TR[v]), TR[id] = 10), DOUBLE) is 0.0002; #313).
+
+        INTEGER rounds half away from zero, a Double in Double arithmetic
+        (build_b254.py r_to_int: 2.5 is 3, -2.5 -3, CURRENCY(2.5) 3;
+        build_b254b.py a_int: CONVERT(0.49999999999999994, INTEGER) is 1 --
+        0.49999999999999994 + 0.5 is 1.0 in Double -- and -0.5 is -1), a date
+        as its serial (DATE(2024, 1, 1) + 0.5 is 45293); text is read as an
+        exact decimal and rounded half to even ("2.5" is 2, "3.5" 4); past
+        the Int64 range Desktop's overflow error (CONVERT(1E19, INTEGER)).
+        The engine rounded half to even and returned a Python int past Int64
+        (#311). DOUBLE of a date is its serial (t_mixed:
+        CONVERT(CURRENCY(1.5) + DATE(2024, 1, 1), DOUBLE) is 45293.5; it was
+        BLANK, #312). CURRENCY rounds as CURRENCY() does
+        (_cur_from_value: a Double half away, text half to even, an Int64
+        wrapped; #309, #310)."""
         parts = self._split_args(args_str)
         if len(parts) != 2:
             return None
-        v = self._eval_expr(parts[0].strip(), ctx)
+        v = _scalarize(self._eval_expr(parts[0].strip(), ctx))
         target = parts[1].strip().upper()
         try:
             if target in ("INTEGER", "INT64"):
-                if isinstance(v, str):
-                    v = float(v)
-                if isinstance(v, (int, float)):
-                    return int(round(float(v)))
-                return None
+                # an Int64 is itself, past 2**53 too: Power BI Desktop 2.152
+                # (build_b257b.py z53_convert_int, #334) gives
+                # CONVERT(9007199254740993, INTEGER) - 9007199254740992 = 1
+                return self._convert_integer(v, ctx)
             if target == "DOUBLE":
                 if isinstance(v, str):
                     return float(v)
+                if isinstance(v, (datetime, date)):
+                    return _as_number(v)
                 if isinstance(v, (int, float)):
                     return float(v)
                 return None
             if target in ("CURRENCY", "DECIMAL"):
-                if isinstance(v, str):
-                    v = float(v)
-                if isinstance(v, (int, float)):
-                    return _Currency(v)
-                return None
+                return _cur_from_value(v, getattr(ctx, 'culture', None))
             if target in ("STRING", "TEXT"):
                 return _concat_str(v)
             if target == "BOOLEAN":
@@ -17156,6 +26095,49 @@ class DAXEngine:
                 return _as_datetime(v)
         except (ValueError, OverflowError):
             return None
+        return None
+
+    @staticmethod
+    def _convert_integer(v, ctx: DAXContext):
+        """CONVERT(v, INTEGER) (see _fn_convert)."""
+        if v is None:
+            return None
+        t = type(v)
+        if t is bool:
+            return int(v)
+        if t is int:
+            return v
+        if t is _Currency:
+            return _div_half_away(_cur_count(v), 10000)
+        if isinstance(v, str):
+            s = v.strip()
+            try:
+                d = decimal.Decimal(s)
+            except (decimal.InvalidOperation, ValueError):
+                d = None
+            if d is None or not d.is_finite():
+                f = _arith_text_number(s, getattr(ctx, 'culture', None)) if s else None
+                if f is None:
+                    raise _DAXEvaluationError(f"Cannot convert value '{v}' of type Text to type Integer.")
+                v = f
+            else:
+                n = int(d.to_integral_value(rounding=decimal.ROUND_HALF_EVEN, context=_CUR_DEC_CTX))
+                if not _I64_MIN <= n <= _I64_MAX:
+                    raise _DAXEvaluationError(_CUR_RANGE_MSG)
+                return n
+        if isinstance(v, (datetime, date)):
+            v = _as_number(v)
+            if v is None:
+                return None
+        if isinstance(v, (int, float)):
+            x = float(v)
+            if x != x or x in (math.inf, -math.inf):
+                raise _DAXEvaluationError(_CUR_RANGE_MSG)
+            n = math.floor(abs(x) + 0.5)
+            n = n if x >= 0 else -n
+            if not _I64_MIN <= n <= _I64_MAX:
+                raise _DAXEvaluationError(_CUR_RANGE_MSG)
+            return n
         return None
 
     def _fn_time(self, args_str: str, ctx: DAXContext):
@@ -17179,8 +26161,11 @@ class DAXEngine:
         return abs(self._daycount_frac(d1, d2, basis))
 
     def _fn_if_eager(self, args_str: str, ctx: DAXContext):
-        # Same result as IF; the eager evaluation strategy is unobservable in
-        # a scalar engine.
+        """IF.EAGER: as IF, only the branch taken is evaluated. Microsoft
+        Learn says its branches are evaluated regardless, but no error shows
+        it: Power BI Desktop 2.152 (build_b255.py, issue #249) answers
+        IF.EAGER([m_zero] <> 0, MOD(1, [m_zero]), 0) 0 (s5) and SUMX(TM,
+        IF.EAGER(TM[d] <> 0, MOD(TM[n], TM[d]))) 2 (i8), as with IF."""
         return self._fn_if(args_str, ctx)
 
     def _fn_evaluateandlog(self, args_str: str, ctx: DAXContext):
@@ -17289,7 +26274,7 @@ class DAXEngine:
         for k in range(len(pairs) - 1, -1, -1):
             col = [vals[k] for vals in keys]
             blank = _order_key(None if any(isinstance(v, str) for v in col) else 0) + (0,)
-            ks = [blank if v is None else _order_key(v) + (1,) for v in col]
+            ks = _meet_key_column([blank if v is None else _order_key(v) + (1,) for v in col])
             order.sort(key=ks.__getitem__, reverse=pairs[k][1])
         return order
 
@@ -17434,15 +26419,96 @@ class DAXEngine:
     # against the PRE-transition context (ctx._outer_ctx): a window function
     # inside SUMX must see every iterated row, not the one row the eager
     # row-to-filter transition narrowed the context to.
+    #
+    # Power BI Desktop 2.152 checks an explicit relation (issue #247;
+    # build_b247.py, build_b253.py, build_b253b.py): before a row is read, it
+    # refuses one of OFFSET / INDEX / WINDOW it cannot prove duplicate-free
+    # when no MATCHBY is given (_win_rel_shape), and one of ROWNUMBER / RANK
+    # whose columns all come from table functions; on the rows, MATCHBY values
+    # that repeat and a ROWNUMBER tie anywhere in a relation that may have
+    # duplicates. It breaks ORDERBY's ties by the relation's key, ascending
+    # (_win_tiebreak), and names the current row, where no row context does,
+    # by the relation's own columns (_win_context_rows).
+
+    _WIN_NAMES = frozenset({'OFFSET', 'INDEX', 'WINDOW', 'ROWNUMBER', 'RANK'})
 
     def _win_base_ctx(self, ctx: DAXContext) -> DAXContext:
         return getattr(ctx, '_outer_ctx', None) or ctx
 
-    def _win_parse(self, parts: list, ctx: DAXContext, skip: int = 0):
+    def _win_orderby(self, ps: str) -> list:
+        """ORDERBY(<expression>[, <order>][, <expression>[, <order>]]...) as
+        [(expression, 'ASC' | 'DESC')]. The argument after an expression is
+        always its order. Power BI Desktop 2.152 (build_b253b.py group G;
+        #259) takes ASC / 1 / TRUE / TRUE() ascending and DESC / 0 /
+        FALSE / FALSE() descending (g_true, g_one, g_true_fn 'A'; g_false,
+        g_zero, g_false_fn 'D') and refuses anything else -- "DESC" (g_text),
+        2 (g_two), a column (build_b253.py i_all_s_fullorder, i_crossjoin,
+        rn_sd) -- with _WIN_ORDER_ARG_MSG; an expression may leave its order
+        out (g_three 'D': ORDERBY(S[V], DESC, S[Cat])). The engine read a
+        second expression as the next sort key, and 0 / FALSE as ascending.
+        The space form ORDERBY(T[C] DESC), which the engine tolerated, is a
+        syntax error in Desktop (g_space). Both are errors of the measure's
+        definition (_WindowError, catchable through a measure reference
+        only), raised before the measure runs (_orderby_definition_error)."""
+        return self._win_orderby_items(self._split_args(ps[ps.index('(') + 1:-1]))
+
+    @staticmethod
+    def _win_orderby_items(items: list) -> list:
+        """_win_orderby of ORDERBY's argument texts."""
+        out: list = []
+        i, n = 0, len(items)
+        while i < n:
+            expr = items[i].strip()
+            last = expr.rsplit(None, 1)[-1] if expr else ''
+            if last.upper() in ('ASC', 'DESC'):
+                raise _WindowError(f"The syntax for '{last}' is incorrect.", True)
+            direction = 'ASC'
+            if i + 1 < n:
+                word = ''.join(items[i + 1].split()).upper()
+                if word in _DESC_ORDER_WORDS:
+                    direction = 'DESC'
+                elif word not in _ASC_ORDER_WORDS:
+                    raise _WindowError(_WIN_ORDER_ARG_MSG, True)
+            i += 2
+            if expr:
+                out.append((expr, direction))
+        return out
+
+    def _win_parse(self, parts: list, ctx: DAXContext, skip: int = 0,
+                   fn: Optional[str] = None, rel: bool = True,
+                   static_only: bool = False, scope: Any = _MISSING):
         """Split window args into (rows, orderby, partitionby, matchby,
-        explicit). orderby is [(expr, 'ASC'|'DESC')]; ``explicit`` is False
-        when the relation is omitted (DAX's default, ALLSELECTED of the
-        ORDERBY / PARTITIONBY columns: _win_visual_axis)."""
+        explicit, kind, tiebreak). orderby is [(expr, 'ASC'|'DESC')]
+        (_win_orderby); ``explicit`` is False when the relation is omitted
+        (DAX's default, ALLSELECTED of the ORDERBY / PARTITIONBY columns:
+        _win_visual_axis).
+
+        With ``fn``, the function's name, an explicit relation is checked as
+        Power BI Desktop 2.152 checks it (issue #247):
+          * statically, before a row is read -- so an empty relation and an
+            empty context are refused too (build_b253.py z_empty_rel,
+            z_empty_ctx), at the top level as per row, and in a query's own
+            expression (build_b253b.py q_cf_index, q_s_index, qd_s_index):
+            OFFSET / INDEX / WINDOW without MATCHBY over a relation that may
+            have duplicate rows (_WIN_DUP_MSG; _win_rel_shape), ROWNUMBER /
+            RANK over one of table-function columns only (_WIN_BUILT_MSG;
+            build_b253.py rn_ctor, rn_ctor_dup, rk_ctor; build_b253b.py b_gs_rn,
+            b_ctor_rn_inline, f_ife_built; #256), and before
+            either, PARTITIONBY over such a relation (_WIN_PART_BUILT_MSG:
+            build_b253c.py c_gs_idx_part, INDEX(1, GENERATESERIES(1, 3),
+            ORDERBY([Value]), PARTITIONBY([Value])) per row, which the engine
+            answered '1,2,3'; #262);
+          * on its rows: MATCHBY values that repeat (_win_check_matchby).
+        ``rel``: the function needs a current row however it is partitioned
+        (OFFSET; WINDOW with a REL bound), which decides GENERATESERIES' kind
+        (_win_kind). A TREATAS relation's rows are its target columns'
+        (_fn_treatas). ``kind`` is the relation's kind
+        under ``fn`` (None: not known, or no explicit relation) and
+        ``tiebreak`` the columns appended to ORDERBY (_win_tiebreak).
+        ``static_only`` stops after the static checks and returns (relation,
+        kind, orderby, partitionby, matchby): the scan of an empty iterator
+        (_win_static_check), which passes the variables the call sees as
+        ``scope`` (_win_rel_shape)."""
         relation_expr = None
         orderby: list = []
         partitionby: list = []
@@ -17451,24 +26517,7 @@ class DAXEngine:
             ps = raw.strip()
             up = ps.upper()
             if up.startswith('ORDERBY') and ps.endswith(')'):
-                items = self._split_args(ps[ps.index('(') + 1:-1])
-                i = 0
-                while i < len(items):
-                    expr = items[i].strip()
-                    direction = 'ASC'
-                    if (i + 1 < len(items)
-                            and items[i + 1].strip().upper() in ('ASC', 'DESC')):
-                        direction = items[i + 1].strip().upper()
-                        i += 1
-                    else:
-                        # Tolerate the space form `ORDERBY(T[C] DESC)` too —
-                        # silently keeping ASC would sort the wrong way.
-                        tail = expr.rsplit(None, 1)
-                        if len(tail) == 2 and tail[1].upper() in ('ASC', 'DESC'):
-                            expr, direction = tail[0].strip(), tail[1].upper()
-                    if expr:
-                        orderby.append((expr, direction))
-                    i += 1
+                orderby.extend(self._win_orderby(ps))
             elif up.startswith('PARTITIONBY') and ps.endswith(')'):
                 partitionby = [x.strip() for x in
                                self._split_args(ps[ps.index('(') + 1:-1])]
@@ -17480,6 +26529,23 @@ class DAXEngine:
             elif relation_expr is None:
                 relation_expr = ps
         explicit = bool(relation_expr)
+        kind = None
+        shape = None
+        if relation_expr and fn is not None:
+            if partitionby and self._win_part_added(relation_expr, partitionby, ctx, scope):
+                raise _WindowError(_WIN_PART_BUILT_MSG, True)
+            shape = self._win_rel_shape(relation_expr, ctx, scope)
+            if shape is not None:
+                if partitionby and shape.built:
+                    raise _WindowError(_WIN_PART_BUILT_MSG, True)
+                kind = self._win_kind(shape.kind, fn, rel or bool(partitionby))
+                if fn in ('ROWNUMBER', 'RANK'):
+                    if shape.built:
+                        raise _WindowError(_WIN_BUILT_MSG.format(fn=fn), False)
+                elif kind == 'bag' and not matchby:
+                    raise _WindowError(_WIN_DUP_MSG.format(fn=fn), True)
+        if static_only:
+            return relation_expr, kind, orderby, partitionby, matchby
         if relation_expr is None:
             # default relation: the table of the first ORDERBY/PARTITIONBY
             # column reference
@@ -17489,11 +26555,449 @@ class DAXEngine:
             elif partitionby:
                 src = partitionby[0]
             if not src or '[' not in src:
-                return None, orderby, partitionby, matchby, False
+                return None, orderby, partitionby, matchby, False, None, None
             t = src[:src.index('[')].strip().strip("'")
             relation_expr = f"'{t}'" if ' ' in t else t
-        rows = self._table_rows(relation_expr, self._win_base_ctx(ctx))
-        return rows, orderby, partitionby, matchby, explicit
+        base = self._win_base_ctx(ctx)
+        rows = self._table_rows(relation_expr, base)
+        tiebreak = None
+        if explicit and fn is not None:
+            if matchby and rows:
+                self._win_check_matchby(fn, rows, matchby, partitionby, ctx, base)
+            tiebreak = self._win_tiebreak(shape, kind, orderby, partitionby, matchby, ctx)
+        return rows, orderby, partitionby, matchby, explicit, kind, tiebreak
+
+    @staticmethod
+    def _win_refs(exprs, ctx: DAXContext) -> Optional[list]:
+        """``[(table, column, expr)]`` of column references, in the model's
+        spelling, or None when one of ``exprs`` is no column reference."""
+        out = []
+        for e in exprs:
+            m = _WHOLE_TCOL_RE.match(e)
+            if not m:
+                return None
+            t, c = ctx.model_column((m.group(1) or m.group(2) or '').strip(),
+                                    m.group(3).strip())
+            out.append((t, c, e.strip()))
+        return out
+
+    def _win_ref_list(self, exprs, ctx: DAXContext) -> list:
+        """``exprs`` as (table, column, expr), (None, None, expr) for one that
+        is no column reference (evaluated against the row, _win_ref_vals)."""
+        out = []
+        for e in exprs:
+            r = self._win_refs([e], ctx)
+            out.append(r[0] if r else (None, None, e))
+        return out
+
+    def _win_ref_vals(self, row: dict, refs, base_ctx: DAXContext) -> tuple:
+        """The values of ``refs`` (_win_ref_list) on a relation row: a cell
+        the row carries, a model column through _win_cell, else the
+        expression evaluated against the row; ``'cells'``: the row's cells."""
+        if refs == 'cells':
+            return tuple(self._row_cells(row))
+        out = []
+        for t, c, e in refs:
+            if c is not None and c in row and (t is None or row.get('__table__') == t):
+                out.append(row[c])
+            elif t is not None:
+                out.append(self._win_cell(row, t, c, e, base_ctx))
+            else:
+                out.append(self._win_val(e, row, base_ctx))
+        return tuple(out)
+
+    _WIN_CALL_RE = re.compile(r"^([A-Za-z_][\w.]*)\s*\(")
+
+    def _win_rel_shape(self, expr: str, ctx: DAXContext,
+                       scope: Any = _MISSING) -> Optional[_WinShape]:
+        """The static shape (_WinShape) of a window function's relation, or
+        None where it is not known -- nothing is then refused and nothing
+        appended to ORDERBY, as before. Power BI Desktop 2.152 (issue #247;
+        build_b253.py, build_b253b.py, b247) decides by the expression alone,
+        whatever the data and the context: S, whose rows are all distinct and
+        which ORDERBY(S[Cat]) sorts without a tie, is refused everywhere.
+
+          relation                                 shape        evidence
+          T, ALL(T), VALUES(T), ALLSELECTED(T),    keyed if T   i_s, i_all_s, i_values_s,
+            ALLNOBLANKROW(T)                       has a key,   i_allsel_s, i_all_dim_name,
+                                                   else bag     i_values_dim (_relation_keys),
+                                                                d_anbr_s, d_anbr_dim
+          ALL / ALLSELECTED / VALUES / DISTINCT /  set          i_allcols_s, i_all2_s,
+            ALLNOBLANKROW of columns of one table               i_values_col, i_sd_allcols
+          DISTINCT(X)                              set          i_distinct_s, i_sd_distinct,
+                                                                b_ctor_distinct_idx, X keyed
+                                                                in a CROSSJOIN: build_b253d.py
+                                                                e_cj_distinct_keyed /_keyed2
+          ALLEXCEPT(T, c...)                       set          i_allexcept_s
+          SUMMARIZE / GROUPBY / SUMMARIZECOLUMNS   set          i_summarize_s, i_groupby_s,
+                                                                i_sumcols_s, o_summarize
+          FILTER, CALCULATETABLE, ADDCOLUMNS,      as X         i_filter_all_s, i_topn_s,
+            TOPN of X; EXCEPT / INTERSECT of X, Y               i_addcols_s, i_filter_dim,
+                                                                c_calctable_all /_kf,
+                                                                c_topn_distinct, i_except_cols,
+                                                                c_except_bag, c_intersect_set,
+                                                                d_intersect_bag
+          SELECTCOLUMNS(X, ...)                    set if X is  i_selcols_dim_key /_nokey,
+                                                   one and its  i_selcols_s, i_selcols_col,
+                                                   key is kept  c_selcols_drop /_keep /_key_expr
+                                                   as columns,
+                                                   else bag
+          CROSSJOIN                                set of sets, c_cj_sets, d_cj_distinct_set,
+                                                   else bag:    c_cj_bag, c_cj_keyed,
+                                                   a keyed      d_cj_keyed_set (beside
+                                                   table too    GENERATESERIES too:
+                                                                build_b253d.py
+                                                                f_cj_keyed_series)
+          UNION                                    bag          i_union_cols (two sets)
+          { }, DATATABLE, ROW                      bag, built   i_ctor, i_ctor_dup, i_datatable,
+                                                                i_row, o_ctor, b_ctor_num_idx
+          TREATAS of a constructor                 bag          b_treatas_idx
+          TREATAS of a set                         set          d_treatas_set
+          TREATAS of another bag or of a keyed     keyed onto   d_treatas_bag_cols,
+            table                                  a key        e_treatas_bag_nokey,
+                                                   column, else e_treatas_keyed
+                                                   bag
+          GENERATESERIES / CALENDAR                built,       _win_kind
+                                                   per function
+
+        A variable is its expression's shape (o_ctor, o_genseries,
+        o_selcols_col, b_gs_idx_var). The built columns are refused under
+        ROWNUMBER / RANK (b_gs_rn, b_ctor_rn_inline); SELECTCOLUMNS of a model
+        column keeps its lineage (b_selcols_rn '1,2,3,4'), and Microsoft's
+        documentation of RANK / ROWNUMBER defines the rest ("all of
+        relation's columns were added by table functions"). Evidence is
+        build_b253.py's, build_b253b.py's and build_b253c.py's probes. Not
+        known, so nothing is refused: ALL with no argument, GENERATE,
+        NATURALINNERJOIN, TREATAS of GENERATESERIES or CALENDAR, and the
+        like. A constructor's TREATAS onto a key column is taken to be a bag,
+        as onto any other column; Desktop has not answered that.
+
+        ``scope``: the variables in force, the engine's current ones unless
+        given (the scan of an empty iterator passes a referenced measure's
+        own: _win_empty_scan). Memoized per expression and relationship set
+        unless the analysis read a variable or met a name that is neither a
+        variable nor a model table: another scope may define that name, and
+        a None memoized where it was unknown hid the refusal and the
+        appended key from every later evaluation of the same relation text
+        (VAR r = ALL(Dim2) RETURN ROWNUMBER(r, ...) numbered Dim2's tie in
+        storage order once an empty SUMX had scanned it)."""
+        e = expr.strip()
+        key = ('win-shape', e, ctx._rels_sig)
+        cache = ctx._shield_cache
+        hit = cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            got: Optional[_WinShape] = hit
+            return got
+        used = [False]
+        shape = self._win_shape_of(e, ctx, self._current_var_scope
+                                   if scope is _MISSING else scope, used, 0)
+        if not used[0]:
+            cache[key] = shape
+        return shape
+
+    def _win_table_shape(self, table: str, ctx: DAXContext) -> Optional[_WinShape]:
+        """A model table's shape: keyed by its first relationship key
+        (_relation_keys), else a bag -- unless it is marked as a date table,
+        whose date column the model declares its key (IsKey) where Desktop
+        has not been measured: not known, so nothing is refused."""
+        keys = _relation_keys(ctx.relationships).get(table)
+        if keys:
+            return _WinShape('keyed', False, ((table, keys[0]),))
+        if table in (getattr(self, '_date_tables', None) or {}):
+            return None
+        return _WinShape('bag', False, ())
+
+    def _win_shape_of(self, e: str, ctx: DAXContext, scope, used: list,
+                      depth: int) -> Optional[_WinShape]:
+        """_win_rel_shape's analysis; ``used[0]`` is set when a variable was
+        read or a name was neither a variable nor a model table (``scope``:
+        the variables in force): the shape is then not memoized."""
+        if depth > 16:
+            return None
+        e = e.strip()
+        while e.startswith('(') and self._wraps_whole(e):
+            e = e[1:-1].strip()
+        if not e:
+            return None
+        if e.startswith('{'):
+            return _WinShape('bag', True, ())
+        m = self._WIN_CALL_RE.match(e)
+        call = (self._extract_args(e[m.end() - 1:]) if m else None)
+        if call is None or m is None or len(call) != len(e) - m.end() + 1:
+            # a name: a variable, else a table
+            quoted = e.startswith("'") and e.endswith("'") and len(e) > 1
+            name = e[1:-1].replace("''", "'") if quoted else e
+            if not quoted and not _IDENT_RE.match(name):
+                return None
+            if not quoted and scope and name in scope:
+                used[0] = True
+                lv = scope[name]
+                if isinstance(lv, _LazyVar):
+                    return self._win_shape_of(lv.expr, ctx, lv.scope, used, depth + 1)
+                return None
+            t = ctx.model_table(name)
+            if t in ctx.tables:
+                return self._win_table_shape(t, ctx)
+            used[0] = True          # a name another scope may define
+            return None
+        fname = m.group(1).upper()
+        inner = call[1:-1]
+        args = [a.strip() for a in self._split_args(inner)] if inner.strip() else []
+
+        def sub(a: str) -> Optional[_WinShape]:
+            return self._win_shape_of(a, ctx, scope, used, depth + 1)
+
+        def table_arg(a: str) -> Optional[str]:
+            a = a.strip()
+            if a.startswith("'") and a.endswith("'") and len(a) > 1:
+                a = a[1:-1].replace("''", "'")
+            elif not _IDENT_RE.match(a):
+                return None
+            elif scope and a in scope:
+                used[0] = True
+                return None
+            t = ctx.model_table(a)
+            if t in ctx.tables:
+                return t
+            used[0] = True          # a name another scope may define
+            return None
+
+        if fname in ('ALL', 'ALLSELECTED', 'VALUES', 'DISTINCT', 'ALLNOBLANKROW'):
+            if not args:
+                return None
+            refs = self._win_refs(args, ctx)
+            if refs is not None:
+                if len({t for t, _c, _e in refs}) != 1:
+                    return None
+                return _WinShape('set', False, tuple((t, c) for t, c, _e in refs))
+            if len(args) != 1:
+                return None
+            if fname != 'DISTINCT':
+                whole = table_arg(args[0])
+                return self._win_table_shape(whole, ctx) if whole else None
+            s = sub(args[0])
+            if s is not None and s.kind in ('keyed', 'set') and s.key and s.key != 'cells':
+                # duplicate-free by DISTINCT, whatever proved it before: a
+                # set, also to CROSSJOIN, with its key. DISTINCT is a set
+                # (i_distinct_s, b_ctor_distinct_idx), over a keyed table in
+                # a CROSSJOIN too (build_b253d.py e_cj_distinct_keyed 'NorthA',
+                # f_cj_distinct_keyed2 'North1')
+                return _WinShape('set', s.built, s.key)
+            return _WinShape('set', s.built if s is not None else None, 'cells')
+        if fname == 'ALLEXCEPT':
+            base_t = table_arg(args[0]) if args else None
+            keep = self._win_refs(args[1:], ctx)
+            if base_t is None or keep is None:
+                return None
+            gone = {c for _t, c, _e in keep}
+            rest = tuple((base_t, c) for c in ctx.tables[base_t].get('columns') or []
+                         if c not in gone)
+            return _WinShape('set', False, rest) if rest else None
+        if fname in ('SUMMARIZE', 'GROUPBY', 'SUMMARIZECOLUMNS'):
+            groups = []
+            for a in (args if fname == 'SUMMARIZECOLUMNS' else args[1:]):
+                r = self._win_refs([a], ctx)
+                if r is None:
+                    if fname == 'SUMMARIZECOLUMNS' and not a.startswith('"'):
+                        continue        # a filter table
+                    break
+                groups.append((r[0][0], r[0][1]))
+            return _WinShape('set', False, tuple(groups)) if groups else None
+        if fname in ('FILTER', 'CALCULATETABLE', 'ADDCOLUMNS', 'EXCEPT', 'INTERSECT'):
+            return sub(args[0]) if args else None
+        if fname == 'TOPN':
+            return sub(args[1]) if len(args) > 1 else None
+        if fname == 'SELECTCOLUMNS':
+            if not args:
+                return None
+            s = sub(args[0])
+            names, lineage = [], []
+            for n_, ex in zip(args[1::2], args[2::2]):
+                names.append(n_.strip().strip('"'))
+                r = self._win_refs([ex], ctx)
+                lineage.append((r[0][0], r[0][1]) if r else None)
+            if any(x is not None for x in lineage):
+                built: Optional[bool] = False
+            else:
+                built = True if s is not None and s.built else None
+            if s is None:
+                return None
+            if s.kind == 'bag':
+                return _WinShape('bag', built, ())
+            if s.kind not in ('keyed', 'set') or not s.key or s.key == 'cells':
+                return None
+            kept = []
+            for kc in s.key:
+                if kc not in lineage:
+                    return _WinShape('bag', built, ())
+                kept.append((None, names[lineage.index(kc)]))
+            return _WinShape('set', built, tuple(kept))
+        if fname == 'UNION':
+            parts = [sub(a) for a in args]
+            if any(p is not None and p.built is False for p in parts):
+                ubuilt: Optional[bool] = False
+            elif parts and all(p is not None and p.built for p in parts):
+                ubuilt = True
+            else:
+                ubuilt = None
+            return _WinShape('bag', ubuilt, ())
+        if fname == 'CROSSJOIN':
+            known = [p for p in (sub(a) for a in args) if p is not None]
+            if not known or len(known) != len(args):
+                return None
+            kinds = {p.kind for p in known}
+            cbuilt = all(p.built for p in known)
+            if 'bag' in kinds or 'keyed' in kinds:
+                # a keyed table's key proves the table, not a product with it:
+                # c_cj_keyed, d_cj_keyed_set ALL(Dim) x ALL(S[Cat]) refused
+                return _WinShape('bag', cbuilt, ())
+            if kinds == {'set'}:
+                if any(p.key == 'cells' or not p.key for p in known):
+                    return _WinShape('set', cbuilt, 'cells')
+                return _WinShape('set', cbuilt, tuple(k for p in known for k in p.key))
+            return None
+        if fname in ('DATATABLE', 'ROW'):
+            return _WinShape('bag', True, ())
+        if fname == 'GENERATESERIES':
+            return _WinShape('series', True, ())
+        if fname in ('CALENDAR', 'CALENDARAUTO'):
+            return _WinShape('calendar', True, ())
+        if fname == 'TREATAS':
+            # of a table constructor refused (b_treatas_idx); of a set a set
+            # of its target columns (d_treatas_set 'N'). Of another bag, or
+            # of a keyed table, whose key TREATAS does not carry over:
+            # accepted onto a key column (d_treatas_bag_cols 'N' onto
+            # Dim[Region]), refused onto none (build_b253d.py
+            # e_treatas_bag_nokey onto Fact[Region], e_treatas_keyed ALL(Dim)
+            # onto S[Reg], S[Cat]; issue #247); nothing is appended
+            # to ORDERBY, its rows repeating a key value (_fn_treatas)
+            s = sub(args[0]) if args else None
+            if s is None:
+                return None
+            if s.kind == 'bag' and s.built:
+                return _WinShape('bag', False, ())
+            refs = self._win_refs(args[1:], ctx)
+            if s.kind in ('bag', 'keyed'):
+                if refs is None:
+                    return None
+                keys = _relation_keys(ctx.relationships)
+                if any(c in (keys.get(t) or ()) for t, c, _e in refs):
+                    return _WinShape('keyed', False, ())
+                return _WinShape('bag', False, ())
+            if s.kind != 'set' or not refs or len({t for t, _c, _e in refs}) != 1:
+                return None
+            return _WinShape('set', False, tuple((t, c) for t, c, _e in refs))
+        return None
+
+    @staticmethod
+    def _win_kind(kind: Optional[str], fn: str, needs_cur: bool) -> Optional[str]:
+        """A shape's kind under ``fn``. GENERATESERIES is a set to INDEX and
+        WINDOW where no current row is needed -- build_b253.py i_genseries 3;
+        build_b253b.py b_gs_idx_asc 1, b_gs_idx_var 3, b_gs_idx_perrow_var
+        '1,1,1', b_gs_win_inline and b_gs_win_var '1,2' -- and so is CALENDAR
+        (b_cal_idx). Where a current row is needed, both may have duplicate
+        rows: OFFSET refuses GENERATESERIES inline and through a variable
+        (b_gs_off_inline; build_b253.py o_genseries) and CALENDAR through a
+        variable (build_b253c.py c_cal_off), WINDOW with REL bounds refuses
+        GENERATESERIES (c_gs_win_rel), all with _WIN_DUP_MSG; the engine
+        answered ',1,2' and '1,12,23' (issue #247). WINDOW with one REL bound
+        refuses GENERATESERIES too, and WINDOW with REL bounds CALENDAR
+        (build_b253d.py d_gs_win_absrel, f_cal_win_rel).
+        INDEX needs a current row only under PARTITIONBY, which
+        table-function columns refuse first (_WIN_PART_BUILT_MSG). Under
+        ROWNUMBER / RANK the kind is not read (_WIN_BUILT_MSG)."""
+        if kind in ('series', 'calendar'):
+            if fn == 'OFFSET' or (fn in ('INDEX', 'WINDOW') and needs_cur):
+                return 'bag'
+            return 'set' if fn in ('INDEX', 'WINDOW') else None
+        return kind
+
+    def _win_tiebreak(self, shape: Optional[_WinShape], kind: Optional[str],
+                      orderby: list, partitionby: list, matchby: list,
+                      ctx: DAXContext):
+        """The columns appended to ORDERBY to break its ties, ascending
+        whatever ORDERBY's direction (_win_sort): refs for _win_ref_vals, or
+        None. Power BI Desktop 2.152 (#257):
+          * a model table with a key: the key, not its other columns
+            (build_b253.py o_dim2_cat ',1,2', rn_dim2_cat '1,2,3' -- Dim2
+            stores K = 2 before K = 1; build_b253b.py d_rn_dim3 '1,2,3', where
+            Dim3's first column would order the tie the other way), ascending
+            under ORDERBY DESC too (d_rn_dim2_desc '2,3,1');
+          * a column list: its columns in the list's order (build_b253.py
+            rn_regcat '1,2,3,4'; build_b253b.py d_rn_q_yx '2,1,3' and
+            d_rn_q2_xy '1,2,3', which the table's own order answers the
+            other way round);
+          * MATCHBY: its columns (build_b253b.py i_mb_rn_tie '1,2,3,4');
+          * a relation that may have duplicate rows: nothing -- ROWNUMBER's
+            ties are refused there (_win_check_ties).
+        The engine sorted ties in storage order. Columns ORDERBY or
+        PARTITIONBY already sort by cannot break a tie and are left out."""
+        if matchby:
+            return self._win_ref_list(matchby, ctx)
+        if shape is None or kind not in ('keyed', 'set'):
+            return None
+        key = shape.key
+        if key == 'cells':
+            return 'cells'
+        if not key:
+            return None
+        used = set()
+        for r in self._win_ref_list([e for e, _d in orderby] + list(partitionby), ctx):
+            if r[0] is not None:
+                used.add((r[0], r[1]))
+        out = [(t, c, f"[{c}]" if t is None else f"'{t}'[{c}]")
+               for t, c in key if (t, c) not in used]
+        return out or None
+
+    def _win_check_matchby(self, fn: str, rows: list, matchby: list,
+                           partitionby: list, ctx: DAXContext,
+                           base_ctx: DAXContext) -> None:
+        """MATCHBY must name each row of the relation once, within its
+        partition. Power BI Desktop 2.152 (#254): MATCHBY lifts the
+        duplicate-rows refusal (build_b253.py i_mb_cat 'A', o_mb_cat
+        ',A,B,C', w_mb_cat), but values that repeat fail INDEX, OFFSET,
+        ROWNUMBER and RANK with _WIN_MB_DUP_MSG (i_mb_reg at the top level,
+        o_mb_reg, rn_mb_reg, rk_mb_reg_rows; S[Reg] repeats) -- a check of the
+        data: S[Cat], unique in it though not provably so, passes. Repeats in
+        other partitions only are no duplicates (build_b253b.py i_mb_part
+        ',A,,A', i_mb_rn_part '1,2,1,2'), nor are two MATCHBY columns that
+        are unique together (i_mb_two ',A,B,A'). IFERROR around the function
+        does not catch it (f_ife_mb). The engine took the first row with the
+        current row's values."""
+        refs = self._win_ref_list(list(partitionby) + list(matchby), ctx)
+        ords = self._win_ord
+        seen: set = set()
+        for row in rows:
+            k = tuple(ords(v) for v in self._win_ref_vals(row, refs, base_ctx))
+            if k in seen:
+                raise _WindowError(_WIN_MB_DUP_MSG.format(fn=fn), False)
+            seen.add(k)
+
+    def _win_check_ties(self, rows: list, orderby: list, partitionby: list,
+                        ctx: DAXContext, base_ctx: DAXContext) -> None:
+        """ROWNUMBER over a relation that may have duplicate rows (nothing is
+        appended to ORDERBY there): two rows alike in PARTITIONBY and ORDERBY
+        fail it with _WIN_RN_TIE_MSG, anywhere in the relation and whatever
+        the current row. Power BI Desktop 2.152 (#255):
+        build_b253.py rn_t3_c fails though its tie is in another partition than the current
+        row, rn_t3_d though its own ORDERBY value is unique, z_rn_iferror at a
+        total; b247 w_rownumber_ties, f_rn_reg_n35, u_rn_reg_s; identical rows
+        under an ORDERBY of every column too (build_b253b.py hp_rn_sd2). A
+        tie in ORDERBY alone is none when PARTITIONBY tells the rows apart
+        (rn_reg_pv '1,1,1,1'), and ROWNUMBER over the same relation answers
+        where nothing ties (rn_v '1,2,3,4'). Neither IFERROR around it nor
+        around a reference to its measure catches it (f_ife_rn_inline,
+        f_iserr_rn_inline, z_rn_iferror, f_ife_rn_perrow). The engine
+        numbered the tied rows in storage order, or told them apart by the
+        caller's filters on other columns."""
+        refs = self._win_ref_list(list(partitionby) + [e for e, _d in orderby], ctx)
+        ords = self._win_ord
+        seen: set = set()
+        for row in rows:
+            k = tuple(ords(v) for v in self._win_ref_vals(row, refs, base_ctx))
+            if k in seen:
+                raise _WindowError(_WIN_RN_TIE_MSG, False)
+            seen.add(k)
 
     def _win_val(self, expr: str, row: dict, base_ctx: DAXContext):
         rc = self._make_row_context(row, base_ctx)
@@ -17501,31 +27005,52 @@ class DAXEngine:
                                         row, rc)
 
     def _win_key(self, row: dict, orderby: list, base_ctx: DAXContext) -> tuple:
-        return tuple(self._win_val(e, row, base_ctx) for e, _ in orderby)
+        """``row``'s ORDERBY values: a column the row carries read off it, as
+        evaluating the reference against the row reads it (_win_ref_vals),
+        anything else evaluated."""
+        return self._win_ref_vals(
+            row, self._win_ref_list([e for e, _ in orderby], base_ctx), base_ctx)
 
     @staticmethod
     def _win_ord(v):
-        """One orderable key: blanks first, then numbers/dates, then text."""
+        """One orderable key: blanks first, then numbers and dates, then text
+        (in the model's collation, #157). Numbers compare exactly: Power BI
+        Desktop 2.152 orders the Int64 values 2**53 - 1 .. 2**53 + 4 one by
+        one (build_b257b.py group G, issue #252: wi_col_asc3 2, wo_col_next
+        '-,0,1,2,3,4', wi_keyed 'f', wo_keyed 'b,c,d,e,f,'), which float()
+        tied in pairs. A date is the moment it starts, as a datetime is; it
+        sorted as text."""
         if v is None:
-            return (0, 0.0, _EMPTY_TEXT_KEY)
+            return (0, 0, _EMPTY_TEXT_KEY)
         if isinstance(v, bool):
-            return (1, float(v), _EMPTY_TEXT_KEY)
-        if isinstance(v, (int, float)):
-            return (1, float(v), _EMPTY_TEXT_KEY)
+            return (1, int(v), _EMPTY_TEXT_KEY)
+        if isinstance(v, (int, float, decimal.Decimal)):
+            return (1, v, _EMPTY_TEXT_KEY)
         if isinstance(v, datetime):
             return (1, v.toordinal() + (v.hour * 3600 + v.minute * 60
                                         + v.second) / 86400.0, _EMPTY_TEXT_KEY)
-        return (2, 0.0, _text_key(str(v)))   # the model's collation (#157)
+        if isinstance(v, date):
+            return (1, v.toordinal(), _EMPTY_TEXT_KEY)
+        return (2, 0, _text_key(str(v)))   # the model's collation (#157)
 
     def _win_sort(self, rows: list, orderby: list, base_ctx: DAXContext,
-                  keys_out: Optional[list] = None) -> list:
-        """``rows`` in ORDERBY order (stable); ``keys_out`` receives each
-        sorted row's ORDERBY key, for a caller that ranks them."""
-        if not orderby:
+                  keys_out: Optional[list] = None, tiebreak=None) -> list:
+        """``rows`` in ORDERBY order, ties broken by ``tiebreak`` ascending
+        (_win_tiebreak), else kept in their order (stable); ``keys_out``
+        receives each sorted row's ORDERBY key, for a caller that ranks
+        them."""
+        if not orderby and not tiebreak:
             if keys_out is not None:
                 keys_out.extend(() for _ in rows)
             return list(rows)
-        keyed = [(self._win_key(r, orderby, base_ctx), r) for r in rows]
+        # the column references resolved once, not per row (_win_key)
+        refs = self._win_ref_list([e for e, _ in orderby], base_ctx)
+        keyed = [(self._win_ref_vals(r, refs, base_ctx), r) for r in rows]
+        if tiebreak:
+            ords = self._win_ord
+            tb = {id(r): tuple(ords(v) for v in self._win_ref_vals(r, tiebreak, base_ctx))
+                  for r in rows}
+            keyed.sort(key=lambda kr: tb[id(kr[1])])
         for i in range(len(orderby) - 1, -1, -1):
             rev = orderby[i][1] == 'DESC'
             # sort executes inside the iteration, so capturing `i` is safe
@@ -17539,13 +27064,26 @@ class DAXEngine:
                        base_ctx: DAXContext) -> list:
         if not partitionby or cur is None:
             return list(rows)
-        ck = tuple(self._win_val(c, cur, base_ctx) for c in partitionby)
-        return [r for r in rows
-                if tuple(self._win_val(c, r, base_ctx)
-                         for c in partitionby) == ck]
+        refs = self._win_ref_list(partitionby, base_ctx)
+        ck = self._win_ref_vals(cur, refs, base_ctx)
+        return [r for r in rows if self._win_ref_vals(r, refs, base_ctx) == ck]
 
     def _win_index_of(self, srt: list, cur: dict, matchby: list,
                       base_ctx: DAXContext):
+        """The position of the row context's row ``cur`` in the sorted
+        relation ``srt``, or None.
+
+        A relation of fewer columns than the row -- ALL(T[c]) or ALL(T[a],
+        T[b]) in an iteration of T -- holds the row by those columns. Power
+        BI Desktop 2.152 (build_b257b.py group G; issue #252's analysis,
+        #261): CONCATENATEX(TKR, OFFSET(1, ALL(TKR[K]), ...)) is
+        '-,0,1,2,3,4' (wo_col_next), CONCATENATEX(TS3, ROWNUMBER(ALL(TS3[G],
+        TS3[H]), ORDERBY(...))) '1,2,3,1' (z_rownum_cols), OFFSET over that
+        list '1-2,2-1,,1-2' (z_offset_cols), and with PARTITIONBY(TS[G])
+        '1,1,1' (z_rownum_part). The engine compared the row's every column,
+        found no row, and then took the FIRST row of the relation for any row
+        without a single column (__column__ / __value__ both absent):
+        '-,-,-,-,-,-', '1,1,1,1', '1-2' for every row, ',,'."""
         if cur is None:
             return None
         if matchby:
@@ -17565,10 +27103,25 @@ class DAXEngine:
             for i, r in enumerate(srt):
                 if self._row_cols(r) == cur_cols:
                     return i
-        for i, r in enumerate(srt):
-            if (r.get('__column__') == cur.get('__column__')
-                    and r.get('__value__') == cur.get('__value__')):
-                return i
+        if cur.get('__column__') is not None:
+            for i, r in enumerate(srt):
+                if (r.get('__column__') == cur.get('__column__')
+                        and r.get('__value__') == cur.get('__value__')):
+                    return i
+        if cur_cols:
+            # a relation narrower than the row, of the row's own table
+            t = cur.get('__table__')
+            for i, r in enumerate(srt):
+                if r.get('__table__') != t:
+                    continue
+                rc = self._row_cols(r)
+                if rc:
+                    if all(k in cur_cols and cur_cols[k] == v for k, v in rc.items()):
+                        return i
+                else:
+                    c = r.get('__column__')
+                    if c is not None and c in cur_cols and cur_cols[c] == r.get('__value__'):
+                        return i
         return None
 
     def _win_visual_axis(self, orderby: list, partitionby: list,
@@ -17669,32 +27222,146 @@ class DAXEngine:
         off the filter context; ``None`` when that cannot be told, and the
         visual axis decides as before (_win_visual_axis).
 
-        DAX identifies the current row by the values the ORDERBY and
-        PARTITIONBY columns (MATCHBY when given) have outside the function,
-        and OFFSET / INDEX / WINDOW return rows OF THE RELATION, which
-        CALCULATE then applies to every column of it. The visual axis
-        replaced the relation with rows of the ORDERBY / PARTITIONBY columns
-        alone. Since a measure's body no longer reads its caller's row
-        (#236), a measure called per row took that path: with
-        offd = CALCULATE(SUM(Fact[Value]), OFFSET(-1, ALL(Dim),
-        ORDERBY(Dim[Region], ASC))), CONCATENATEX(Dim, [offd], ...) went
-        from 0.9.146's ',15,20' to ',,' -- the axis row (Region N) left the
-        caller's Dim[Name] = "South" in place -- and the same measure under
-        the filters Dim[Region] = S, Dim[Name] = South was BLANK on both
-        trees. The expected values follow from those rules; Desktop has not
-        measured these shapes.
-
-        A column with ONE filter value names it. Where the relation holds
-        several rows with those values, the other columns of the rows that
-        carry one filter value narrow them (DAX adds columns until the rows
-        are unique). Where a column has no single value -- a total, a caller
-        row with no lineage -- DAX evaluates the function once for every
-        combination of the values those columns still have in the context
-        and unites the rows (its documented "apply semantics"); that is the
-        list returned, for OFFSET / INDEX / WINDOW only (``scalar`` False):
-        a ROWNUMBER or RANK of several rows has no one answer."""
+        Power BI Desktop 2.152 (build_b253.py; #258) names the
+        current row by the relation's own columns (_win_ident) -- MATCHBY's when given
+        -- with the values they have in the context, cross-filtered ones
+        included: CALCULATE([rn over ALL(S) by S[V]], S[Cat] = "C") is 3
+        (rn_s_cat_c; Cat = C names V = 40), ROWNUMBER of ALL(S[Reg]) under
+        S[Cat] = "C" 2 (rn_regcol_cat_c), RANK of ALL(S) by S[Reg] 2 there
+        (rk_reg_cat_c), and of the keyed ALL(Dim) by Dim[Name] under
+        Dim[Region] = "S" 2 (rk_dim_name_s); a relation's added column names
+        nothing (build_b253b.py hp_rk_added '1,1,1,1'). Where the context
+        leaves several combinations, OFFSET / INDEX / WINDOW are evaluated for
+        each and their rows united (``scalar`` False; b247 u_gen_off '35,35',
+        u_reg_s_off_allcol 40), and ROWNUMBER / RANK, which have no one
+        answer, give BLANK (``scalar``: an empty list) even where the ranks
+        agree (rk_dim2_g1, rk_mb_cat_reg_s, b247 u_rk_reg_s; the totals
+        rn_total, rk_col_total). Identical rows count once (rk_sd_rows
+        '1,1,2'), and a combination the relation lacks is no current row
+        (build_b253b.py hp_rk_cur_missing BLANK). The engine read only direct
+        single-valued filters on the ORDERBY / PARTITIONBY columns, ignored
+        cross-filtered values, never narrowed a column list's rows, and gave
+        RANK the shared rank of several current rows."""
         if rows is None:
             return None
+        ident = self._win_ident(rows, matchby, ctx)
+        if ident is None:
+            return self._win_context_rows_by_keys(rows, orderby, partitionby,
+                                                  matchby, ctx, scalar)
+        if not ident:
+            return []
+        table = ident[0][0]
+        tbl = ctx.tables[table]
+        idxs = [ctx._find_col_idx(tbl.get('columns') or [], c) for _t, c, _e in ident]
+        if min(idxs) < 0:
+            return None
+        base = self._win_base_ctx(ctx)
+        cell = self._win_cell
+        try:
+            fixed = self._win_fixed_combo(ctx, table, tbl, ident, idxs)
+            combos: set = set() if fixed is None else fixed
+            if fixed is None:
+                # the rows get_filtered_rows reads (its root's in a row
+                # context, #116), in no order: a set of combinations needs none
+                root = ctx._row_root() if ctx._outer_ctx is not None else ctx
+                keep = root._surviving_indices(table, tbl)
+                trows = tbl['rows']
+                for r in (trows if keep is None else map(trows.__getitem__, keep)):
+                    combos.add(tuple(r[i] for i in idxs))
+                    if scalar and len(combos) > 1:
+                        return []
+            out: list = []
+            got: set = set()
+            for r in rows:
+                k = tuple(cell(r, t, c, e, base) for t, c, e in ident)
+                if k in combos and k not in got:
+                    got.add(k)
+                    out.append(r)
+            return out
+        except (TypeError, IndexError):
+            return None
+
+    @staticmethod
+    def _win_fixed_combo(ctx: DAXContext, table: str, tbl: dict, ident: list,
+                         idxs: list) -> Optional[set]:
+        """The combinations of ``ident``'s columns over ``table``'s rows in
+        the filter context, without scanning those rows, where every one of
+        the columns carries ONE filter value: then every surviving row holds
+        the same combination, so any one's is it, and no row leaves none. None where a column has no single filter value (the caller
+        scans) -- a visual's group of one flat table, ALL(F[cat]) under
+        F[cat] = "A", read 37,500 rows of 300,000 per call to find one
+        value 0.9.147 took straight from the filter. The rows are the ones
+        get_filtered_rows reads: in a row context, its root's (#116)."""
+        root = ctx._row_root() if ctx._outer_ctx is not None else ctx
+        fc = root.filter_context
+        for t, c, _e in ident:
+            v = fc.get(f"{t}.{c}")
+            if not (isinstance(v, list) and len(v) == 1):
+                return None
+        keep = root._surviving_indices(table, tbl)
+        if keep is None:
+            return None
+        if not keep:
+            return set()
+        r = tbl['rows'][next(iter(keep))]
+        return {tuple(r[i] for i in idxs)}
+
+    def _win_ident(self, rows: list, matchby: list, ctx: DAXContext) -> Optional[list]:
+        """The columns that name a row of the relation, as (table, column,
+        expr) of one model table: MATCHBY's; else, read off its rows, a keyed
+        table's key, a keyless table's columns, a column list's columns or
+        one column -- never a column a table function added. [] for an empty
+        relation, None when the rows span tables or carry no model column
+        (a CROSSJOIN, a constructor), where _win_context_rows_by_keys
+        decides as before."""
+        if matchby:
+            refs = self._win_refs(matchby, ctx)
+            if not refs or len({t for t, _c, _e in refs}) != 1 or refs[0][0] not in ctx.tables:
+                return None
+            return refs
+        if not rows:
+            return []
+        r0 = rows[0]
+        t = r0.get('__table__')
+        tbl = ctx.tables.get(t) if isinstance(t, str) else None
+        if not tbl:
+            return None
+        tcols = tbl.get('columns') or []
+
+        def own(k: str) -> bool:
+            return not k.startswith('__') and ctx._find_col_idx(tcols, k) >= 0
+
+        parts = r0.get('__parts__')
+        if isinstance(r0, _ColumnsRow):
+            if parts and any(p.get('__table__') != t for p in parts):
+                return None
+            cols = [k for k in r0 if own(k)]
+        elif parts:
+            return None
+        elif '__row__' in r0:
+            cols = [k for k in (_relation_keys(ctx.relationships).get(t) or ())[:1] if k in r0]
+            if not cols:
+                cols = [k for k in r0 if own(k)]
+        elif r0.get('__column__') is not None:
+            c = r0['__column__']
+            cols = [c] if own(c) else []
+        else:
+            return None
+        if not cols:
+            return None
+        return [(t, c, f"'{t}'[{c}]") for c in cols]
+
+    def _win_context_rows_by_keys(self, rows: list, orderby: list,
+                                  partitionby: list, matchby: list,
+                                  ctx: DAXContext, scalar: bool) -> Optional[list]:
+        """_win_context_rows for a relation whose rows _win_ident cannot read
+        (they span tables, or carry no model column): the current row named
+        by the ORDERBY and PARTITIONBY columns (#236). A column with ONE
+        filter value names it; where the relation holds several rows with
+        those values, the other columns of the rows that carry one filter
+        value narrow them (_win_narrow). Where a column has no single value,
+        the rows of every combination the context still has are united, for
+        OFFSET / INDEX / WINDOW only (``scalar`` False)."""
         exprs = (list(matchby) if matchby
                  else [e for e, _d in orderby] + list(partitionby))
         keys = []
@@ -17719,27 +27386,9 @@ class DAXEngine:
                 break
             want.append(v[0])
         else:
-            if len(keys) == 1:
-                # one column, the common case: read rows of its table inline
-                # (a measure called per row looks its row up once per call)
-                (t, c, e), w = keys[0], want[0]
-                cand = []
-                for r in rows:
-                    if r.get('__table__') == t and not isinstance(r, _ColumnsRow):
-                        if c in r:
-                            v = r[c]
-                        elif r.get('__column__') == c:
-                            v = r.get('__value__')
-                        else:
-                            v = self._win_val(e, r, base)
-                    else:
-                        v = self._win_val(e, r, base)
-                    if v == w:
-                        cand.append(r)
-            else:
-                cand = [r for r in rows
-                        if all(cell(r, t, c, e, base) == w
-                               for (t, c, e), w in zip(keys, want))]
+            cand = [r for r in rows
+                    if all(cell(r, t, c, e, base) == w
+                           for (t, c, e), w in zip(keys, want))]
             if len(cand) > 1:
                 cand = self._win_narrow(cand, {c for _t, c, _e in keys}, ctx)
             return cand
@@ -17781,7 +27430,7 @@ class DAXEngine:
 
     def _win_frames(self, rows: list, orderby: list, partitionby: list,
                     curs: list, base_ctx: DAXContext,
-                    with_keys: bool = False) -> list:
+                    with_keys: bool = False, tiebreak=None) -> list:
         """``[(sorted partition, its ORDERBY keys, index)]`` for each current
         row in ``curs`` (rows of ``rows``, from _win_context_rows), in order;
         the keys only ``with_keys`` (RANK), else an empty list. Each
@@ -17792,8 +27441,9 @@ class DAXEngine:
         part_of: dict = {}
         try:
             if partitionby:
+                prefs = self._win_ref_list(partitionby, base_ctx)
                 for r in rows:
-                    k = tuple(self._win_val(c, r, base_ctx) for c in partitionby)
+                    k = self._win_ref_vals(r, prefs, base_ctx)
                     part_of[id(r)] = k
                     groups.setdefault(k, []).append(r)
             else:
@@ -17813,7 +27463,7 @@ class DAXEngine:
             if got is None:
                 keys: list = []
                 srt = self._win_sort(groups.get(k, []), orderby, base_ctx,
-                                     keys if with_keys else None)
+                                     keys if with_keys else None, tiebreak)
                 pos: Optional[dict] = None
                 if not few:     # many current rows: one map, not a scan each
                     pos = {}
@@ -17879,25 +27529,29 @@ class DAXEngine:
 
     def _fn_rownumber_win(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str) if args_str.strip() else []
-        rows, orderby, partitionby, matchby, explicit = self._win_parse(parts, ctx)
+        rows, orderby, partitionby, matchby, explicit, kind, tiebreak = self._win_parse(
+            parts, ctx, fn='ROWNUMBER')
+        base = self._win_base_ctx(ctx)
+        if explicit and kind == 'bag' and not matchby and rows:
+            self._win_check_ties(rows, orderby, partitionby, ctx, base)
         cur = getattr(ctx, '_current_row', None)
         if cur is None and explicit:
-            # the relation's row the filter context names (#236)
+            # the relation's row the filter context names (#236, #247)
             curs = self._win_context_rows(rows, orderby, partitionby, matchby,
                                           ctx, True)
             if curs is not None:
                 if len(curs) != 1:
                     return None
                 fr = self._win_frames(rows or [], orderby, partitionby, curs,
-                                      self._win_base_ctx(ctx))
+                                      base, tiebreak=tiebreak)
                 return float(fr[0][2] + 1) if fr else None
         if cur is None:
             rows, cur = self._win_visual_axis(orderby, partitionby, ctx)
+            tiebreak = None
         if rows is None or cur is None:
             return None
-        base = self._win_base_ctx(ctx)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
-                             orderby, base)
+                             orderby, base, tiebreak=tiebreak)
         idx = self._win_index_of(srt, cur, matchby, base)
         return None if idx is None else float(idx + 1)
 
@@ -17908,36 +27562,45 @@ class DAXEngine:
         if parts and parts[0].strip().upper() in ('SKIP', 'DENSE'):
             ties = parts[0].strip().upper()
             skip = 1
-        rows, orderby, partitionby, matchby, explicit = self._win_parse(
-            parts, ctx, skip)
+        rows, orderby, partitionby, matchby, explicit, _kind, _tb = self._win_parse(
+            parts, ctx, skip, fn='RANK')
+        # (_tb: a rank depends on the ORDERBY keys alone, so the key appended
+        # to break their ties, _win_tiebreak, orders rows of one rank only:
+        # the sorts leave it out)
+        base = self._win_base_ctx(ctx)
         cur = getattr(ctx, '_current_row', None)
         if cur is None and explicit:
-            # the relation's rows the filter context names (#236): rows that
-            # share the partition and the ORDERBY values share the rank
+            # the relation's row the filter context names (#236); several
+            # current rows have no one rank, even an equal one (#247)
             curs = self._win_context_rows(rows, orderby, partitionby, matchby,
                                           ctx, True)
             if curs is not None:
+                if len(curs) != 1:
+                    return None
                 fr = self._win_frames(rows or [], orderby, partitionby, curs,
-                                      self._win_base_ctx(ctx), with_keys=True)
+                                      base, with_keys=True)
                 if not fr:
                     return None
-                srt0, keys0, i0 = fr[0]
-                if any(s is not srt0 or k[i] != keys0[i0] for s, k, i in fr[1:]):
-                    return None
+                _srt, keys0, i0 = fr[0]
                 return self._win_rank_at(keys0, i0, ties)
         if cur is None:
             rows, cur = self._win_visual_axis(orderby, partitionby, ctx)
         if rows is None or cur is None:
             return None
-        base = self._win_base_ctx(ctx)
+        keys: list = []
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
-                             orderby, base)
+                             orderby, base, keys)
+        if explicit:
+            # the row context's row, found in the relation (a relation of
+            # fewer columns included, _win_index_of): its own ORDERBY values
+            at = self._win_index_of(srt, cur, matchby, base)
+            if at is not None:
+                return self._win_rank_at(keys, at, ties)
         cur_k = self._win_key(cur, orderby, base)
         prev_k: object = object()
         dense = 0
         group_start = 0
-        for i, r in enumerate(srt):
-            k = self._win_key(r, orderby, base)
+        for i, k in enumerate(keys):
             if k != prev_k:
                 dense += 1
                 group_start = i
@@ -17953,8 +27616,8 @@ class DAXEngine:
         pos = self._num1(parts[0], ctx)
         if pos is None:
             return None
-        rows, orderby, partitionby, matchby, explicit = self._win_parse(
-            parts, ctx, 1)
+        rows, orderby, partitionby, matchby, explicit, _kind, tiebreak = self._win_parse(
+            parts, ctx, 1, fn='INDEX', rel=False)
         cur = getattr(ctx, '_current_row', None)
         if cur is None and explicit and partitionby:
             # the partitions of the relation's rows the filter context names
@@ -17965,7 +27628,7 @@ class DAXEngine:
                 picks = []
                 for srt, _k, _i in self._win_frames(
                         rows or [], orderby, partitionby, curs,
-                        self._win_base_ctx(ctx)):
+                        self._win_base_ctx(ctx), tiebreak=tiebreak):
                     n = len(srt)
                     j = int(pos) - 1 if pos > 0 else n + int(pos)
                     if 0 <= j < n:
@@ -17977,12 +27640,12 @@ class DAXEngine:
             # INDEX returns ITS row, every column of it -- #236)
             vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
             if vrows is not None:
-                rows, cur = vrows, vcur
+                rows, cur, tiebreak = vrows, vcur, None
         if rows is None:
             return None
         base = self._win_base_ctx(ctx)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
-                             orderby, base)
+                             orderby, base, tiebreak=tiebreak)
         n = len(srt)
         i = int(pos) - 1 if pos > 0 else n + int(pos)
         if 0 <= i < n:
@@ -17994,8 +27657,8 @@ class DAXEngine:
         if not parts:
             return None
         delta = self._num1(parts[0], ctx)
-        rows, orderby, partitionby, matchby, explicit = self._win_parse(
-            parts, ctx, 1)
+        rows, orderby, partitionby, matchby, explicit, _kind, tiebreak = self._win_parse(
+            parts, ctx, 1, fn='OFFSET')
         cur = getattr(ctx, '_current_row', None)
         if cur is None and explicit:
             # the relation's rows the filter context names (#236); several
@@ -18009,17 +27672,17 @@ class DAXEngine:
                 return self._win_union(
                     (srt, i + d, i + d) for srt, _k, i in self._win_frames(
                         rows or [], orderby, partitionby, curs,
-                        self._win_base_ctx(ctx))
+                        self._win_base_ctx(ctx), tiebreak=tiebreak)
                     if 0 <= i + d < len(srt))
         if cur is None:
             vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
             if vrows is not None:
-                rows, cur = vrows, vcur
+                rows, cur, tiebreak = vrows, vcur, None
         if delta is None or rows is None or cur is None:
             return None
         base = self._win_base_ctx(ctx)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
-                             orderby, base)
+                             orderby, base, tiebreak=tiebreak)
         idx = self._win_index_of(srt, cur, matchby, base)
         if idx is None:
             return []
@@ -18028,28 +27691,37 @@ class DAXEngine:
             return [srt[i]]
         return []
 
-    def _fn_window_win(self, args_str: str, ctx: DAXContext):
-        parts = self._split_args(args_str)
-        if len(parts) < 2:
-            return None
-        frm = self._num1(parts[0], ctx)
+    @staticmethod
+    def _win_window_bounds(parts: list) -> tuple:
+        """WINDOW's (from, from type, to, to type, index of the relation)
+        argument texts: ``from[, ABS | REL], to[, ABS | REL]``, REL when a
+        type is left out."""
         i = 1
         frm_type = 'REL'
         if i < len(parts) and parts[i].strip().upper() in ('ABS', 'REL'):
             frm_type = parts[i].strip().upper()
             i += 1
-        if i >= len(parts):
-            return None
-        to = self._num1(parts[i], ctx)
+        to_i = i
         i += 1
         to_type = 'REL'
         if i < len(parts) and parts[i].strip().upper() in ('ABS', 'REL'):
             to_type = parts[i].strip().upper()
             i += 1
+        return parts[0], frm_type, (parts[to_i] if to_i < len(parts) else None), to_type, i
+
+    def _fn_window_win(self, args_str: str, ctx: DAXContext):
+        parts = self._split_args(args_str)
+        if len(parts) < 2:
+            return None
+        frm_text, frm_type, to_text, to_type, i = self._win_window_bounds(parts)
+        if to_text is None:
+            return None
+        frm = self._num1(frm_text, ctx)
+        to = self._num1(to_text, ctx)
         if frm is None or to is None:
             return None
-        rows, orderby, partitionby, matchby, explicit = self._win_parse(
-            parts, ctx, i)
+        rows, orderby, partitionby, matchby, explicit, _kind, tiebreak = self._win_parse(
+            parts, ctx, i, fn='WINDOW', rel='REL' in (frm_type, to_type))
         cur = getattr(ctx, '_current_row', None)
         needs_cur = bool(partitionby) or 'REL' in (frm_type, to_type)
         if cur is None and explicit and needs_cur:
@@ -18063,25 +27735,377 @@ class DAXEngine:
                                               len(srt), ci)
                     for srt, _k, ci in self._win_frames(
                         rows or [], orderby, partitionby, curs,
-                        self._win_base_ctx(ctx)))
+                        self._win_base_ctx(ctx), tiebreak=tiebreak))
         if cur is None and not (explicit and not needs_cur
                                 and rows is not None):
             # (ABS bounds over an explicit relation without PARTITIONBY need
             # no current row: WINDOW returns ITS rows -- #236)
             vrows, vcur = self._win_visual_axis(orderby, partitionby, ctx)
             if vrows is not None:
-                rows, cur = vrows, vcur
+                rows, cur, tiebreak = vrows, vcur, None
         if rows is None:
             return None
         base = self._win_base_ctx(ctx)
         srt = self._win_sort(self._win_partition(rows, partitionby, cur, base),
-                             orderby, base)
+                             orderby, base, tiebreak=tiebreak)
         n = len(srt)
         cur_idx = self._win_index_of(srt, cur, matchby, base) if cur else None
         lo, hi = self._win_bounds(frm, frm_type, to, to_type, n, cur_idx)
         if lo > hi:
             return []
         return srt[lo:hi + 1]
+
+    # ---- the window functions of an iterator over an empty table (#247) ----
+
+    _WIN_GUARD_FNS = frozenset({'IF', 'IF.EAGER', 'SWITCH', 'IFERROR', 'ISERROR', 'COALESCE'})
+    _WIN_SCAN_HINT_RE = re.compile(r"(?i)\b(?:OFFSET|INDEX|WINDOW|ROWNUMBER|RANK)\s*\(|\[")
+    _WIN_ALL_REL_RE = re.compile(r"(?is)^\s*ALL\s*\(")
+
+    def _win_empty_scan(self, expr: str, ctx: DAXContext) -> None:
+        """SUMX, AVERAGEX, MINX, MAXX, COUNTX and FILTER over an empty table
+        still refuse the window functions of their expression, and of the
+        measures it references, as Power BI Desktop 2.152 does (issue #247):
+        SUMX(FILTER(S, S[V] > 1000), [h_off_all]) fails with the
+        duplicate-rows refusal of h_off_all's OFFSET over ALL(S)
+        (build_b253.py z_sumx_empty), and so do the same OFFSET written
+        inline (build_b253b.py e_sumx_empty_inline), FILTER(<empty>,
+        [h_off_all] > 0) (e_filter_empty), [h_off_all] + 1 (build_b253c.py
+        e_sumx_empty_plus) and AVERAGEX / MINX / MAXX / COUNTX(<empty>,
+        [h_off_all]) (e_averagex_empty, e_minx_empty, e_maxx_empty,
+        e_countx_empty; the engine answered BLANK); a ROWNUMBER over ALL(S)
+        with a tie fails it with its tie (e_sumx_empty_rn). Under IFERROR it
+        is BLANK (e_sumx_empty_iferror), and so under IF (e_sumx_empty_if);
+        untaken IF branches of a non-empty iteration do not fail
+        (e_if_false_iter, e_if_row_iter, e_if_row_rn: 4), so the arguments of
+        IF / SWITCH / IFERROR / ISERROR / COALESCE are not scanned.
+        CONCATENATEX over an empty table answers BLANK (e_concatx_empty), as
+        COUNTROWS(ADDCOLUMNS(<empty>, "x", [h_off_all])) does
+        (e_addcols_empty), so they do not scan. COUNTAX, PRODUCTX, STDEVX.P
+        and GEOMEANX refuse (build_b253d.py b_countax_empty,
+        b_productx_empty, b_stdevxp_empty, b_geomeanx_empty;
+        issue #247), while MEDIANX and PERCENTILEX.INC answer BLANK
+        and RANKX 1 (b_medianx_empty, b_percentilex_empty, b_rankx_empty), so
+        those do not scan, nor do the iterators Desktop has not answered
+        (STDEVX.S, VARX.P, VARX.S, ...). The engine evaluated nothing over
+        zero rows and answered BLANK.
+
+        Each call is checked with the variables it sees, since the refusal
+        is decided where the call is written: a call in ``expr`` with the
+        caller's variables and the VARs ``expr`` declares around it, a call
+        in a referenced measure with that measure's own VARs and never the
+        caller's (_win_static_calls). A measure's VAR r = ALL(S) is r's
+        shape there, as a variable is its expression's shape everywhere
+        (build_b253.py o_ctor, o_genseries; build_b253b.py b_gs_idx_var),
+        and a caller's VAR t = ALL(S) does not make the measure's own VAR
+        t = ALL(S[Cat]) a bag. The calls found are memoized per expression;
+        the variables are bound at each check, so the memo holds no
+        context."""
+        if not self._WIN_SCAN_HINT_RE.search(expr):
+            return
+        key = ('win-empty-scan', expr)
+        cache = ctx._shield_cache
+        calls = cache.get(key)
+        if calls is None:
+            calls = cache[key] = tuple(self._win_static_calls(expr, ctx, False, set(), ()))
+        outer = self._current_var_scope or {}
+        for fn, args_text, via_ref, decls in calls:
+            scope: dict = {} if via_ref else outer
+            for name, vexpr in decls:
+                # never forced: the checks read a variable's expression only
+                # (_win_shape_of) and evaluate no variable (_win_static_check)
+                scope = {**scope, name: _LazyVar(vexpr, None, scope)}
+            try:
+                self._win_static_check(fn, args_text, ctx, scope)
+            except _WindowError as exc:
+                if via_ref and exc._win_ref_catchable:
+                    exc._dax_uncatchable = False
+                raise
+
+    def _win_static_calls(self, text: str, ctx: DAXContext, via_ref: bool,
+                          seen: set, decls: tuple, defn: bool = False) -> list:
+        """``[(function, its argument text, through a measure reference,
+        the VARs it sees)]`` of the window function calls in ``text`` and in
+        the measures it references (transitively, each once), outside the
+        arguments of _WIN_GUARD_FNS and of another window function. The VARs
+        a call sees are ``decls`` -- the (name, expression) declarations
+        around ``text``, outermost first -- and those of the VAR blocks
+        around it in ``text`` (_win_static_var_block); a referenced
+        measure's text starts with none. ``defn``: every call of ``text``
+        itself, in the arguments of _WIN_GUARD_FNS and of another window
+        function too, and none of a referenced measure
+        (_partitionby_definition_error)."""
+        lower = ctx._shield_cache.get(('measure-names',))
+        if lower is None:
+            lower = ctx._shield_cache[('measure-names',)] = {m.lower(): m for m in ctx.measures}
+        out: list = []
+        stack: list = []        # one per open parenthesis: is it a guard's
+        guard = 0
+        prev = ''               # the last character that is no space
+        i, n = 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '"' or ch == "'":
+                j = i + 1
+                while j < n:
+                    if text[j] == ch:
+                        if j + 1 < n and text[j + 1] == ch:
+                            j += 2
+                            continue
+                        break
+                    j += 1
+                i, prev = j + 1, ch
+                continue
+            if ch == '[':
+                j = text.find(']', i + 1)
+                if j < 0:
+                    break
+                if not guard and not defn and not (prev.isalnum() or prev in ("_", "'")):
+                    m = lower.get(text[i + 1:j].strip().lower())
+                    if m is not None and m not in seen:
+                        seen.add(m)
+                        out.extend(self._win_static_calls(
+                            _strip_line_comments(str(ctx.measures.get(m) or '')),
+                            ctx, True, seen, ()))
+                i, prev = j + 1, ']'
+                continue
+            if ch.isalpha() or ch == '_':
+                j = i
+                while j < n and (text[j].isalnum() or text[j] in '_.'):
+                    j += 1
+                word = text[i:j].upper()
+                if word == 'VAR' and j < n and text[j].isspace():
+                    # a VAR block runs to the end of its argument
+                    end = self._win_arg_end(text, i)
+                    if not guard:
+                        out.extend(self._win_static_var_block(
+                            text[i:end], ctx, via_ref, seen, decls, defn))
+                    i, prev = end, ' '
+                    continue
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                if k < n and text[k] == '(':
+                    if word in self._WIN_NAMES:
+                        call = self._extract_args(text[k:])
+                        if call is None:
+                            break
+                        if not guard:
+                            out.append((word, call[1:-1], via_ref, decls))
+                        if defn:
+                            # its arguments' calls too
+                            stack.append(False)
+                            i, prev = k + 1, '('
+                            continue
+                        i, prev = k + len(call), ')'
+                        continue
+                    is_guard = word in self._WIN_GUARD_FNS and not defn
+                    stack.append(is_guard)
+                    guard += is_guard
+                    i, prev = k + 1, '('
+                    continue
+                i, prev = j, text[j - 1]
+                continue
+            if ch == '(':
+                stack.append(False)
+            elif ch == ')':
+                if stack and stack.pop():
+                    guard -= 1
+            if not ch.isspace():
+                prev = ch
+            i += 1
+        return out
+
+    @staticmethod
+    def _win_arg_end(text: str, i: int) -> int:
+        """Where the argument that runs through ``text[i]`` ends: the first
+        ',' ')' or '}' outside parentheses, braces and literals, else the
+        text's end."""
+        depth = 0
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch in '"\'[':
+                i = _skip_literal(text, i)
+                continue
+            if ch in '({':
+                depth += 1
+            elif ch in ')}':
+                if not depth:
+                    return i
+                depth -= 1
+            elif ch == ',' and not depth:
+                return i
+            i += 1
+        return n
+
+    def _win_static_var_block(self, block: str, ctx: DAXContext, via_ref: bool,
+                              seen: set, decls: tuple, defn: bool = False) -> list:
+        """_win_static_calls of a VAR ... RETURN block, split as
+        _eval_var_return splits it: a declaration's calls see the VARs
+        declared before it, RETURN's see them all."""
+        parts, ret = _var_block_parts(_collapse_ws_outside_strings(block))
+        out: list = []
+        for name, vexpr in parts:
+            out.extend(self._win_static_calls(vexpr, ctx, via_ref, seen, decls, defn))
+            if name is not None:
+                decls = decls + ((name, vexpr),)
+        if ret:
+            out.extend(self._win_static_calls(ret, ctx, via_ref, seen, decls, defn))
+        return out
+
+    def _partitionby_definition_error(self, expr: str, ctx: DAXContext) -> Optional[str]:
+        """_WIN_PART_BUILT_MSG when a window function call anywhere in the
+        MEASURE expression ``expr`` partitions by columns a DAX table
+        function added (_win_part_refused), else None. Power BI Desktop
+        2.152 refuses such a measure as it refuses ORDERBY's order
+        (_orderby_definition_error): also in an IF branch never taken --
+        IF(FALSE(), CONCATENATEX(INDEX(1, GENERATESERIES(1, 3),
+        ORDERBY([Value]), PARTITIONBY([Value])), [Value]), "ok") fails
+        (build_b253d.py a_part_untaken; #262), where the
+        engine checked it where the call ran and answered "ok" -- while
+        IFERROR around a reference to such a measure catches it
+        (a_part_ife_ref "caught"). A reference is no part of the
+        definition: IF(FALSE(), [h_bad_order], "ok") is "ok"
+        (c_order_ref_untaken), so referenced measures are not scanned. Each
+        call sees the VARs declared around it in ``expr``
+        (_win_static_calls); memoized per expression and relationship set,
+        the calls reading only ``expr`` and the model."""
+        key = ('part-def', expr, ctx._rels_sig)
+        cache = ctx._shield_cache
+        hit = cache.get(key, _MISSING)
+        if hit is not _MISSING:
+            got: Optional[str] = hit
+            return got
+        msg = None
+        for fn, args_text, _via, decls in self._win_static_calls(
+                _strip_line_comments(expr), ctx, False, set(), (), defn=True):
+            if not _PARTITIONBY_CALL_RE.search(args_text):
+                continue
+            scope: dict = {}
+            for name, vexpr in decls:
+                scope = {**scope, name: _LazyVar(vexpr, None, scope)}
+            if self._win_part_refused(fn, args_text, ctx, scope):
+                msg = _WIN_PART_BUILT_MSG
+                break
+        cache[key] = msg
+        return msg
+
+    def _win_part_refused(self, fn: str, args_text: str, ctx: DAXContext,
+                          scope: dict) -> bool:
+        """Does the window function call ``fn(args_text)`` partition by
+        columns a DAX table function added, with the variables ``scope``:
+        over a relation of such columns only (_win_rel_shape's ``built``:
+        GENERATESERIES, CALENDAR, a table constructor, DATATABLE, ROW), or by
+        a column ADDCOLUMNS added (_win_part_added)? Nothing is evaluated."""
+        parts = self._split_args(args_text) if args_text.strip() else []
+        skip = 0
+        if fn == 'RANK':
+            skip = 1 if parts and parts[0].strip().upper() in ('SKIP', 'DENSE') else 0
+        elif fn in ('INDEX', 'OFFSET'):
+            skip = 1
+        elif fn == 'WINDOW':
+            skip = self._win_window_bounds(parts)[4] if parts else 0
+        relation, partitionby = None, []
+        for raw in parts[skip:]:
+            ps = raw.strip()
+            up = ps.upper()
+            if up.startswith('PARTITIONBY') and ps.endswith(')'):
+                partitionby = [x.strip() for x in self._split_args(ps[ps.index('(') + 1:-1])]
+            elif up.startswith(('ORDERBY', 'MATCHBY')) and ps.endswith(')'):
+                continue
+            elif up in ('KEEP', 'DEFAULT', 'KEEPBLANKS', 'IGNOREBLANKS'):
+                continue
+            elif relation is None:
+                relation = ps
+        if not relation or not partitionby:
+            return False
+        if self._win_part_added(relation, partitionby, ctx, scope):
+            return True
+        shape = self._win_rel_shape(relation, ctx, scope)
+        return bool(shape is not None and shape.built)
+
+    def _win_part_added(self, relation: str, partitionby: list, ctx: DAXContext,
+                        scope: Any = _MISSING) -> bool:
+        """Is one of ``partitionby`` an unqualified [name] of a column that
+        ADDCOLUMNS added to ``relation`` (_win_added_names)? Power BI Desktop
+        2.152 refuses OFFSET(-1, ADDCOLUMNS(ALL(S[Cat]), "g", IF(S[Cat] <
+        "C", 1, 2)), ORDERBY(S[Cat]), PARTITIONBY([g])) with
+        _WIN_PART_BUILT_MSG although S[Cat] is a model column
+        (build_b253d.py a_part_addcol; #262); the engine
+        failed it with "Measure or column '[g]' cannot be found"."""
+        names = set()
+        for p in partitionby:
+            p = p.strip()
+            if p.startswith('[') and p.endswith(']') and p.count('[') == 1:
+                names.add(p[1:-1].strip().lower())
+        if not names:
+            return False
+        added = self._win_added_names(relation, ctx, self._current_var_scope
+                                      if scope is _MISSING else scope, 0)
+        return bool(names & added)
+
+    def _win_added_names(self, e: str, ctx: DAXContext, scope, depth: int) -> frozenset:
+        """The names, in lower case, of the columns ADDCOLUMNS added to the
+        table expression ``e``, through FILTER / CALCULATETABLE / TOPN /
+        DISTINCT and variables (``scope``). Other table functions' added
+        columns are not measured as PARTITIONBY columns of a relation with
+        model columns, and are left out."""
+        if depth > 16:
+            return frozenset()
+        e = e.strip()
+        while e.startswith('(') and self._wraps_whole(e):
+            e = e[1:-1].strip()
+        m = self._WIN_CALL_RE.match(e)
+        call = self._extract_args(e[m.end() - 1:]) if m else None
+        if call is None or m is None or len(call) != len(e) - m.end() + 1:
+            if scope and _IDENT_RE.match(e) and e in scope:
+                lv = scope[e]
+                if isinstance(lv, _LazyVar):
+                    return self._win_added_names(lv.expr, ctx, lv.scope, depth + 1)
+            return frozenset()
+        fname = m.group(1).upper()
+        inner = call[1:-1]
+        args = [a.strip() for a in self._split_args(inner)] if inner.strip() else []
+        if not args:
+            return frozenset()
+        if fname == 'ADDCOLUMNS':
+            own = {n.strip().strip('"').strip().lower() for n in args[1::2]}
+            return frozenset(own) | self._win_added_names(args[0], ctx, scope, depth + 1)
+        if fname in ('FILTER', 'CALCULATETABLE', 'DISTINCT'):
+            return self._win_added_names(args[0], ctx, scope, depth + 1)
+        if fname == 'TOPN' and len(args) > 1:
+            return self._win_added_names(args[1], ctx, scope, depth + 1)
+        return frozenset()
+
+    def _win_static_check(self, fn: str, args_text: str, ctx: DAXContext,
+                          scope: dict) -> None:
+        """The checks a window function call makes before reading a row
+        (_win_parse), without running it, with the variables ``scope`` the
+        call sees (_win_empty_scan); for ROWNUMBER over ALL(...) of a
+        relation that may have duplicate rows, which no context changes, its
+        tie check too (_win_check_ties; build_b253b.py e_sumx_empty_rn) --
+        where ORDERBY and PARTITIONBY are column references, so that nothing
+        is evaluated in a scope that is not the call's."""
+        parts = self._split_args(args_text) if args_text.strip() else []
+        skip, rel = 0, True
+        if fn == 'RANK':
+            skip = 1 if parts and parts[0].strip().upper() in ('SKIP', 'DENSE') else 0
+        elif fn in ('INDEX', 'OFFSET'):
+            skip, rel = 1, fn == 'OFFSET'
+        elif fn == 'WINDOW':
+            _f, frm_type, _t, to_type, skip = self._win_window_bounds(parts) if parts else (
+                None, 'REL', None, 'REL', 0)
+            rel = 'REL' in (frm_type, to_type)
+        relation, kind, orderby, partitionby, matchby = self._win_parse(
+            parts, ctx, skip, fn, rel, static_only=True, scope=scope)
+        if (fn == 'ROWNUMBER' and kind == 'bag' and not matchby and relation
+                and self._WIN_ALL_REL_RE.match(relation)
+                and self._win_refs([e for e, _d in orderby] + list(partitionby), ctx)
+                is not None):
+            base = self._win_base_ctx(ctx)
+            rows = self._table_rows(relation, base)
+            if rows:
+                self._win_check_ties(rows, orderby, partitionby, ctx, base)
 
     # ---- INFO.* model-metadata family.  Serves the LOGICAL model the
     # context executes (tables/columns/measures/relationships) plus the
@@ -18347,14 +28371,29 @@ class DAXEngine:
         return None
 
     def _fn_trunc(self, args_str: str, ctx: DAXContext) -> Any:
-        """TRUNC(number, digits) — truncate to specified decimal places."""
+        """TRUNC(number, digits) — truncate to specified decimal places, toward
+        zero, as ROUNDDOWN does (_round_dec15_directed): on the number's
+        15-digit decimal (_dec15, #333), a Double a Double and
+        an Int64 an Int64 at any digits (build_b257d.py j_type_trunc_int1:
+        TRUNC(5, 1)). Power BI Desktop 2.152:
+        TRUNC(9007199254740993) - 9007199254740992 is -2 (build_b257b.py
+        z53_trunc; we answered 0), TRUNC(0.29, 2) 0.29 and
+        TRUNC(1234567890123456) - 1234567890123450 10 (build_b257c.py
+        j_trunc_029, j_trunc_16; the Double product gave 0.28 and 6),
+        TRUNC(5) an Int64 (j_type_trunc_int; we answered a Double) and
+        TRUNC(-1.5) the Double -1 (build_b254b.py f_fns)."""
         args = self._split_args(args_str)
         val = self._num_arg(args[0], ctx)
         d = self._num_arg(args[1], ctx) if len(args) > 1 else 0
         digits = int(d) if d is not None else 0
+        if type(val) is _Currency:
+            # toward zero on the count, a Currency (Power BI Desktop 2.152,
+            # build_b254.py f_round: TRUNC(CURRENCY(-1.5)) is C-1;
+            # build_b254b.py f_fns: TRUNC(CURRENCY(1.23456), 2) C1.23;
+            # #305)
+            return self._cur_directed(val, digits, False)
         if isinstance(val, (int, float)):
-            multiplier = 10 ** digits
-            return int(val * multiplier) / multiplier
+            return _round_dec15_directed(val, digits, False)
         return None
 
     def _fn_even(self, args_str: str, ctx: DAXContext) -> Any:
@@ -18429,11 +28468,22 @@ class DAXEngine:
         return math.pi
 
     def _fn_currency(self, args_str: str, ctx: DAXContext) -> Any:
-        """CURRENCY(value) — convert to currency (fixed-point decimal, 4 decimal places)."""
-        val = self._eval_expr(args_str.strip(), ctx)
-        if isinstance(val, (int, float)):
-            return _Currency(round(val, 4))
-        return 0
+        """CURRENCY(value) -- the value as a Fixed Decimal (_cur_from_value).
+
+        Power BI Desktop 2.152 (issue #248): a Double rounds half away from
+        zero from x * 10000 in Double (build_b254.py r_cur_lit: 0.03125 is
+        0.0313, -0.03125 -0.0313; build_b254b.py a_fe_conv: 0.00035 is
+        0.0004), where round(x, 4) took a tie to even (#310);
+        text is read as an exact decimal and rounded half to even
+        (r_cur_text: "0.00015" is 0.0002, "0.03125" 0.0312), where any text
+        was the Integer 0, and text that is no number is an error (a_text:
+        CURRENCY("abc"), CURRENCY("")) (#309); TRUE is 1, a
+        date its serial, BLANK stays BLANK (a_text); an Int64 wraps past the
+        range and a Double raises (o_scalar: CURRENCY(1E15) is an error;
+        g_ovf: CONVERT(1000000000000000, CURRENCY) wraps;
+        #308)."""
+        val = _scalarize(self._eval_expr(args_str.strip(), ctx))
+        return _cur_from_value(val, getattr(ctx, 'culture', None))
 
     def _fn_fixed(self, args_str: str, ctx: DAXContext) -> Any:
         """FIXED(number, decimals, no_commas) — format number as text with fixed decimals."""
@@ -18781,19 +28831,62 @@ class DAXEngine:
         parts = [self._eval_text(a, ctx) for a in args[1:]]
         return _from_u16(delimiter.join(parts))
 
+    def _eval_once_arg(self, text: str, ctx: DAXContext) -> Any:
+        """An iterator's argument evaluated once, outside its rows: an error
+        it raises is tagged so that the iterator's call does not mark it as a
+        row error (#267, _exec_plan). Power BI Desktop 2.152
+        (build_b255c.py r28): IFERROR(LEN(CONCATENATEX(TM, TM[n],
+        FORMAT(MOD(1, [m_zero]), "0"))), -1) is -1, where an error in TOPN's N
+        is not caught (r27); RANKX's value and PERCENTILEX's k are caught
+        (build_b255d.py r29, r30), SAMPLE's N, CONCATENATEX's orderBy and a
+        SUMMARIZECOLUMNS filter table not (r31, r32, r34). An error already
+        marked stays marked."""
+        try:
+            return self._eval_expr(text, ctx)
+        except Exception as exc:
+            self._tag_once_arg(exc)
+            raise
+
+    @staticmethod
+    def _tag_once_arg(exc: BaseException) -> None:
+        """Tag ``exc`` as raised by an argument evaluated once (see
+        _eval_once_arg), unless it is already marked uncatchable."""
+        if not getattr(exc, "_dax_uncatchable", False) and not getattr(exc, "_pbix_deadline", False):
+            try:
+                setattr(exc, "_dax_once_arg", True)
+            except (AttributeError, TypeError):
+                pass
+
     def _fn_concatenatex(self, args_str: str, ctx: DAXContext) -> Any:
-        """CONCATENATEX(table, expression, delimiter[, orderBy_expr[, order]]) —
+        """CONCATENATEX(table, expression, delimiter[, orderBy, [order]]...) —
         iterate table, evaluate expression per row, join with delimiter,
-        optionally sorted by orderBy_expr (ASC default, DESC supported)."""
+        ordered by every orderBy / order pair in turn.
+
+        The pairs are read by position as TOPN's are (_order_pairs): the
+        argument after an orderBy is its order -- 0 / FALSE / DESC descending,
+        1 / TRUE / ASC ascending, anything else an error -- and a last
+        orderBy without one ascends. Only the first pair was read, and any
+        order word without "DESC" ascended. Power BI Desktop 2.152
+        (#328; build_b257.py, build_b257b.py) over TS = (1, p),
+        (1, q), (2, r): CONCATENATEX(TS, TS[L], "", TS[G], ASC, TS[L], DESC)
+        is "qpr" (we answered "pqr"), CONCATENATEX(TS, TS[L], "", TS[L], 0)
+        and (..., FALSE()) "rqp" (we: "pqr"), (..., 1) "pqr"; an order of 2,
+        and CONCATENATEX(TS, TS[L], "", TS[G], TS[L]) -- an orderBy where the
+        order is due -- raise "Unexpected value for the ORDER argument in the
+        function CONCATENATEX. Use 0/FALSE/DESC for descending order or
+        1/TRUE/ASC for ascending order." Each key is the row's value,
+        a one-row table read as its value, ordered as _order_key orders."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return ''
         table_ref = self._eval_expr(args[0].strip(), ctx)
         row_expr = args[1].strip()
-        # the delimiter is text as `&` writes it: a 0 is "0", which `or ''` dropped (#178)
-        delimiter = _concat_str(self._eval_expr(args[2].strip(), ctx)) if len(args) > 2 else ''
-        order_expr = args[3].strip() if len(args) > 3 else None
-        descending = len(args) > 4 and 'DESC' in args[4].strip().upper()
+        # the delimiter is text as `&` writes it: a 0 is "0", which `or ''` dropped (#178);
+        # evaluated once, its error is one IFERROR catches (_eval_once_arg)
+        delimiter = _concat_str(self._eval_once_arg(args[2].strip(), ctx)) if len(args) > 2 else ''
+        pairs = self._order_pairs('CONCATENATEX', args[3:], default_desc=False)
+        order_expr = pairs[0][0] if pairs else None
+        single = len(pairs) == 1        # one key per row: no list to build
 
         parts: list[Any] = []   # (sort_key, text) when sorting, else just text
         if isinstance(table_ref, list):
@@ -18811,16 +28904,27 @@ class DAXEngine:
                 # wrote 1.0, 2024-01-02 00:00:00 and True (issue #178)
                 text = _concat_str(result)
                 if order_expr is not None:
-                    key = self._eval_expr(order_expr, row_ctx)
-                    parts.append((key, text))
+                    if single:
+                        v = self._eval_expr(order_expr, row_ctx)
+                        if row_ctx is not ctx and isinstance(v, (list, tuple)):
+                            v = self._resolve_row_result(v, row_item, row_ctx)
+                        parts.append(((_order_key(_scalarize(v)),), text))
+                        continue
+                    if row_ctx is ctx:
+                        vals = [self._eval_expr(e, ctx) for e, _d in pairs]
+                    else:
+                        vals = [self._resolve_row_result(self._eval_expr(e, row_ctx), row_item, row_ctx)
+                                for e, _d in pairs]
+                    parts.append((tuple(_order_key(_scalarize(v)) for v in vals), text))
                 else:
                     parts.append(text)
         if not parts:
             return None     # no rows: BLANK (Desktop 2.152, build_b174b.py, #177)
         if order_expr is not None:
-            # Stable sort; BLANK keys sort first, text in the model's collation (#157).
-            parts.sort(key=lambda item: _order_key(item[0]), reverse=descending)
-            return _from_u16(delimiter.join(text for _, text in parts))
+            # Stable sorts, the last pair first; BLANK keys sort first, text in
+            # the model's collation (#157).
+            order = self._pair_order(_meet_order_keys([key for key, _t in parts]), pairs)
+            return _from_u16(delimiter.join(parts[j][1] for j in order))
         return _from_u16(delimiter.join(parts))
 
     def _rankx_order_desc(self, order: str, ctx: DAXContext) -> bool:
@@ -18844,21 +28948,48 @@ class DAXEngine:
         all text expressions" (Microsoft's RANKX reference); Desktop 2.152
         ranks a member with no data 5th of 6, above a -5. Dates are numbers.
         Text compares as the formula engine does: in the model's collation
-        (issue #157). A value of any other kind maps to None and is left out."""
+        (issue #157). A value of any other kind maps to None and is left out.
+
+        Numbers keep their exact values, as _order_key keeps them: through
+        float(), two Int64 values that share a Double shared a rank. Power BI
+        Desktop 2.152 (build_b257.py, issue #252) ranks TK[K] = 2**53 - 1 ..
+        2**53 + 4 6,5,4,3,2,1 with RANKX(ALL(TK), TK[K]) (we answered
+        6,4,4,3,1,1), and RANKX(ALL(TK), TK[K], 9007199254740993, ASC) is 3
+        (we: 2). A BLANK is the int 0, so that it does not make an Int64
+        column Double.
+
+        The keys (``values[1:]``, one expression's values) have one type: a
+        Double among Int64 keys makes them all Doubles. The value ranked
+        (``values[0]``) is another expression, so it changes no key; it is
+        compared with each key as an Int64 that meets a Double is, as a
+        Double (DAXEngine._fn_rankx; #325, _num_meet):
+        RANKX(ALL(TK), TK[K], 9007199254740992.0) is 4, and over the Double
+        column TD[D] = 2**53, 2**53 + 4, RANKX(ALL(TD), TD[D],
+        9007199254740993, ASC) is 1 (build_b257b.py rankx_dbl_asc). Desktop's
+        RANKX(ALL(TK), TK[K], 9007199254740991.0, DESC, DENSE) over TK[K] =
+        2**53 - 1 .. 2**53 + 2 is 4 (build_b257c.py r_dense_dbl): the three
+        keys above it stay three values, where met with the value as Doubles
+        2**53 and 2**53 + 1 were one and we answered 3."""
         text = any(isinstance(v, str) for v in values)
         out: list[tuple | float | None] = []
         for v in values:
             if text:
                 out.append(_EMPTY_TEXT_KEY if v is None else (_text_key(v) if isinstance(v, str) else None))
             elif v is None:
-                out.append(0.0)
+                out.append(0)
+            elif isinstance(v, bool):
+                out.append(int(v))
             elif isinstance(v, (int, float)):
-                out.append(float(v))
+                out.append(v)
             elif isinstance(v, (datetime, date)):
                 out.append(_dax_serial(v if isinstance(v, datetime)
                                        else datetime(v.year, v.month, v.day)))
             else:
                 out.append(None)
+        if not text and len(out) > 2:
+            kinds = set(map(type, out[1:]))
+            if int in kinds and float in kinds:
+                out[1:] = [float(k) if type(k) is int else k for k in out[1:]]
         return out
 
     def _fn_rankx(self, args_str: str, ctx: DAXContext) -> Any:
@@ -18874,7 +29005,9 @@ class DAXEngine:
 
         # Get the value to rank
         if value_expr:
-            current_raw = self._eval_expr(value_expr, ctx)
+            # evaluated once: IFERROR catches its error (#267;
+            # Power BI Desktop 2.152, build_b255d.py r29)
+            current_raw = self._eval_once_arg(value_expr, ctx)
         else:
             current_raw = self._eval_expr(rank_expr, ctx)
 
@@ -18914,13 +29047,28 @@ class DAXEngine:
         # above the ranked value) where Desktop answers 6 -- there are only 10
         # DISTINCT values and 5 of them beat it.
         ties = (args[4].strip().strip('"\'').upper() if len(args) > 4 else '') or 'SKIP'
+        # the value meets the keys as an Int64 meets a Double (_rankx_keys):
+        # each key is compared as a Double, and DENSE still counts the keys'
+        # own distinct values
+        cmp_vals = all_vals
+        ct = type(current_val)
+        if ct is float or ct is int:
+            kinds = set(map(type, all_vals))
+            if ct is float and int in kinds:
+                cmp_vals = [float(v) if type(v) is int else v for v in all_vals]
+            elif ct is int and float in kinds:
+                current_val = float(current_val)
         if ties == 'DENSE':
-            beat = len({v for v in all_vals
-                        if (v > current_val if is_desc else v < current_val)})
+            if cmp_vals is all_vals:
+                beat = len({v for v in all_vals
+                            if (v > current_val if is_desc else v < current_val)})
+            else:
+                beat = len({v for v, c in zip(all_vals, cmp_vals)
+                            if (c > current_val if is_desc else c < current_val)})
         elif is_desc:
-            beat = sum(1 for v in all_vals if v > current_val)
+            beat = sum(1 for v in cmp_vals if v > current_val)
         else:
-            beat = sum(1 for v in all_vals if v < current_val)
+            beat = sum(1 for v in cmp_vals if v < current_val)
         return beat + 1
 
     @staticmethod
@@ -19057,7 +29205,15 @@ class DAXEngine:
         except (_VarEvalError, _ScalarColumnsError):
             raise
         except Exception as exc:
-            if getattr(exc, "_pbix_deadline", False):
+            # An error raised in a row of an iteration that the argument
+            # holds, and not caught inside that row, is no error IFERROR /
+            # ISERROR can take (#267, see _ROW_ITERATOR_FNS):
+            # Power BI Desktop 2.152 fails the query. Neither is a refusal
+            # Desktop makes before running the query (ERROR with an argument
+            # that is no constant, #268), nor a window
+            # function's refusal around which IFERROR / ISERROR stands
+            # (build_b253b.py group F, issue #247; _WindowError).
+            if getattr(exc, "_pbix_deadline", False) or getattr(exc, "_dax_uncatchable", False):
                 raise
             self._consume_caught(before, frame, n_frame, n_errors)
             return True, None
@@ -19104,7 +29260,15 @@ class DAXEngine:
         for arg in args:
             val = _scalarize(self._eval_expr(arg.strip(), ctx))
             if val is not None:
-                return val
+                # typed as every argument types it (issue #248, _unify_result);
+                # an Int64 nothing can change is returned from _unify_entry's
+                # memo, read inline
+                t = type(val)
+                if t is not int and t is not _Currency:
+                    return val
+                if ctx._filter_idx_cache.unify_coalesce.get(args_str) is ctx.measures:  # type: ignore[attr-defined]
+                    return val
+                return self._unify_result(val, 'COALESCE', args_str, args, ctx)
         return None
 
     def _fn_contains(self, args_str: str, ctx: DAXContext) -> Any:
@@ -19225,28 +29389,101 @@ class DAXEngine:
             if not hit:
                 break
         if hit:
-            return tbl['rows'][min(hit)][result_col_idx]
+            rows = tbl['rows']
+            first = rows[min(hit)][result_col_idx]
+            if len(hit) > 1 and not self._lookup_rows_agree(
+                    ctx, tbl, rows, hit, result_col_idx, criteria):
+                # Several rows match: one value if they all hold it, else the
+                # alternateResult when given, else an error, as Microsoft's
+                # LOOKUPVALUE reference says and Power BI Desktop 2.152
+                # answers (#327; build_b257b.py over TS = (1, p),
+                # (1, q), (2, r): LOOKUPVALUE(TS[L], TS[G], 1) raises "A table
+                # of multiple values was supplied where a single value was
+                # expected.", IFERROR catches it, LOOKUPVALUE(TS[L], TS[G], 1,
+                # "alt") is "alt", LOOKUPVALUE(TS[G], TS[G], 1) is 1;
+                # build_b257.py l_lookup_id: the Double 2**53.0 finds 2**53 and
+                # 2**53 + 1). We returned the first row's value, "p".
+                if len(args) > 1 + len(criteria) * 2:
+                    return self._eval_expr(args[-1].strip(), ctx)
+                raise _DAXEvaluationError(
+                    "A table of multiple values was supplied where a single value was expected.")
+            # a Fixed Decimal column reads as a Currency (issue #248; Desktop
+            # 2.152, build_b254.py l_scalars: LOOKUPVALUE(TR[v], TR[id], 10) is
+            # C0.0002)
+            return _cur_typed(ctx, table_name, tbl['columns'][result_col_idx], first)
 
         # Return alternate value if provided
         if len(args) > 1 + len(criteria) * 2:
             return self._eval_expr(args[-1].strip(), ctx)
         return None
 
+    @staticmethod
+    def _lookup_rows_agree(ctx: DAXContext, tbl: dict, rows: list, hit,
+                           result_col_idx: int, criteria: list) -> bool:
+        """Whether the rows ``hit`` that a LOOKUPVALUE matched all hold one
+        value in its result column, by the values' identity (_value_keys:
+        text with its ASCII case folded, numbers by their exact value, dates
+        as moments) -- several different values are Desktop's error
+        (#327).
+
+        Many rows holding one value is the common case -- LOOKUPVALUE(
+        Product[Category], Product[Subcategory], x) -- and was checked row
+        by row in Python, every call: 21 times slower at 1,000 matching rows.
+        Now the distinct cells are collected in C (a set of the raw cells:
+        Python's == is exact between ints and floats) and only two or more of
+        them are read by identity ("p" and "P" are one value). The verdict
+        is memoized per searched values, droppable ('lv-agree': the whole
+        table is searched, whatever the filters, so it is a fact of the
+        model's rows): even in C the cells cost about 0.1 us a matching row,
+        a fifth more on a lookup that matches 100."""
+        if len(criteria) == 1:                  # flat: no generator on the common case
+            c0, v0 = criteria[0]
+            memo_key: Optional[tuple] = (id(tbl), 'lv-agree', result_col_idx, c0, type(v0), v0)
+        else:
+            memo_key = (id(tbl), 'lv-agree', result_col_idx,
+                        tuple((c, type(v), v) for c, v in criteria))
+        try:
+            verdict = ctx._filter_idx_cache.get(memo_key)
+        except TypeError:                       # an unhashable search value
+            memo_key = verdict = None
+        if verdict is not None:
+            return verdict is True
+        getr = operator.itemgetter(result_col_idx)
+        try:
+            cells = set(map(getr, map(rows.__getitem__, hit)))
+        except TypeError:                       # an unhashable cell
+            cells = None
+        if cells is not None and len(cells) == 1:
+            v = next(iter(cells))
+            # TRUE is == 1 to Python and another value to DAX: a 0 / 1 whose
+            # set may hide a boolean looks at the cells' types
+            agree = True
+            if isinstance(v, (int, float, decimal.Decimal)) and (v == 0 or v == 1):
+                types = set(map(type, map(getr, map(rows.__getitem__, hit))))
+                agree = bool not in types or len(types) == 1
+        else:
+            src = cells if cells is not None else [rows[i][result_col_idx] for i in hit]
+            agree = len({_value_keys(v, False)[0] for v in src}) == 1
+        if memo_key is not None:
+            _put_filter_entry(ctx._filter_idx_cache, memo_key, agree, 1)
+        return agree
+
     # =========================================================================
     # Relationship functions
     # =========================================================================
 
     def _related_row_index(self, ctx: DAXContext, to_table: str,
-                           to_col: str) -> dict:
+                           to_col: str, date_part: bool = False) -> dict:
         """{ key -> related row as a column dict } for to_table[to_col], keyed
         by _rel_key, built once per model and memoized in the shared per-model
         cache (_filter_idx_cache) so an iterator does not rebuild it per row.
         A key the one side holds more than once reaches its LAST row, and a
         text key matches with its ASCII case folded, as Desktop joins them
         (build_b165.py, issues #162, #163: F's "K1" reaches D's "k1", and k3
-        of rows C and D reaches D)."""
+        of rows C and D reaches D). ``date_part``: keyed by the keys' date
+        parts (_date_part_key), for a DatePartOnly relationship."""
         cache = ctx._filter_idx_cache
-        ck = ('__related_idx__', to_table, to_col)
+        ck = ('__related_idx__', to_table, to_col, 'dp') if date_part else ('__related_idx__', to_table, to_col)
         cached: Optional[dict] = cache.get(ck)
         if cached is not None:
             return cached
@@ -19262,7 +29499,8 @@ class DAXEngine:
                         for i, c in enumerate(cols):
                             if i < len(r):
                                 mrow[c] = r[i]
-                        idx[_rel_key(r[ti])] = mrow
+                        k = (_date_part_key(r[ti]) if date_part else None) or _rel_key(r[ti])
+                        idx[k] = mrow
         cache[ck] = idx
         return idx
 
@@ -19271,7 +29509,16 @@ class DAXEngine:
         """Navigate from the current (many-side) row to its single related row
         in target_table, following active From->To relationship edges (the FK
         on the many side matches the key on the one side). Multi-hop capable.
-        Returns the target row as a column dict, or None."""
+        Returns the target row as a column dict, or None.
+
+        A DatePartOnly relationship joins the keys' date parts, as it does
+        everywhere else (#288). Power BI Desktop 2.152
+        (build_b256b.py): SUMX(H, RELATED(Cal3[Bit3])) over the active
+        DatePartOnly H[Order], whose orders carry a time of day, is 8 -- 1 +
+        1 + 2 + 4 (rl_dp_active; 0.9.147 joined by value: 1) -- and
+        CALCULATE(SUMX(F, RELATED(Cal[Bit])), USERELATIONSHIP(F[Ship],
+        Cal[Date])) is 251, the ship days (rl_inside_ur; 0.9.147 110).
+        An activated by-value relationship keeps its own join: rl_dp_inside 6."""
         if _depth > 16 or not isinstance(cur, dict):
             return None
         src_table = cur.get('__table__')
@@ -19292,8 +29539,12 @@ class DAXEngine:
             # every row context through _filter_idx_cache) -- a linear scan
             # here made SUMX(fact, RELATED(...)) O(fact x dim) on 200k-row
             # models.
-            idx = self._related_row_index(ctx, to_table, to_col)
-            mrow = idx.get(_rel_key(fk))
+            dpk = (_date_part_key(fk) if fk is not None and ctx._date_part_joins
+                   and (src_table, from_col, to_table, to_col) in ctx._date_part_joins else None)
+            if dpk is not None:
+                mrow = self._related_row_index(ctx, to_table, to_col, True).get(dpk)
+            else:
+                mrow = self._related_row_index(ctx, to_table, to_col).get(_rel_key(fk))
             if mrow is None:
                 continue          # no related row (orphan FK) -> BLANK
             if to_table == target_table:
@@ -19309,7 +29560,27 @@ class DAXEngine:
         row-context navigation (the FK of the iterated row selects the related
         row), NOT a filter-context lookup -- so it must use ctx._current_row,
         never 'the first visible row of the related table' (which returns the
-        same value for every iterated row)."""
+        same value for every iterated row).
+
+        With no row context it is Desktop's error, and so it is when no active
+        relationship joins the row's table to the column's
+        (#284). There is none in a measure's own expression, nor
+        in CALCULATE's -- CALCULATE consumes the row it transitions. Power BI
+        Desktop 2.152 (build_b256.py / build_b256b.py), "The column 'Cal[Bit]'
+        either doesn't exist or doesn't have a relationship to any table
+        available in the current context.": SUMX(F, CALCULATE(RELATED(
+        Cal[Bit]))) (rl_plain; with USERELATIONSHIP or CROSSFILTER beside it,
+        d_related_userel, rl_order_uo, rl_other_pair, rl_cfnone, rl_cfboth,
+        rl_p_ur), CALCULATE(RELATED(Cal[Bit]), Cal[Date] = DATE(2024, 1, 2))
+        (rl_norow) and CALCULATE(SUMX(F, RELATED(Cal[Bit])), CROSSFILTER(
+        F[Order], Cal[Date], None)) (rl_inside_none). 0.9.147 read the first
+        visible row of the related table (172, 8, ...). SUMX(F, VAR b =
+        RELATED(Cal[Bit]) RETURN CALCULATE(b, ..)) is 172 (rl_var). Desktop
+        reports it before evaluating anything -- IF(FALSE(), SUMX(F,
+        CALCULATE(RELATED(Cal[Bit]), ..)), 1) fails too (rl_iffalse) -- so
+        IFERROR in the same expression cannot catch it here either
+        (_bind_error), and a measure's expression is checked before it is
+        evaluated (DAXEngine._static_refusal)."""
         ref = self._column_arg(args_str, ctx)
         if not isinstance(ref, tuple) or len(ref) != 2:
             return None
@@ -19321,23 +29592,76 @@ class DAXEngine:
         if target_col_idx < 0:
             return None
         cur = getattr(ctx, '_current_row', None)
-        if isinstance(cur, dict) and cur.get('__table__'):
+        # a Fixed Decimal column reads as a Currency (issue #248; Desktop
+        # 2.152, build_b254.py l_tables: SUMX(FactC, RELATED(DimC[price])) is
+        # an exact Currency); on a model without one, nothing is asked
+        spelled = tbl['columns'][target_col_idx]
+        if (type(cur) is dict and '__parts__' not in cur
+                and type(cur.get('__table__')) is str
+                and ('__column__' not in cur or cur['__column__'] in cur)):
+            # one row of one table, the common case
             related = self._related_lookup(cur, target_table, ctx)
             if related is not None:
-                return related.get(target_col)
-            # A row context exists but no related row was reachable: the FK is
-            # orphaned or the current row already IS the target table with the
-            # column present. Fall through only for the same-table case.
-            if cur.get('__table__') == target_table and target_col in cur:
-                return cur[target_col]
-            return None
-        # No row context (degenerate RELATED call): the previous
-        # filter-context behavior, so a single-visible-row context still
-        # resolves rather than crashing.
-        rows = ctx.get_filtered_rows(target_table)
-        if rows:
-            return rows[0][target_col_idx]
+                return _cur_typed(ctx, target_table, spelled, related.get(target_col))
+            parts = [cur]
+        else:
+            # A row of a table of COLUMNS -- VALUES / DISTINCT / ALL of a
+            # column, SUMMARIZE, SELECTCOLUMNS (_ColumnsRow); not RELATEDTABLE's
+            # whole rows, see _row_of_columns -- is no row of
+            # its columns' table and reaches no related table: Power BI
+            # Desktop 2.152 refuses SUMX(VALUES(F[Order]), RELATED(Cal[Bit]))
+            # and SUMX(SUMMARIZE(F, F[Order]), RELATED(Cal[Bit]))
+            # (build_b256c.py r_values_order, r_summarize_order;
+            # #298), where the engine answered BLANK and 127.
+            parts = ([p for p in (cur.get('__parts__') or (cur,))
+                      if isinstance(p, dict) and isinstance(p.get('__table__'), str)
+                      and not _row_of_columns(p)]
+                     if isinstance(cur, dict) else [])
+            if not parts:
+                raise _bind_error(_RELATED_NO_REL_MSG.format(ref=f"{target_table}[{target_col}]"))
+            for part in parts:
+                related = self._related_lookup(part, target_table, ctx)
+                if related is not None:
+                    return _cur_typed(ctx, target_table, spelled, related.get(target_col))
+        # A row context exists but no related row was reachable: the FK is
+        # orphaned or the current row already IS the target table with the
+        # column present. Fall through only for the same-table case.
+        for part in parts:
+            if part.get('__table__') == target_table and target_col in part:
+                return _cur_typed(ctx, target_table, spelled, part[target_col])
+        if not any(self._tables_joined(ctx, part['__table__'], target_table) for part in parts):
+            raise _bind_error(_RELATED_NO_REL_MSG.format(ref=f"{target_table}[{target_col}]"))
         return None
+
+    @staticmethod
+    def _tables_joined(ctx: DAXContext, a: str, b: str) -> bool:
+        """Do ACTIVE relationships join table a to table b, in any direction
+        and over any number of hops? RELATED's structural test (_fn_related):
+        an orphan key is BLANK, no relationship at all Desktop's error. The
+        groups of joined tables are kept per relationship set (kind
+        'related-reach', structural)."""
+        if a == b:
+            return True
+        key = ('related-reach', ctx._rels_sig)
+        cache = ctx._filter_idx_cache
+        groups: Optional[dict] = cache.get(key) if ctx._rels_sig is not None else None
+        if groups is None:
+            groups = {}
+            for rel in ctx.relationships:
+                if not rel.get('IsActive', 1):
+                    continue
+                ft, tt = rel.get('FromTable'), rel.get('ToTable')
+                if not ft or not tt:
+                    continue
+                ga, gb = groups.setdefault(ft, {ft}), groups.setdefault(tt, {tt})
+                if ga is not gb:
+                    ga |= gb
+                    for t in gb:
+                        groups[t] = ga
+            if ctx._rels_sig is not None:
+                cache[key] = groups
+        g = groups.get(a)
+        return g is not None and b in g
 
     def _fn_relatedtable(self, args_str: str, ctx: DAXContext) -> Any:
         """RELATEDTABLE(table) — follow relationship to get filtered related table rows."""
@@ -19487,15 +29811,9 @@ class DAXEngine:
         year_end_month = 12
         year_end_day = 31
         if len(args) > 1:
-            ye = self._eval_expr(args[1].strip(), ctx)
-            if isinstance(ye, str):
-                try:
-                    parts = ye.split('/')
-                    if len(parts) == 2:
-                        year_end_month = int(parts[0])
-                        year_end_day = int(parts[1])
-                except ValueError:
-                    pass
+            md = self._year_end_parts(self._eval_expr(args[1].strip(), ctx))
+            if md is not None:
+                year_end_month, year_end_day = md
 
         max_date = max(dates)
         # YTD: from start of fiscal year to max_date
@@ -19511,6 +29829,34 @@ class DAXEngine:
         all_dates = self._get_all_date_table_dates(table_name, col_name, ctx)
         ytd = [d for d in all_dates if year_start <= d <= max_date]
         return self._make_date_table_result(table_name, col_name, ytd, ctx=ctx)
+
+    @staticmethod
+    def _year_end_parts(ye: Any) -> Optional[tuple]:
+        """(month, day) of a DATESYTD / TOTALYTD year end, or None: the
+        default, December 31. The year is ignored. A date, "m/d", "m/d/yyyy",
+        and the ISO "yyyy-mm-dd" (with or without a time of day), which was
+        ignored (#289). Power BI Desktop 2.152
+        (build_b256b.py): TOTALYTD(SUM(F[v]), Cal[Date], "2023-12-30") under
+        Cal[Date] = DATE(2024, 1, 2) is 124, the year from December 31
+        (t_ytd_ye_j2; 0.9.147 120, from January 1), as "12/30" is
+        (t_ytd_ye_md_j2), and so is DATESYTD's (t_dytd_ye_j2); under
+        December 31 2023 it is that day's 4 (t_ytd_ye_dec31; 0.9.147 7)."""
+        if isinstance(ye, (datetime, date)):
+            return ye.month, ye.day
+        if not isinstance(ye, str):
+            return None
+        text = ye.strip()
+        m = re.match(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ].*)?$", text)
+        if m:
+            month, day = int(m.group(2)), int(m.group(3))
+        else:
+            m = re.match(r"^(\d{1,2})/(\d{1,2})(?:/\d{2,4})?$", text)
+            if not m:
+                return None
+            month, day = int(m.group(1)), int(m.group(2))
+        if not (1 <= month <= 12 and 1 <= day <= monthrange(2000, month)[1]):
+            return None
+        return month, day
 
     def _fn_datesmtd(self, args_str: str, ctx: DAXContext) -> Any:
         """DATESMTD(dates) — month to date dates."""
@@ -19535,9 +29881,41 @@ class DAXEngine:
         qtd = [d for d in all_dates if quarter_start <= d <= max_date]
         return self._make_date_table_result(table_name, col_name, qtd, ctx=ctx)
 
-    def _total_over_dates(self, expr: str, dates: Any, ctx: DAXContext) -> Any:
+    def _total_over_dates(self, expr: str, dates: Any, ctx: DAXContext, filters: list | tuple = ()) -> Any:
         """Evaluate ``expr`` with ``dates`` (a DATESYTD/QTD/MTD result) as the
-        filter on its date column.
+        filter on its date column, and the function's own ``filters``.
+
+        With filters it is CALCULATE(expr, <dates>, filters...): the dates
+        first, the filters evaluated in ``ctx`` and applied as CALCULATE's
+        filter arguments -- USERELATIONSHIP among them -- where 0.9.147
+        dropped them (#282). Power BI Desktop 2.152
+        (build_b256.py / build_b256b.py), under Cal[Date] = DATE(2024, 1, 3):
+        TOTALYTD(SUM(F[v]), Cal[Date], USERELATIONSHIP(F[Ship], Cal[Date])) is
+        8254, as CALCULATE(SUM(F[v]), DATESYTD(Cal[Date]), USERELATIONSHIP(..))
+        is (c_ytdship_jan3; 0.9.147 8696, the F[Order] total), and so are
+        TOTALMTD's and TOTALQTD's (c_mtdship_jan3, t_qtd_ur_j3); a boolean
+        filter F[pk] = 1 gives 72 in all three (t_*_bool_j3), ALL(F[pk])
+        lifts an outer F[pk] = 1 (t_ytd_allpk_j3 8696), and Cal[Year] = 2023
+        meets the 2024 dates: BLANK (t_ytd_year_j3). CLOSINGBALANCEMONTH /
+        YEAR / QUARTER and OPENINGBALANCEMONTH / YEAR take theirs the same way
+        (t_cbm_ur_j3 1536, t_cby_ur_dec30 1, t_cbq_pk2_j3 BLANK, t_obm_ur_j3
+        1, t_oby_ur_j3 1). A filter on the date column itself intersects the
+        dates, as any two filter arguments of one CALCULATE do
+        (#294, _apply_date_rows): TOTALYTD(SUM(F[v]), Cal[Date],
+        Cal[Date] <= DATE(2024, 1, 2)) under January 3 2024 is January 1..2,
+        not every order up to January 2 of either year.
+
+        Without a filter it is CALCULATE(e, <dates>) as well
+        (#296): its own path applied the dates without the
+        transition of an iterated row, and evaluated e unfiltered where
+        there were no dates. Power BI Desktop 2.152 (build_b256c.py):
+        SUMX(F, TOTALYTD(SUM(F[v]), Cal[Date])) is 13311, as SUMX(F,
+        CALCULATE(SUM(F[v]), DATESYTD(Cal[Date]))) and the TOTALYTD with a
+        filter doing nothing are -- each row its own value where its order
+        day is in its year to date; rows 10 and 11 reach Cal's blank row,
+        whose year to date is empty (q_sumx_ytd; the engine 16383) -- and
+        CALCULATE(TOTALYTD(SUM(F[v]), Cal[Date]), ISBLANK(Cal[Date])) is
+        BLANK (q_ytd_blank; the engine 3072, the blank row's rows).
 
         TOTALYTD(e, d) is CALCULATE(e, DATESYTD(d)) (Microsoft's DAX
         reference), so the dates REPLACE every existing filter on the date
@@ -19552,19 +29930,37 @@ class DAXEngine:
         CALCULATE(e, DATESYTD/DATESQTD(d)) in every cell grouped by year,
         year x period and a non-date column x year.
         """
-        if dates and isinstance(dates, list) and isinstance(dates[0], dict) and '__table__' in dates[0]:
-            tbl_name, col_name = dates[0]['__table__'], dates[0]['__column__']
-            if (tbl_name, col_name) not in self._clearing_date_columns(ctx):
-                # Not a marked date column nor a DateTime relationship column:
-                # Power BI intersects the dates with the table's filters (#78).
-                return self._eval_expr(expr, ctx.with_filters(
-                    {f"{tbl_name}.{col_name}": [item['__value__'] for item in dates]}))
-            # Derived from ctx, so ALL snapshots and the grouping survive (#87).
-            new_ctx = ctx.without_filters(
-                [k for k in ctx.filter_context if k.startswith(f"{tbl_name}.")]
-            ).with_filters({f"{tbl_name}.{col_name}": [item['__value__'] for item in dates]})
-            return self._eval_expr(expr, new_ctx)
-        return self._eval_expr(expr, ctx)
+        return self._fn_calculate(', '.join([expr, *filters]), ctx,
+                                  _dates=dates if isinstance(dates, list) else [])
+
+    def _se_eval_scoped(self, expr: str, ctx: DAXContext) -> Any:
+        """``expr`` evaluated in ctx -- a context of its own, made for it --
+        as a scope of aggregations scanned together (_se_scope,
+        #339), as CALCULATE with filters evaluates its
+        expression: TOTALYTD(e, d) is CALCULATE(e, DATESYTD(d)) (Microsoft's
+        DAX reference), so TOTALYTD(SUM(T[a]) + SUM(T[b]), d) scans a and b
+        together as the CALCULATE does, where it scanned them apart."""
+        prev = ctx._se_fuse
+        ctx._se_fuse = (ctx, self._se_scope(expr, ctx, self._home_tables[-1] if self._home_tables else None))
+        try:
+            return self._eval_expr(expr, ctx)
+        finally:
+            ctx._se_fuse = prev
+    @staticmethod
+    def _split_year_end(rest: list) -> tuple:
+        """(filters, year end or None) of the arguments after TOTALYTD's /
+        OPENING/CLOSINGBALANCEYEAR's dates: [filter][, year_end_date]. A lone
+        third argument is the year end when it is a string literal, else a
+        filter; a fourth is the year end (#282; Desktop 2.152,
+        build_b256b.py: TOTALYTD(SUM(F[v]), Cal[Date], USERELATIONSHIP(..),
+        "2023-12-30") under January 2 2024 is 31, both applied --
+        t_ytd_ur_ye_j2)."""
+        rest = [a.strip() for a in rest]
+        if len(rest) >= 2:
+            return rest[:-1], rest[-1]
+        if rest and len(rest[0]) >= 2 and rest[0][0] == '"' and rest[0][-1] == '"':
+            return [], rest[0]
+        return rest, None
 
     def _fn_totalytd(self, args_str: str, ctx: DAXContext) -> Any:
         """TOTALYTD(expression, dates, filter, yearEndDate) — year to date total."""
@@ -19572,22 +29968,25 @@ class DAXEngine:
         if len(args) < 2:
             return 0
         expr = args[0].strip()
-        ytd_dates = self._fn_datesytd(', '.join(args[1:]), ctx)
-        return self._total_over_dates(expr, ytd_dates, ctx)
+        filters, ye = self._split_year_end(args[2:])
+        ytd_dates = self._fn_datesytd(args[1].strip() + (', ' + ye if ye else ''), ctx)
+        return self._total_over_dates(expr, ytd_dates, ctx, filters)
 
     def _fn_totalmtd(self, args_str: str, ctx: DAXContext) -> Any:
-        """TOTALMTD(expression, dates) — month to date total."""
+        """TOTALMTD(expression, dates, filter) — month to date total."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
-        return self._total_over_dates(args[0].strip(), self._fn_datesmtd(args[1].strip(), ctx), ctx)
+        return self._total_over_dates(args[0].strip(), self._fn_datesmtd(args[1].strip(), ctx), ctx,
+                                      [a.strip() for a in args[2:]])
 
     def _fn_totalqtd(self, args_str: str, ctx: DAXContext) -> Any:
-        """TOTALQTD(expression, dates) — quarter to date total."""
+        """TOTALQTD(expression, dates, filter) — quarter to date total."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
-        return self._total_over_dates(args[0].strip(), self._fn_datesqtd(args[1].strip(), ctx), ctx)
+        return self._total_over_dates(args[0].strip(), self._fn_datesqtd(args[1].strip(), ctx), ctx,
+                                      [a.strip() for a in args[2:]])
 
     # =========================================================================
     # Time Intelligence — Period Navigation
@@ -19798,23 +30197,43 @@ class DAXEngine:
         return (datetime(d.year, first_month, 1),
                 datetime(d.year, last_month, monthrange(d.year, last_month)[1], 23, 59, 59))
 
+    def _period_of(self, args_str: str, ctx: DAXContext, period: str) -> tuple:
+        """``(dates text, bounds function)`` of STARTOF* / ENDOF*'s
+        arguments. STARTOFYEAR and ENDOFYEAR take a year end after the dates
+        (Microsoft's DAX reference: <year_end_date>, December 31 when
+        omitted), read as DATESYTD's (_year_end_parts) and bounding the year
+        (_fiscal_year_bounds) (#299). With one the whole
+        argument text was taken for the dates, which named no column: the
+        period was empty, and CALCULATE(SUM(F[v]), ENDOFYEAR(Cal[Date],
+        "12/30")) BLANK."""
+        if period == 'YEAR':
+            args = self._split_args(args_str)
+            if len(args) >= 2:
+                md = self._year_end_parts(self._eval_expr(args[1].strip(), ctx))
+                if md is not None:
+                    return args[0], lambda d: self._fiscal_year_bounds(d, md)
+                return args[0], lambda d: self._period_bounds(d, period)
+        return args_str, lambda d: self._period_bounds(d, period)
+
     def _start_of(self, args_str: str, ctx: DAXContext, period: str) -> Any:
         """STARTOFMONTH/QUARTER/YEAR: the first date of the dates column in the
         period that contains the earliest date in context."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        text, bounds = self._period_of(args_str, ctx, period)
+        table_name, col_name, dates = self._get_date_column_dates(text.strip(), ctx)
         if not dates:
             return []
-        lo, hi = self._period_bounds(min(dates), period)
+        lo, hi = bounds(min(dates))
         inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
         return self._make_date_table_result(table_name, col_name, [min(inside)] if inside else [], ctx=ctx)
 
     def _end_of(self, args_str: str, ctx: DAXContext, period: str) -> Any:
         """ENDOFMONTH/QUARTER/YEAR: the last date of the dates column in the
         period that contains the latest date in context."""
-        table_name, col_name, dates = self._get_date_column_dates(args_str.strip(), ctx)
+        text, bounds = self._period_of(args_str, ctx, period)
+        table_name, col_name, dates = self._get_date_column_dates(text.strip(), ctx)
         if not dates:
             return []
-        lo, hi = self._period_bounds(max(dates), period)
+        lo, hi = bounds(max(dates))
         inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
         return self._make_date_table_result(table_name, col_name, [max(inside)] if inside else [], ctx=ctx)
 
@@ -19852,24 +30271,73 @@ class DAXEngine:
     # value, which a kept Period filter would have made BLANK.
 
     def _balance_at(self, args_str: str, ctx: DAXContext, period: str, opening: bool) -> Any:
+        """OPENING/CLOSINGBALANCE*(expression, dates[, filter][, year end]):
+        the filter applies as a CALCULATE filter argument beside the date
+        (_total_over_dates, #282).
+
+        The YEAR variants' year end bounds their year (#297),
+        as DATESYTD's does (_year_end_parts; the year part is ignored); it was
+        taken apart from the filters and not applied. Power BI Desktop 2.152
+        (build_b256c.py): CALCULATE(OPENINGBALANCEYEAR(SUM(F[v]), Cal[Date],
+        "12/30"), Cal[Date] = DATE(2024, 1, 3)) is December 30 2023's 3, the
+        last day before the year that starts December 31 (y_oby_ye_j3; the
+        engine 4, December 31's), CLOSINGBALANCEYEAR's under December 30 2023
+        is that day's 3 (y_cby_ye_dec30; the engine 4), and with
+        USERELATIONSHIP(F[Ship], Cal[Date]) beside the year end 2048, the
+        ship shipped that day (y_cby_ur_ye_dec30; the engine 1)."""
         args = self._split_args(args_str)
         if len(args) < 2:
             return 0
         expr = args[0].strip()
+        ye_md = None
+        if period != 'YEAR':
+            filters = [a.strip() for a in args[2:]]
+        else:
+            filters, ye = self._split_year_end(args[2:])
+            if ye is not None:
+                ye_md = self._year_end_parts(self._eval_expr(ye, ctx))
         table_name, col_name, dates = self._get_date_column_dates(args[1].strip(), ctx)
         if not dates:
+            if filters:
+                return self._fn_calculate(', '.join([expr, *filters]), ctx)
             return self._eval_expr(expr, ctx)
         if opening:
-            lo, _hi = self._period_bounds(min(dates), period)
+            lo, _hi = (self._fiscal_year_bounds(min(dates), ye_md) if ye_md is not None
+                       else self._period_bounds(min(dates), period))
             before = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if d < lo]
             if not before:
                 return None
             at = self._make_date_table_result(table_name, col_name, [max(before)], ctx=ctx)
+        elif ye_md is not None:
+            lo, hi = self._fiscal_year_bounds(max(dates), ye_md)
+            inside = [d for d in self._get_all_date_table_dates(table_name, col_name, ctx) if lo <= d <= hi]
+            if not inside:
+                return None
+            at = self._make_date_table_result(table_name, col_name, [max(inside)], ctx=ctx)
         else:
             at = self._end_of(args[1], ctx, period)
             if not at:
                 return None
-        return self._total_over_dates(expr, at, ctx)
+        return self._total_over_dates(expr, at, ctx, filters)
+
+    @staticmethod
+    def _fiscal_year_bounds(d: datetime, year_end: tuple) -> tuple:
+        """(first, last) calendar day of the year ending on ``year_end``
+        ((month, day), _year_end_parts) that contains d -- _period_bounds'
+        YEAR for another year end. A February 29 year end is the last day of
+        February in a year without one."""
+        month, day = year_end
+        if not isinstance(d, datetime):
+            d = datetime(d.year, d.month, d.day)
+
+        def end_in(y: int) -> datetime:
+            return datetime(y, month, min(day, monthrange(y, month)[1]), 23, 59, 59)
+        end = end_in(d.year)
+        if d > end:
+            end = end_in(d.year + 1)
+        prev = end_in(end.year - 1)
+        first = datetime(prev.year, prev.month, prev.day) + timedelta(days=1)
+        return first, end
 
     def _fn_openingbalancemonth(self, args_str: str, ctx: DAXContext) -> Any:
         """OPENINGBALANCEMONTH(expression, dates, filter) — at the last date before the month."""
@@ -20084,7 +30552,20 @@ class _PerThreadEngine:
         return getattr(self._get(), name)
 
     def __setattr__(self, name: str, value: Any) -> None:
-        setattr(self._get(), name, value)
+        eng = self._get()
+        if (getattr(value, '__self__', None) is eng
+                and getattr(value, '__func__', None) is getattr(type(eng), name, None)):
+            # The engine's own method put back -- what monkeypatch's undo of
+            # setattr(_engine, "_eval_expr", f) does, having read the bound
+            # method through __getattr__. Stored, it stayed on this thread's
+            # engine and shadowed the class from then on: a later test that
+            # patched DAXEngine._eval_expr never reached it
+            # (tests/test_issue131_memo_shield.py::test_evaluated_once_not_once_per_row
+            # failed after tests/test_issue233_evaluate_dax_batch.py; the
+            # tests of issues #186 and #193 left the same; #272).
+            eng.__dict__.pop(name, None)
+            return
+        setattr(eng, name, value)
 
 
 _engine: DAXEngine = _PerThreadEngine()  # type: ignore[assignment]
@@ -20473,23 +30954,37 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
         # --- filter the fact table by the base context ONCE ---
         base_ctx = DAXContext(tables, measures, date_table, date_column,
                               base_fc_no_dim, relationships)
+        # Each bucket is one group of a grouped scan of the fact table: its
+        # rows' storage positions, the column that groups them and the
+        # columns the base filters name travel with it, so its sums add as
+        # the per-value path's -- and Desktop's -- do (issue #243; a bucket
+        # of bare rows lost where they were stored). The buckets hold the
+        # positions, and their rows are read off them (get_filtered_rows'
+        # rows are those at get_row_positions): one append per base row, as
+        # when they held the rows.
+        all_rows = ftbl["rows"]
         base_rows = base_ctx.get_filtered_rows(ftbl_name)
+        kept_pos = base_ctx.get_row_positions(ftbl_name)
+        base_pos: Any = range(len(base_rows)) if kept_pos is None else kept_pos
+        scan_where, scan_group = base_ctx.se_scan_columns(ftbl_name, ftbl)
+        # each bucket's storage positions
+        bucket_pos: dict = {}
 
         # --- bucket base-filtered rows by dimension value ---
         # buckets are keyed by str(val) for the direct case (dimension column on
         # the aggregated table) and by the value object for the cross-table
         # case; `key_is_str` records which so the aggregation loop resolves the
         # right key.
-        buckets: dict = {}
         if ftbl_name == dim_table:
             dcol_idx = col_helper._find_col_idx(ftbl["columns"], dim_col)
             if dcol_idx < 0:
                 continue
+            group_col = ftbl["columns"][dcol_idx]
             wanted = set(str(v) for v in unique_vals)
-            for row in base_rows:
+            for row, p in zip(base_rows, base_pos):
                 key = str(row[dcol_idx])
                 if key in wanted:
-                    buckets.setdefault(key, []).append(row)
+                    bucket_pos.setdefault(key, []).append(p)
             key_is_str = True
         else:
             # The cross-table bucketing applies base_fc (via base_rows) and the
@@ -20542,7 +31037,8 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
                     break
             if not ok or fact_col_idx is None:
                 continue
-            for row in base_rows:
+            group_col = ftbl["columns"][fact_col_idx]
+            for row, p in zip(base_rows, base_pos):
                 cell = row[fact_col_idx]
                 if date_part:
                     k = (_date_part_key(cell) or str(cell)) if cell is not None else 'None'
@@ -20555,19 +31051,24 @@ def evaluate_per_dimension(measure_names: list, tables: dict, measures: dict,
                 if k in key_to_value:
                     # BLANK is a group of its own: the rows that reach the
                     # dimension's blank row (issue #82)
-                    buckets.setdefault(key_to_value[k], []).append(row)
+                    bucket_pos.setdefault(key_to_value[k], []).append(p)
             key_is_str = False
 
         # --- aggregate each bucket with the real engine (empty filter) ---
         for val in unique_vals:
             bkey = str(val) if key_is_str else val
-            brows = buckets.get(bkey, [])
+            bpos = bucket_pos.get(bkey, [])
+            brows = list(map(all_rows.__getitem__, bpos))
             # A transient copy evaluates with a cache of its own, so the
             # buckets leave the model's cache where it is (issue #214). One
             # per bucket, never shared: the next bucket's fact dict may be
             # given this one's freed id, and entries are keyed by it.
             tables_copy = transient_tables(tables)
-            tables_copy[ftbl_name] = {**ftbl, "rows": brows}
+            tables_copy[ftbl_name] = {**ftbl, "rows": brows,
+                                      "storage_index": bpos,
+                                      "storage_n": len(ftbl["rows"]),
+                                      "scan_where": scan_where,
+                                      "scan_group": scan_group | {group_col}}
             res = evaluate_measures_batch(list(ms), tables_copy, measures, {},
                                           date_table, date_column, relationships)
             for name in ms:

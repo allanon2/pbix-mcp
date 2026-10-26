@@ -13868,12 +13868,16 @@ def _get_dax_context(alias: str) -> dict:
         if tname.startswith('H$') or tname.startswith('R$'):
             continue
         try:
-            td = model.get_table(tname)
+            # with the columns' runs: Desktop's storage engine adds a Double
+            # column along them (issue #243, pbix_mcp.dax.se_scan)
+            td = model.get_table(tname, with_storage=True)
             if td and td.get('columns') and td.get('rows'):
                 tables[tname] = {
                     'columns': td['columns'],
                     'rows': td['rows'],
                 }
+                if td.get('storage'):
+                    tables[tname]['storage'] = td['storage']
         except Exception:
             continue
 

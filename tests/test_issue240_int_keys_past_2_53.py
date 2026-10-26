@@ -15,9 +15,16 @@ F:/_desktop_oracle/build_b234.py, table TI with K = 9007199254740992 and
 9007199254740993, A = 1 and 2; measures i_pred, i_filter, i_values; the last
 two already matched). The other filter forms must agree with FILTER's
 row-by-row answer, which compares Python numbers exactly and matched
-Desktop; they are not measured one by one. An int past 2**53 against a
-Double cell holding its rounded float is not measured either: it follows
-the same exact comparison.
+Desktop; they are not measured one by one.
+
+An int past 2**53 against a Double cell holding its rounded float does NOT
+follow the exact comparison: Desktop converts an Int64 that meets a Double
+to that Double (#325; build_b257.py l_lookup_di, the Double
+column TD[D] searched with 9007199254740993 finds its 2**53.0, and
+build_b257b.py c_dcol_eq_i, CALCULATE(..., TD[D] = 9007199254740993)
+keeps it). test_numbers_a_float_holds_still_match_across_storage and
+test_spelling_helpers assert that now; between two Int64 values every
+assertion here stands.
 """
 from __future__ import annotations
 
@@ -91,7 +98,10 @@ def test_a_caller_filter_selects_its_own_key():
 def test_numbers_a_float_holds_still_match_across_storage():
     assert _ev("CALCULATE(SUM(FD[A]), FD[K] = 9007199254740992)") == 16
     assert _ev("CALCULATE(SUM(FD[A]), FD[K] = 2024)") == 32           # issue #39
-    assert _ev("CALCULATE(SUM(FD[A]), FD[K] = 9007199254740993)") is None
+    # an Int64 that meets a Double compares as that Double, so 2**53 + 1
+    # finds the Double cell 2**53.0 (Desktop, build_b257b.py c_dcol_eq_i "x",
+    # build_b257.py l_lookup_di "x"; #325). It answered BLANK.
+    assert _ev("CALCULATE(SUM(FD[A]), FD[K] = 9007199254740993)") == 16
 
 
 def test_spelling_helpers():
@@ -104,7 +114,10 @@ def test_spelling_helpers():
     assert de._join_key_aliases(B + 1) == {str(B + 1)}
     assert de._join_key_aliases(B) == {str(B), str(float(B))}
     assert de._value_keys(B + 1) != de._value_keys(B)
-    assert de._value_keys(B) == de._value_keys(float(B))
+    # the first key is the value's identity; a whole Double past 2**53 also
+    # answers to the Int64 filter values that meet it (#325)
+    assert de._value_keys(B)[0] == de._value_keys(float(B))[0]
+    assert ("dbl", float(B)) in de._value_keys(float(B))
     assert de._value_keys(2) == de._value_keys(2.0)
     assert ("num", B) not in de._filter_value_keys(B + 1)
     assert ("text", str(B + 1)) in de._filter_value_keys(B + 1)

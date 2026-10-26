@@ -423,6 +423,7 @@ def _decode_numeric_dictionary(buf: bytes, pos: int, dict_type: int) -> list:
 def decode_idf(
     idf_bytes: bytes, bit_width: int, row_count: int, rle_base: int = 0,
     segments: "list[tuple[int, int]] | None" = None,
+    runs_out: "list | None" = None,
 ) -> list[int]:
     """
     Decode an IDF blob and return per-row dictionary indices.
@@ -443,6 +444,14 @@ def decode_idf(
     a column that mixes both (or is pure-RLE, e.g. a single-value column)
     decodes consistently. The default 0 preserves the legacy behaviour for
     callers that don't need the adjustment (our own encoder never emits RLE).
+
+    ``runs_out``: a list that receives the column's physical layout, one
+    ``(start, length, is_rle)`` per primary entry in storage order, ``start``
+    counted from the first row of the column (each segment's runs offset by
+    the rows of the segments before it), clipped to ``row_count``. Power BI
+    Desktop's storage engine adds a Double column run by run -- an RLE run as
+    value x rows, a bit-packed run in 16,384-row chunks (issue #243) -- so the
+    engine needs the runs, which the per-row indices no longer show.
     """
     buf = idf_bytes
     indices: list[int] = []
@@ -467,9 +476,13 @@ def decode_idf(
         else:
             seg_bw, seg_rle_base, seg_bp_add = bit_width, rle_base, 0
             seg_rows = row_count
+        seg_runs: "list | None" = [] if runs_out is not None else None
         seg_indices, pos = _decode_idf_segment_at(
-            buf, pos, seg_bw, seg_rle_base, seg_bp_add, seg_rows
+            buf, pos, seg_bw, seg_rle_base, seg_bp_add, seg_rows, seg_runs
         )
+        if runs_out is not None and seg_runs is not None:
+            base = len(indices)
+            runs_out.extend((base + s, n, r) for s, n, r in seg_runs)
         indices.extend(seg_indices)
         seg_idx += 1
         if row_count and len(indices) >= row_count and segments is None:
@@ -477,18 +490,28 @@ def decode_idf(
             # trailing segments they didn't ask about.
             break
 
+    if runs_out is not None and row_count:
+        # the rows past row_count are padding: so are their runs
+        kept = []
+        for s, n, r in runs_out:
+            if s >= row_count:
+                break
+            kept.append((s, min(n, row_count - s), r))
+        runs_out[:] = kept
     # Truncate to exact row count (sub-segment may have padding)
     return indices[:row_count] if row_count else indices
 
 
 def _decode_idf_segment_at(
     buf: bytes, pos: int, bit_width: int, rle_base: int, bitpacked_add: int = 0,
-    seg_rows: int = 0,
+    seg_rows: int = 0, runs_out: "list | None" = None,
 ):
     """Decode ONE segment of an .idf starting at ``pos``.
 
     Returns ``(indices, next_pos)`` — the segment's per-row indices and the byte
     offset immediately after this segment (start of the next segment, if any).
+    ``runs_out`` receives the segment's runs, ``(start, length, is_rle)`` with
+    ``start`` counted from the segment's first row (see decode_idf).
 
     ``bitpacked_add`` shifts this segment's bit-packed values onto a shared
     scale. Across the segments of one column the dictionary is GLOBAL but each
@@ -579,13 +602,17 @@ def _decode_idf_segment_at(
     # `data_value + bit_packed_offset == 0xFFFFFFFF` (Power BI stores each
     # successive marker as 0xFFFFFFFF minus the number of bit-packed values
     # already consumed), otherwise it is an RLE run of `data_value`.
-    indices = []
+    indices: list[int] = []
     bit_packed_offset = 0
     for dv, rv in primary_entries:
         if (dv + bit_packed_offset) & 0xFFFFFFFF == 0xFFFFFFFF:
+            if runs_out is not None:
+                runs_out.append((len(indices), rv, False))
             indices.extend(bitpacked_values[bit_packed_offset:bit_packed_offset + rv])
             bit_packed_offset += rv
         else:
+            if runs_out is not None:
+                runs_out.append((len(indices), rv, True))
             # RLE: repeat dv exactly rv times. Re-base absolute data_ids onto
             # the same relative scale as the bit-packed sub-segment values.
             indices.extend([dv - rle_base] * rv)
@@ -698,6 +725,7 @@ def read_table_from_abf(
     table_name: str,
     metadata_db_bytes: bytes,
     include_calculated: bool = False,
+    with_storage: bool = False,
 ) -> dict:
     """
     Read a full table from an ABF blob.
@@ -710,12 +738,29 @@ def read_table_from_abf(
         Name of the table to read.
     metadata_db_bytes : bytes
         Raw bytes of metadata.sqlitedb extracted from ABF.
+    with_storage : bool
+        Also return the table's physical layout as ``storage`` (below).
 
     Returns
     -------
     dict with keys:
         columns: list[str]  -- column names
         rows: list[list]    -- row data
+        storage: dict       -- with ``with_storage`` only, when any column
+            was decoded from an IDF: ``{'rows': n, 'segments': (records of
+            each segment, ...), 'columns': {name: {'starts': array('q') of
+            each run's first row, 'rle': bytes (1 = RLE run, 0 =
+            bit-packed), 'enc': 'value' | 'hash', 'mag': Magnitude}}}``,
+            and for a hash-encoded column with a dictionary 'dict': its
+            entries in data-ID order (as decode_dictionary returns them)
+            and 'dtype': the type name they reconstruct with.
+            Rows are returned in storage order, so a row's index is its
+            storage position. Power BI Desktop's storage engine adds a
+            Double column along these runs (issue #243,
+            pbix_mcp.dax.se_scan), and its formula engine reads a column's
+            values in data-ID order where it iterates them on its own
+            (DAXEngine._fe_fold_order); a column whose runs do not cover
+            the rows exactly is left out.
     """
     from pbix_mcp.formats.abf_rebuild import list_abf_files, read_abf_file
 
@@ -800,6 +845,10 @@ def read_table_from_abf(
 
     # Read each column's data
     col_data = []  # list of (col_name, data_type, values_list)
+    # with_storage: each IDF column's runs, encoding and Magnitude, and the
+    # segments' record counts (issue #243)
+    col_layout: dict = {}
+    seg_records: "tuple | None" = None
     # Columns whose VertiPaq files EXIST but fail to decode. These are genuine
     # data-loss situations (corrupt store, or a missing decoder dependency such
     # as xmhuffman for Huffman-compressed string dictionaries). We collect them
@@ -973,15 +1022,28 @@ def read_table_from_abf(
                      s["min_data_id"] - _gmin, s["records"])
                     for s in seg_meta_list
                 ]
+            runs: "list | None" = [] if with_storage else None
             try:
                 indices = decode_idf(
                     idf_bytes_raw, bit_width, row_count,
-                    rle_base=_rle_base, segments=_seg_params,
+                    rle_base=_rle_base, segments=_seg_params, runs_out=runs,
                 )
             except Exception as e:
                 decode_errors.append((col_name, "idf", f"{type(e).__name__}: {e}"))
                 col_data.append((col_name, data_type, None))
                 continue
+            if runs is not None:
+                value_enc = dict_entry is None and ds_type == 2
+                col_layout[col_name] = (
+                    runs, "value" if value_enc else "hash",
+                    float(ds_magnitude) if value_enc and ds_magnitude else 1.0,
+                    # the dictionary, in data-ID order: the order the
+                    # formula engine reads the column's values in (#243)
+                    None if value_enc or dict_entry is None else dict_values,
+                    data_type)
+                if seg_records is None:
+                    seg_records = (tuple(s["records"] for s in seg_meta_list)
+                                   if len(seg_meta_list) > 1 else (row_count,))
 
             # VALUE-encoded column (no external dictionary, DictionaryStorage.
             # Type=2): reconstruct value = (data_id + BaseId) / Magnitude.
@@ -1064,4 +1126,49 @@ def read_table_from_abf(
                 row.append(None)
         rows.append(row)
 
-    return {"columns": col_names, "rows": rows}
+    out: dict = {"columns": col_names, "rows": rows}
+    if with_storage and col_layout:
+        storage = _storage_layout(col_layout, col_names, n_rows, seg_records)
+        if storage is not None:
+            out["storage"] = storage
+    return out
+
+
+def _storage_layout(col_layout: dict, col_names: list, n_rows: int,
+                    seg_records: "tuple | None") -> "dict | None":
+    """read_table_from_abf's ``storage``: per returned column its runs as
+    compact arrays -- a column whose runs do not cover the ``n_rows`` rows
+    exactly is left out -- and the segments, when their records add up to
+    ``n_rows`` (one segment of ``n_rows`` otherwise). 1,801 runs for the 15
+    columns of a 199,999-row fact table; 168k for 13 segments of 12.6M rows.
+    A hash-encoded column keeps the dictionary list decode_dictionary made
+    ('dict', with its type name 'dtype'): one reference per distinct value,
+    the values themselves shared with the rows for text, Int64 and Float64."""
+    from array import array
+    cols: dict = {}
+    for name in col_names:
+        got = col_layout.get(name)
+        if got is None:
+            continue
+        runs, enc, mag = got[:3]
+        if not runs or runs[0][0] != 0:
+            continue
+        ok = True
+        nxt = 0
+        for s, n, _r in runs:
+            if s != nxt or n <= 0:
+                ok = False
+                break
+            nxt = s + n
+        if not ok or nxt != n_rows:
+            continue
+        cols[name] = {"starts": array("q", [s for s, _n, _r in runs]),
+                      "rle": bytes(1 if r else 0 for _s, _n, r in runs),
+                      "enc": enc, "mag": mag}
+        if len(got) > 4 and got[3] is not None:
+            cols[name]["dict"] = got[3]
+            cols[name]["dtype"] = got[4]
+    if not cols:
+        return None
+    segs = seg_records if seg_records and sum(seg_records) == n_rows else (n_rows,)
+    return {"rows": n_rows, "segments": tuple(segs), "columns": cols}

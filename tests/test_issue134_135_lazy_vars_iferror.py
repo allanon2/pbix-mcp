@@ -15,8 +15,9 @@ BLANK in Desktop and was 5; ISERROR(BLANK()) is FALSE and was TRUE. A division
 by zero IS an error there (IFERROR(1 / 0, 5) is 5), and so is a referenced
 measure that fails (IFERROR([Bad], 13) is 13).
 
-Not covered: VAR x = [Bad] RETURN x fails in Desktop; the engine still degrades
-a referenced measure's error to BLANK outside IFERROR / ISERROR.
+VAR x = [Bad] RETURN x fails in Desktop (measure_used); the engine degraded a
+referenced measure's error to BLANK outside IFERROR / ISERROR until
+#266.
 """
 from __future__ import annotations
 
@@ -41,6 +42,7 @@ DESKTOP = {   # expression -> Desktop's answer
     'VAR x = SUM(T[v]) RETURN x + x': 120,
     'VAR x = ERROR("boom") RETURN IFERROR(x, 9)': ERROR,
     'VAR x = [Bad] RETURN 10': 10,
+    'VAR x = [Bad] RETURN x': ERROR,
     'VAR x = [Bad] RETURN IF(ISBLANK(BLANK()), 11, x)': 11,
     'VAR x = ERROR("boom") RETURN IF(ISERROR(x), 1, 0)': ERROR,
     'VAR x = IFERROR(ERROR("boom"), 1) RETURN x': 1,

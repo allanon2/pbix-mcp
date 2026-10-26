@@ -12,11 +12,17 @@ MOD(-3, 2) 1); tests/test_issue139 and tests/test_dax_accuracy pin the
 argument conversions. A BLANK number, also with a divisor of 0, is not
 measured; it stays BLANK and is deliberately not pinned.
 
-&& and || stop at the side that decides, as AND() and OR() always did here:
-they evaluated every side, so once MOD by 0 raised, a guard written with
-them -- COUNTROWS(FILTER(T, T[d] <> 0 && MOD(T[n], T[d]) = 1)) -- failed the
-measure where the AND() form, and 0.9.146, counted 2. Whether Desktop stops
-early is not measured; the tests pin that the two forms agree.
+&& and || (and AND() / OR()) stop at the side that decides only where
+nothing they read changes -- a scalar (issue #249; Power BI Desktop 2.152,
+build_b255.py: IF([m_zero] <> 0 && MOD(1, [m_zero]) = 1, 1, 0) is 0, s1;
+|| s2 1, s8 0). In an iteration's rows they evaluate every operand: SUMX(T,
+IF(T[d] <> 0 && MOD(T[n], T[d]) = 1, 1)) fails (a3; AND() x5), and so does
+FILTER over an || (a2, f12; OR() f13). FILTER's top-level conjunction is
+split instead: a row on which a column predicate is FALSE goes before the
+other conjuncts run, so COUNTROWS(FILTER(T, T[d] <> 0 && MOD(T[n], T[d]) =
+1)) is 2 with the guard on either side (a1, f1). #239 had made && stop early
+everywhere ("not measured on Desktop"); the operator and function forms still
+agree.
 """
 from __future__ import annotations
 
@@ -71,23 +77,28 @@ def test_remainder_takes_the_divisor_sign(expr, want):
     assert _engine(expr) == want
 
 
-@pytest.mark.parametrize("ops,funcs", [
+@pytest.mark.parametrize("ops,funcs,want", [
+    # Desktop 2.152 (build_b255.py): a1 2, a2 ERROR, a3 ERROR (x5 the AND()
+    # form); IF(FALSE() && MOD(1, 0) = 1, 1, 0) is 0 even in SUMX's rows
+    # (build_b255b.py x20), b247's IF(FALSE() && ERROR("x"), 1, 0) 0 and
+    # IF(TRUE() || ERROR("x"), 1, 0) 1
     ("COUNTROWS(FILTER(T, T[d] <> 0 && MOD(T[n], T[d]) = 1))",
-     "COUNTROWS(FILTER(T, AND(T[d] <> 0, MOD(T[n], T[d]) = 1)))"),
+     "COUNTROWS(FILTER(T, AND(T[d] <> 0, MOD(T[n], T[d]) = 1)))", 2),
     ("COUNTROWS(FILTER(T, T[d] = 0 || ISBLANK(T[d]) || MOD(T[n], T[d]) = 1))",
-     "COUNTROWS(FILTER(T, OR(OR(T[d] = 0, ISBLANK(T[d])), MOD(T[n], T[d]) = 1)))"),
+     "COUNTROWS(FILTER(T, OR(OR(T[d] = 0, ISBLANK(T[d])), MOD(T[n], T[d]) = 1)))", "ERROR"),
     ("SUMX(T, IF(T[d] <> 0 && MOD(T[n], T[d]) = 1, 1))",
-     "SUMX(T, IF(AND(T[d] <> 0, MOD(T[n], T[d]) = 1), 1))"),
-    ("IF(FALSE() && MOD(1, 0) = 1, 1, 0)", "IF(AND(FALSE(), MOD(1, 0) = 1), 1, 0)"),
-    ("IF(TRUE() || MOD(1, 0) = 1, 1, 0)", "IF(OR(TRUE(), MOD(1, 0) = 1), 1, 0)"),
+     "SUMX(T, IF(AND(T[d] <> 0, MOD(T[n], T[d]) = 1), 1))", "ERROR"),
+    ("IF(FALSE() && MOD(1, 0) = 1, 1, 0)", "IF(AND(FALSE(), MOD(1, 0) = 1), 1, 0)", 0),
+    ("IF(TRUE() || MOD(1, 0) = 1, 1, 0)", "IF(OR(TRUE(), MOD(1, 0) = 1), 1, 0)", 1),
 ])
-def test_a_guard_written_with_operators_guards_as_and_or_do(ops, funcs):
-    got = _engine(ops)
-    assert got != "ERROR"
-    assert got == _engine(funcs)
+def test_a_guard_written_with_operators_guards_as_and_or_do(ops, funcs, want):
+    assert _engine(ops) == want
+    assert _engine(funcs) == want
 
 
-def test_the_guard_must_come_first():
-    assert _engine("COUNTROWS(FILTER(T, MOD(T[n], T[d]) = 1 && T[d] <> 0))") == "ERROR"
+def test_the_guard_may_come_second():
+    # Desktop 2.152, build_b255.py f1: FILTER applies its column predicate
+    # first, wherever it is written (issue #249)
+    assert _engine("COUNTROWS(FILTER(T, MOD(T[n], T[d]) = 1 && T[d] <> 0))") == 2
     assert _engine("TRUE() && TRUE() && FALSE()") is False
     assert _engine("FALSE() || BLANK() || 1") is True

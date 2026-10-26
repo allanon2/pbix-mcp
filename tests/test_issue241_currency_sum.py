@@ -17,15 +17,19 @@ Expected values:
 - DESKTOP: Power BI Desktop 2.152 over ADOMD (battery build_b234.py), TCur =
   a Fixed Decimal column of ten rows of 0.1.
 - DOUBLE: the same ten rows as Doubles keep a Double column's rules, through
-  the same file: SUM / AVERAGE correctly rounded (issue #246), SUMX left to
-  right (Desktop, build_b210.py).
+  the same file: SUM, SUMX and AVERAGE add them left to right, as Desktop's
+  storage engine adds a short bit-packed run (Desktop, build_b210.py; issue
+  #243, which supersedes the correctly rounded SUM of #246).
 - The rest are derived: an exact sum does not depend on the row order and is
   the Double nearest the exact total (checked against Fraction arithmetic);
   an iterator over any table that hands it the column's own values (FILTER,
   VALUES, a row transition, a bare [v] in the row context) adds the same
   Currency values; AVERAGEA over a column of numbers is AVERAGE; a sum of
-  Currency values is Currency, as CURRENCY() is. Arithmetic on a Currency
-  value is not measured on Desktop and stays Double arithmetic.
+  Currency values is Currency, as CURRENCY() is. An AVERAGE of Currency is
+  the exact total over the count rounded half away from zero to a Currency
+  (Desktop, build_b254.py r_avg / a_col, issue #248), so the averages below
+  are that exact arithmetic; arithmetic on a Currency is #248's
+  (test_issue248_currency_types.py).
 """
 from __future__ import annotations
 
@@ -48,13 +52,16 @@ DESKTOP = {
     "c_sumx_bits": ("(SUMX(TCur, TCur[v]) - 1) * 1E17", 0),
     "c_avg_bits": ("(AVERAGE(TCur[v]) - 0.1) * 1E18", 0),
 }
-# the same ten rows as Doubles: SUM / AVERAGE correctly rounded (issue #246),
-# SUMX left to right as Desktop adds them (build_b210.py, T10)
+# the same ten rows as Doubles: SUM, SUMX and AVERAGE add them left to right,
+# as Desktop's storage engine adds one bit-packed run of ten rows (Power BI
+# Desktop 2.152, build_b210.py T10: f_sum10_eq1 0, f_sum10_bits and
+# f_sumx10_bits -11.102230246251565, f_avg10_bits -13.877787807814457; issue
+# #243 -- the correctly rounded SUM of issue #246 gave 1, 0 and 0)
 DOUBLE = {
-    "d_sum_eq1": ("IF(SUM(TDbl[v]) = 1, 1, 0)", 1),
-    "d_sum_bits": ("(SUM(TDbl[v]) - 1) * 1E17", 0),
+    "d_sum_eq1": ("IF(SUM(TDbl[v]) = 1, 1, 0)", 0),
+    "d_sum_bits": ("(SUM(TDbl[v]) - 1) * 1E17", -11.102230246251565),
     "d_sumx_bits": ("(SUMX(TDbl, TDbl[v]) - 1) * 1E17", -11.102230246251565),
-    "d_avg_bits": ("(AVERAGE(TDbl[v]) - 0.1) * 1E18", 0),
+    "d_avg_bits": ("(AVERAGE(TDbl[v]) - 0.1) * 1E18", -13.877787807814457),
 }
 
 
@@ -149,7 +156,13 @@ def test_exact_in_any_row_order(seed):
     again = _eval(measures, _tables(values))
     assert first == again
     assert first["s"] == first["x"] == want
-    assert first["a"] == first["ax"] == first["aa"] == want / len(values)
+    # the exact average rounded half away from zero to 4 decimals, a Currency
+    # (issue #248; Desktop, build_b254.py r_avg: 0.5 counts is 1, -0.5 is -1)
+    counts = sum(Fraction(str(v)) * 10000 for v in values)
+    avg = Fraction(counts, len(values))
+    want_avg = (int(avg + Fraction(1, 2)) if avg >= 0 else -int(-avg + Fraction(1, 2))) / 10000
+    assert first["a"] == first["ax"] == first["aa"] == want_avg
+    assert type(first["a"]) is type(first["ax"]) is type(first["aa"]) is de._Currency
     # the data tells exact from row order apart
     assert want != _fold(values)
 
@@ -207,7 +220,8 @@ def test_per_dimension_buckets_add_exactly():
     measures = {"s": "SUM(T[v])", "a": "AVERAGE(T[v])"}
     fast = de.evaluate_per_dimension(["s", "a"], tables, measures, None, "T.g", "T", "g", ["p", "q"])
     assert fast["s"] == {"p": 1.0, "q": 2.1}
-    assert fast["a"] == {"p": 0.1, "q": 2.1 / 3}
+    # 21000 counts / 3 = 7000 counts exactly: a Currency average (issue #248)
+    assert fast["a"] == {"p": 0.1, "q": 0.7}
 
 
 def test_currency_values_an_iterator_computes_add_exactly():

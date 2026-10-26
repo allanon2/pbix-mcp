@@ -1,6 +1,6 @@
 # Supported DAX Functions
 
-All 435 of the DAX functions Power BI Desktop can evaluate in a query are implemented and verified — 100% of the evaluable surface (out of the engine's 467-function catalog; the remaining 32 are proven not query-authorable by the engine's own refusals, so the whole surface is accounted for — [dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (359 value probes, 1e-9 relative tolerance), and the 24-report corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
+All 435 of the DAX functions Power BI Desktop can evaluate in a query are implemented and verified — 100% of the evaluable surface (out of the engine's 467-function catalog; the remaining 32 are proven not query-authorable by the engine's own refusals, so the whole surface is accounted for — [dax-coverage.md](dax-coverage.md)). Semantics are verified two ways: a per-function conformance harness replays Desktop-captured goldens (354 value probes, 1e-9 relative tolerance), and the 24-report corpus matches Desktop on every comparable cell — 432 grand totals, 1,705 filter-context cells, 397 calculated columns (v0.9.63). Functions outside this list return `None` with status `"unsupported"` rather than a guess; expressions using unlisted shapes may still be refused.
 
 ## Aggregation (13)
 `SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `COUNTROWS`, `MIN`, `MAX`, `DISTINCTCOUNT`, `DISTINCTCOUNTNOBLANK`, `PRODUCT`, `MEDIAN`, `MEDIANX`, `COUNTBLANK`
@@ -107,8 +107,17 @@ the eager row-to-filter transition narrows the context to; the current row is
 located by value in the sorted partition (all columns, or the `MATCHBY`
 columns). `WINDOW` supports `ABS` (1-based, negative-from-end) and `REL`
 (clamped at partition edges) endpoints; `RANK` supports `SKIP` and `DENSE`
-ties. All fourteen Desktop goldens — including partitioned row numbers and
-relative windows — match by hand-checkable values.
+ties. As Power BI Desktop does (issue #247), `OFFSET` / `INDEX` / `WINDOW`
+refuse a relation that may have duplicate rows (a table no relationship keys,
+a table constructor, `UNION`, ...) unless `MATCHBY` is given, `ROWNUMBER`
+refuses ties, `ROWNUMBER` / `RANK` refuse a relation of table-function columns
+only, `PARTITIONBY` by columns a table function added fails the measure
+wherever the call is, ties are broken by the relation's key ascending, and
+`ORDERBY`'s argument after an expression is its order (a measure with another
+order fails wherever the call is). As a table, `TREATAS` keeps repeated values
+and drops the values its target column lacks. Nine Desktop goldens match by
+value; the five over the fixture's keyless fact table are Desktop refusals,
+and the engine refuses them too.
 
 **INFO.\* model-metadata family (66)**: every `INFO.*` function Desktop's
 engine will evaluate in a query. They serve the logical model the engine

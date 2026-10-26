@@ -116,7 +116,8 @@ def test_evaluated_once_not_once_per_row(monkeypatch):
     monkeypatch.setattr(de.DAXEngine, "_shielded_keys", lambda self, n, c: frozenset())
     assert _eval(["Last Day"]) == {"Last Day": LAST_SALE}
     # once, instead of once per row of [Last Day]'s FILTER that gets to it:
-    # && stops at a FALSE left side (issue #239), so [Max Week] ran on the
+    # FILTER's top-level conjuncts stop at a FALSE one (issue #249; neither
+    # is a column predicate, so left to right), so [Max Week] ran on the
     # rows whose NOT ISBLANK([Sales]) holds, one per sale
     assert shielded == 1
     assert calls["n"] == len(TABLES["Sales"]["rows"]) > 1

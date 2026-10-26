@@ -211,7 +211,9 @@ def _evaluate_calculated_columns(
 
                 ctx = dax_engine.DAXContext(tables, {}, None, None, None, relationships or [])
                 result = engine._eval_expr(row_expr, ctx)
-                new_values.append(result)
+                # a model table's rows hold floats, a Currency too (the
+                # schema marks the column; issue #248)
+                new_values.append(float(result) if type(result) is dax_engine._Currency else result)
             except Exception:
                 new_values.append(None)
 
@@ -1255,6 +1257,12 @@ def _lv_key(val):
     a stored "ABC". Numbers unify int/float so 3 matches 3.0, and a midnight
     datetime matches the plain date -- the same normalisation the corpus
     ground-truth comparison uses.
+
+    An Int64 is its EXACT value: through float() 9007199254740992 and
+    9007199254740993 were one key, so a LOOKUPVALUE over such keys was
+    refused as ambiguous and a DISTINCTCOUNT counted them once. Two Int64
+    values compare exactly in Power BI Desktop 2.152 (build_b234.py, #240;
+    build_b257.py, #252); #324.
     """
     if val is None or isinstance(val, bool):
         return val
@@ -1264,6 +1272,8 @@ def _lv_key(val):
         return val.date() if (val.hour, val.minute, val.second,
                               val.microsecond) == (0, 0, 0, 0) else val
     if isinstance(val, date):
+        return val
+    if type(val) is int:
         return val
     if isinstance(val, (int, float)):
         f = float(val)
@@ -1308,7 +1318,21 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
     Walks the hop chain once per DISTINCT key and memoises, so a fact table
     with a handful of distinct foreign keys costs a handful of walks rather
     than one per row.
+
+    A DatePartOnly hop joins the keys' DATE PARTS, as RELATED in a measure
+    does (#295, #288): it joined by value, so a
+    calculated column RELATED(Cal3[Bit3]) over an active DatePartOnly
+    relationship whose keys carry a time of day was BLANK on those rows
+    ([None, 1, None, None] over build_b256.py's H; Power BI Desktop 2.152
+    joins them by day, build_b256b.py rl_dp_active: SUMX(H,
+    RELATED(Cal3[Bit3])) is 8 = 1 + 1 + 2 + 4). Auto date/time joins
+    (LocalDateTable) are DatePartOnly too.
     """
+    from pbix_mcp.dax import engine as dax_engine
+
+    def _dp_key(v):
+        return dax_engine._date_part_key(v) or _lv_key(v)
+
     def _tbl(name):
         for tname, tdata in (all_tables or {}).items():
             if tname.lower() == (name or "").lower():
@@ -1328,9 +1352,10 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
             return (f"RELATED: '{hop.get('ToTable')}' has no column "
                     f"'{hop.get('ToColumn')}' to join on")
         by_key: Dict[object, list] = {}
+        keyer = _dp_key if dax_engine._joins_date_parts(hop) else _lv_key
         for r in dst.get("rows") or []:
-            by_key.setdefault(_lv_key(r[lower[pk]]), r)
-        hops.append((by_key, lower))
+            by_key.setdefault(keyer(r[lower[pk]]), r)
+        hops.append((by_key, lower, keyer))
     last_cols = hops[-1][1]
     res_i = last_cols.get(spec["column"].lower())
     if res_i is None:
@@ -1346,9 +1371,9 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
         if key in memo:
             return memo[key]
         val = None
-        cur = key
-        for i, (by_key, lower) in enumerate(hops):
-            row = by_key.get(cur)
+        raw = fk_value
+        for i, (by_key, lower, keyer) in enumerate(hops):
+            row = by_key.get(keyer(raw))
             if row is None:
                 val = None
                 break
@@ -1359,7 +1384,7 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
                 if nxt_i is None:
                     val = None
                     break
-                cur = _lv_key(row[nxt_i])
+                raw = row[nxt_i]
         memo[key] = val
         return val
 
@@ -1367,13 +1392,23 @@ def _build_related_resolver(spec: dict, all_tables: Dict[str, dict]):
 
 
 def _ord_key(v):
-    """A sortable key for the inequality column, or None if not orderable."""
+    """A sortable key for the inequality column, or None if not orderable.
+
+    A number keeps its exact value (Python orders an int against an int or a
+    float exactly): through float(), the Int64 values 9007199254740992 and
+    9007199254740993 tied, and FILTER(T, T[K] <= EARLIER(T[K])) kept both
+    for the first (#324; Desktop orders two Int64 values
+    exactly, build_b257.py, #252). Where an Int64 key meets a Double
+    threshold, or a Double key an Int64 one, the resolver compares them as
+    Doubles (_build_calculate_resolver, #325)."""
     if isinstance(v, bool):
         return None
     if isinstance(v, datetime):
         return v
     if isinstance(v, date):
         return datetime(v.year, v.month, v.day)
+    if type(v) is int:
+        return v
     if isinstance(v, (int, float)):
         return float(v)
     if isinstance(v, str):
@@ -1382,14 +1417,21 @@ def _ord_key(v):
 
 
 def _running(agg: str, vals: "list"):
-    """Prefix aggregate over `vals`, as a list where [i] covers vals[:i+1]."""
+    """Prefix aggregate over `vals`, as a list where [i] covers vals[:i+1].
+
+    A sum of Int64 values is exact: it is added up in Python ints and given
+    out as the Double this path has always given, except where a Double
+    cannot hold it -- past 2**53 the exact int (#324; Desktop
+    sums an Int64 column exactly, build_b257.py, #252). A float accumulator
+    made SUM over 2**53, 1, 1 come out 2**53."""
     out: "list" = []
     if agg == "sum":
-        acc = 0.0
+        iacc: "int | float" = 0
         for v in vals:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                acc += float(v)
-            out.append(acc)
+                iacc += v if type(v) is int else float(v)
+            out.append(float(iacc) if -9007199254740992 <= iacc <= 9007199254740992
+                       else iacc)
     elif agg in ("count", "counta"):
         acc = 0
         for v in vals:
@@ -1414,12 +1456,12 @@ def _running(agg: str, vals: "list"):
                 cur_k, cur_v = k, v
             out.append(cur_v)
     elif agg == "average":
-        acc, n = 0.0, 0
+        total, n = 0.0, 0
         for v in vals:
             if isinstance(v, (int, float)) and not isinstance(v, bool):
-                acc += float(v)
+                total += float(v)
                 n += 1
-            out.append(acc / n if n else None)
+            out.append(total / n if n else None)
     return out
 
 
@@ -1495,6 +1537,8 @@ def _build_calculate_resolver(spec, columns, rows, outer_fns):
             compiled[key] = (keys, list(reversed(rev)), True)
     empty = _aggregate(agg, [])
 
+    met_keys: dict = {}
+
     def resolve(row_data):
         key = tuple(_lv_key(fn(row_data)) for fn in outer_fns["eq"])
         got = compiled.get(key)
@@ -1504,6 +1548,18 @@ def _build_calculate_resolver(spec, columns, rows, outer_fns):
         thr = _ord_key(outer_fns["ineq"](row_data))
         if thr is None:
             return empty
+        # an Int64 that meets a Double compares as a Double
+        # (#325); the two readings differ only past 2**53
+        tt = type(thr)
+        if tt is int and not -9007199254740992 <= thr <= 9007199254740992 \
+                and keys and type(keys[0]) is float:
+            thr = float(thr)
+        elif tt is float and not -9007199254740992.0 < thr < 9007199254740992.0 \
+                and keys and type(keys[0]) is int:
+            fk = met_keys.get(key)
+            if fk is None:          # int -> float keeps the sorted order
+                fk = met_keys[key] = [float(k) if type(k) is int else k for k in keys]
+            keys = fk
         if not suffix:
             n = (bisect.bisect_right(keys, thr) if op == "<="
                  else bisect.bisect_left(keys, thr))
@@ -1968,8 +2024,8 @@ def evaluate_calc_table_expression(
         col = result[0].get("__column__")
         if not col:
             return None, "single-column result has no column name"
-        return {"columns": [col],
-                "rows": [[r.get("__value__")] for r in result]}, None
+        return _untype_currency({"columns": [col],
+                                 "rows": [[r.get("__value__")] for r in result]}), None
 
     cols = [k for k in result[0].keys() if k not in meta]
     if not cols:
@@ -1978,8 +2034,35 @@ def evaluate_calc_table_expression(
     for r in result:
         if [k for k in r.keys() if k not in meta] != cols:
             return None, "result rows have inconsistent columns"
-    return {"columns": cols,
-            "rows": [[r.get(c) for c in cols] for r in result]}, None
+    return _untype_currency({"columns": cols,
+                             "rows": [[r.get(c) for c in cols] for r in result]}), None
+
+
+def _untype_currency(table: dict) -> dict:
+    """``table`` (``{columns, rows}``) with every Fixed Decimal (Currency)
+    value the engine computed stored as the plain float the decoder gives a
+    Currency column, and the columns that held only Currency values recorded
+    as its ``currency_columns`` (engine.mark_currency_columns), so a read
+    types them again. The engine now keeps the Currency type through reads
+    and arithmetic (issue #248); in a model table's rows a _Currency would
+    make every row GC-tracked and fail the ``type(v) is float`` tests of the
+    column code."""
+    from pbix_mcp.dax import engine as dax_engine
+    cur_t = dax_engine._Currency
+    cols = table.get('columns') or []
+    cur: set = set()
+    other: set = set()
+    for row in table.get('rows') or []:
+        for i, v in enumerate(row):
+            if type(v) is cur_t:
+                row[i] = float(v)
+                cur.add(i)
+            elif v is not None:
+                other.add(i)
+    found = [cols[i] for i in sorted(cur - other) if i < len(cols)]
+    if found:
+        dax_engine.mark_currency_columns({'t': table}, {'t': found})
+    return table
 
 
 def _topo_sort(calc_defs: dict, existing_tables: dict) -> list:
@@ -2189,6 +2272,7 @@ def _parse_field_parameter(expr: str, tdef: dict) -> Optional[dict]:
 
 def _parse_datatable(expr: str, tdef: dict) -> Optional[dict]:
     """Parse DATATABLE("col", TYPE, ..., {{val1, val2}, ...})"""
+    from pbix_mcp.dax.engine import _int_literal
     # Find the data block (everything inside the outermost {})
     brace_pos = expr.find('{{')
     if brace_pos < 0:
@@ -2232,7 +2316,7 @@ def _parse_datatable(expr: str, tdef: dict) -> Optional[dict]:
     for block in row_blocks:
         values = [v.strip().strip('"\'') for v in block.split(',')]
         if len(values) >= len(col_names):
-            row = []
+            row: list = []
             for j, cn in enumerate(col_names):
                 raw = values[j]
                 if j < len(col_types):
@@ -2241,9 +2325,19 @@ def _parse_datatable(expr: str, tdef: dict) -> Optional[dict]:
                     ct = 'STRING'
 
                 if ct == 'INTEGER':
-                    try: row.append(int(float(raw)))
+                    # a whole literal exactly, past 2**53 too (#334)
+                    try: row.append(_int_literal(raw))
                     except: row.append(0)
-                elif ct in ('DOUBLE', 'CURRENCY'):
+                elif ct == 'CURRENCY':
+                    # rounded to 4 decimals as Desktop converts the literal
+                    # (issue #248; build_b254b.py a_fe_conv: 0.00035 is
+                    # 0.0004), a Currency column
+                    try:
+                        from pbix_mcp.dax.engine import _cur_from_double
+                        row.append(float(_cur_from_double(float(raw))))
+                    except Exception:
+                        row.append(0.0)
+                elif ct == 'DOUBLE':
                     try: row.append(float(raw))
                     except: row.append(0.0)
                 elif ct == 'BOOLEAN':
@@ -2257,7 +2351,12 @@ def _parse_datatable(expr: str, tdef: dict) -> Optional[dict]:
             rows.append([raw])
 
     if rows:
-        return {'columns': col_names, 'rows': rows}
+        out = {'columns': col_names, 'rows': rows}
+        cur = [cn for cn, ct in zip(col_names, col_types) if ct == 'CURRENCY']
+        if cur:
+            from pbix_mcp.dax.engine import mark_currency_columns
+            mark_currency_columns({'t': out}, {'t': cur})
+        return out
     return None
 
 
@@ -2382,8 +2481,16 @@ def _to_date(v) -> Optional[date]:
     if isinstance(v, date):
         return v
     if isinstance(v, str):
-        try: return date.fromisoformat(v.split('T')[0][:10])
-        except: return None
+        # The date in the first ten characters before any 'T' when they are
+        # wholly an ISO extended date (YYYY-MM-DD), read as the engine reads
+        # one (_iso_moment, issue #242) on every Python: this was
+        # date.fromisoformat, which Python 3.11 widened to the basic format
+        # ('20240110') and week dates ('2024-W02-1', '2024W021'), so a text
+        # date column gave the generated calendar other years on 3.10 than
+        # on 3.11+ (issue #251). Each spelling 3.10 read reads as before.
+        from pbix_mcp.dax.engine import _iso_moment
+        m = _iso_moment(v.split('T')[0][:10])
+        return m.date() if m is not None else None
     if isinstance(v, (int, float)):
         try:
             ds = str(int(v))
@@ -2425,4 +2532,4 @@ def _convert_dax_result(result: list, tdef: dict) -> Optional[dict]:
             row.append(val)
         rows.append(row)
 
-    return {'columns': col_names, 'rows': rows}
+    return _untype_currency({'columns': col_names, 'rows': rows})

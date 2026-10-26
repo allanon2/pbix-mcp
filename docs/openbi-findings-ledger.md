@@ -40,8 +40,18 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-25 (0.9.147): docs 1-66 and GitHub issues/PRs #1-#246 are
-closed except #243; #247-#252 are open.** 0.9.147 closes PRs #205
+**Updated 2026-10-26 (0.9.148): docs 1-66 and GitHub issues #1-#252 and
+#254-#346 are closed; PR #253 is open.** 0.9.148 closes #243 (Desktop's
+storage-engine summation order), #247 (window relations that may have
+duplicate rows), #248 (Fixed Decimal results), #249 (eager evaluation in
+iterations), #250 (USERELATIONSHIP over DatePartOnly joins), #251 (ISO text in
+calc_tables and the encoder) and #252 (ordering past 2^53), and #254-#346: the
+further defects their Power BI Desktop 2.152 batteries exposed (build_b243*.py,
+build_b253*.py, build_b254*.py / b248c / b248g, build_b255*.py,
+build_b256*.py, build_b257*.py; 1,489 probes in four rounds).
+
+As of 0.9.147 (2026-10-25): docs 1-66 and GitHub issues/PRs #1-#246 were
+closed except #243; #247-#252 were open. 0.9.147 closes PRs #205
 and #206 (issues #229-#233: the bounded filter cache, per-source filter
 propagation, column-aggregate memo and running totals, per-context fixed
 costs, pbix_evaluate_dax_batch) and #234-#242, #244-#246: EXCEPT / INTERSECT
@@ -559,6 +569,21 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **GH #243, #247-#252, #254-#346** (#243 and #247-#252 reported in the
+  0.9.147 work; #254-#346 found by their Desktop batteries) -- CLOSED (0.9.148).
+  Storage-engine summation: storage order, RLE runs, 16,384-row chunks, filter
+  cuts, fused scans, value encoding (#243 and follow-ups); window functions'
+  duplicate-row refusal, MATCHBY, ROWNUMBER ties, ORDERBY's order argument,
+  current rows (#247 and follow-ups); Currency arithmetic, aggregates,
+  conversions, FORMAT, type unification (#248 and follow-ups); eager && / ||
+  in iterations, CALCULATE boolean filters, measure errors failing the caller,
+  IFERROR scope (#249 and follow-ups); date-part joins under USERELATIONSHIP,
+  TOTALxTD filter arguments, CROSSFILTER conflicts, RELATED without a row
+  (#250 and follow-ups); ISO text on every Python (#251); exact ordering past
+  2^53, Int64 meeting a Double, GENERATESERIES, TREATAS conversion, UNION
+  (#252 and follow-ups). Regression: tests/test_issue243_*.py ...
+  test_issue346_*.py (2,468 tests).
 
 - **GH #229-#242, #244-#246** (PRs #205, #206 by @allanon2; the rest found by
   0.9.146's units, settled by Desktop) -- CLOSED (0.9.147). Bounded filter

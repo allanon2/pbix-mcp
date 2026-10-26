@@ -10,15 +10,23 @@ ORDERBY(Dim[Region], ASC))), CONCATENATEX(Dim, [offd], ...) went from
 0.9.146's ',15,20' to ',,' and SUMX(Dim, [wind]) from 92 to 42. The same
 fault was older at the top level: [offd] under Dim[Region] = S was BLANK.
 
-Expected values come from the DAX rules, not from Desktop (no battery has
-measured window functions in measures yet): OFFSET, INDEX and WINDOW return
-rows OF THE RELATION, and CALCULATE applies them to every column of it; the
-current row is the relation's row named by the outer values of the ORDERBY
-and PARTITIONBY columns (MATCHBY when given); where those columns have
-several values, the function is evaluated for each existing combination and
-the rows are united (the documented "apply semantics"). For the shapes that
-0.9.146 answered from its caller row the values are 0.9.146's; the engine's
-own CALCULATE(CALCULATE(<body>)) written inline gives them too.
+The expected values were first derived from the DAX rules; Power BI Desktop
+2.152 has since answered every one of these shapes (build_b247.py; the probe
+ids are noted), and the values are its answers: OFFSET, INDEX and WINDOW
+return rows OF THE RELATION, and CALCULATE applies them to every column of
+it; where no row context names the current row, the relation's columns do,
+with the values they have in the filter context; where several rows are
+current, OFFSET / INDEX / WINDOW unite their rows and RANK / ROWNUMBER are
+BLANK (#247).
+
+Desktop refuted the cases over ALL(S), S and ALL(Fact) -- tables no
+relationship gives a key -- with "The relation parameter of OFFSET may have
+duplicate rows. This is not allowed." (#247), whatever the context, and
+ROWNUMBER(ALL(S), ORDERBY(S[Reg])) with "Duplicate rows detected in the
+relation parameter of the ROWNUMBER function." (#255); this
+file expected values there (0.9.146's, or the engine's). RANK of the two
+current rows under S[Reg] = "S" is BLANK, not their shared rank
+(#258).
 """
 from __future__ import annotations
 
@@ -93,17 +101,11 @@ CALLED_PER_ROW = [
                          'Dim[Region], ASC)', "S,W"),
     ("sumx_offset", "SUMX(Dim, [offd])", 35),
     ("sumx_window", "SUMX(Dim, [wind])", 92),
-    ("offset_all_fact", "SUMX(Fact, [prevf])", 22),
     ("offset_allselected", 'CONCATENATEX(Dim, [prevsel], ",", Dim[Region], ASC)', ",15,20"),
     ("growth_filter", 'CONCATENATEX(FILTER(Dim, [growth] > 0), Dim[Region], ",", '
                       'Dim[Region], ASC)', "N,S"),
     ("averagex_offset", "AVERAGEX(Dim, [prevsel])", 17.5),
-    ("partition_offset", 'CONCATENATEX(S, [off_p], ",", S[Cat], ASC)', ",30,,40"),
-    ("partition_index", 'CONCATENATEX(S, [idx_p], ",", S[Cat], ASC)', "30,30,40,40"),
-    ("partition_window", 'CONCATENATEX(S, [win_p], ",", S[Cat], ASC)', "30,65,40,115"),
     ("matchby_rownumber", 'CONCATENATEX(S, [rn_m], ",", S[Cat], ASC)', "4,3,2,1"),
-    # ORDERBY(S[Reg]) is not unique: the caller's other columns tell the rows apart
-    ("rownumber_ties_told_apart", 'CONCATENATEX(S, [rn_reg], ",", S[Cat], ASC)', "1,2,3,4"),
 ]
 
 
@@ -111,6 +113,36 @@ CALLED_PER_ROW = [
                          ids=[c[0] for c in CALLED_PER_ROW])
 def test_window_measure_called_per_row(expr, want):
     assert _ev(expr) == want
+
+
+DUP = "may have duplicate rows"
+TIE = "Duplicate rows detected in the relation parameter of the ROWNUMBER function."
+
+
+def _err(expr, filters=None):
+    """The error Desktop fails the measure with: it fails the whole query,
+    though the refusal is in a measure the query only references."""
+    assert _ev(expr, filters) is None
+    err = de._engine.eval_errors.get("m")
+    assert err, expr
+    return err
+
+
+@pytest.mark.parametrize("expr,fn", [
+    ("SUMX(Fact, [prevf])", "OFFSET"),                                     # w_offset_all_fact
+    ('CONCATENATEX(S, [off_p], ",", S[Cat], ASC)', "OFFSET"),              # w_partition_offset
+    ('CONCATENATEX(S, [idx_p], ",", S[Cat], ASC)', "INDEX"),               # w_partition_index
+    ('CONCATENATEX(S, [win_p], ",", S[Cat], ASC)', "WINDOW"),              # w_partition_window
+])
+def test_called_per_row_over_a_relation_without_a_key(expr, fn):
+    err = _err(expr)
+    assert DUP in err and f"of {fn} " in err, err
+
+
+def test_a_rownumber_tie_is_no_row_of_the_caller():
+    # w_rownumber_ties: ORDERBY(S[Reg]) ties; the caller's other columns did
+    # tell the rows apart (0.9.146 '1,2,3,4')
+    assert TIE in _err('CONCATENATEX(S, [rn_reg], ",", S[Cat], ASC)')
 
 
 def test_the_same_as_the_body_written_inline():
@@ -133,31 +165,42 @@ S_SOUTH = {"Dim.Region": ["S"], "Dim.Name": ["South"]}
     ("offd", S_SOUTH, 15),
     ("offd", {"Dim.Region": ["S"]}, 15),
     ("wind", S_SOUTH, 35),
-    ("offname", S_SOUTH, "North"),
-    # OFFSET of ALL(S) returns every column of row A: it overrides Cat = B
-    ("off_all", {"S.Cat": ["B"]}, 30),
-    ("off_allcol", {"S.Cat": ["B"]}, 30),
-    ("idx_all", {"S.Cat": ["B"]}, 30),
-    ("win_all", {"S.Cat": ["B"]}, 65),
-    ("off_p", {"S.Cat": ["B"]}, 30),
-    ("rn_m", {"S.Cat": ["B"]}, 3),
-    # one group of a visual by S[Cat]
-    ("off_p", {"S.Cat": ["D"]}, 40),
-    ("idx_p", {"S.Cat": ["D"]}, 40),
-    ("win_p", {"S.Cat": ["D"]}, 115),
-    # filters on two columns: the second tells the Reg = N rows apart
-    ("rn_reg", {"S.Reg": ["N"], "S.V": [35]}, 2),
+    ("offname", S_SOUTH, "North"),                      # f_offname_ss
+    ("off_allcol", {"S.Cat": ["B"]}, 30),               # f_off_allcol_b
+    ("rn_m", {"S.Cat": ["B"]}, 3),                      # f_rn_m_b
 ])
 def test_filter_context_names_the_current_row(measure, filters, want):
     assert _ev(f"[{measure}]", filters) == want
 
 
+@pytest.mark.parametrize("measure,filters,fn", [
+    ("off_all", {"S.Cat": ["B"]}, "OFFSET"),            # f_off_all_b
+    ("idx_all", {"S.Cat": ["B"]}, "INDEX"),             # f_idx_all_b
+    ("win_all", {"S.Cat": ["B"]}, "WINDOW"),            # f_win_all_b
+    ("off_p", {"S.Cat": ["B"]}, "OFFSET"),              # f_off_p_b
+    # one group of a visual by S[Cat]
+    ("off_p", {"S.Cat": ["D"]}, "OFFSET"),              # f_off_p_d
+    ("idx_p", {"S.Cat": ["D"]}, "INDEX"),               # f_idx_p_d
+    ("win_p", {"S.Cat": ["D"]}, "WINDOW"),              # f_win_p_d
+])
+def test_a_named_row_of_a_relation_without_a_key(measure, filters, fn):
+    err = _err(f"[{measure}]", filters)
+    assert DUP in err and f"of {fn} " in err, err
+
+
+def test_filters_on_two_columns_tell_no_tie_apart():
+    # f_rn_reg_n35: the second filter told the Reg = N rows apart (0.9.146: 2)
+    assert TIE in _err("[rn_reg]", {"S.Reg": ["N"], "S.V": [35]})
+
+
 @pytest.mark.parametrize("cat", ["A", "B", "C", "D"])
-def test_an_explicit_table_relation_is_evaluated_in_the_context(cat):
-    # OFFSET(-1, S, ...) under S[Cat] = <cat>: the relation is that one row
-    # (the reason a visual's "previous" uses ALLSELECTED); the visual axis
-    # answered the previous group's sum
-    assert _ev("[off_tbl]", {"S.Cat": [cat]}) is None
+def test_an_explicit_table_relation_is_refused_in_every_context(cat):
+    # OFFSET(-1, S, ...) under S[Cat] = <cat>: S has no key, so Desktop
+    # refuses it before it reads the one row the context leaves (f_off_tbl_a,
+    # f_off_tbl_c); the visual axis answered the previous group's sum, and
+    # 0.9.147 BLANK
+    err = _err("[off_tbl]", {"S.Cat": [cat]})
+    assert DUP in err and "of OFFSET " in err, err
     assert _ev("[sv]", {"S.Cat": [cat]}) is not None
 
 
@@ -169,30 +212,42 @@ def test_an_explicit_table_relation_is_evaluated_in_the_context(cat):
     ('CONCATENATEX(GENERATESERIES(1, 2), [off], ",", [Value], ASC)', None, "35,35"),
     ('CONCATENATEX(GENERATESERIES(1, 2), [offd], ",", [Value], ASC)', None, "35,35"),
     ('CONCATENATEX(GENERATESERIES(1, 2), [win], ",", [Value], ASC)', None, "42,42"),
-    # a total: the previous row of every row, per partition
-    ("[off_p]", None, 70),
-    ("[idx_p]", None, 70),
-    ("[win_p]", None, 180),
-    ("[off_all]", None, 105),
     # a group of a visual by S[Reg]: C and D are current
-    ("[off_all]", {"S.Reg": ["S"]}, 75),
-    ("[off_allcol]", {"S.Reg": ["S"]}, 40),
-    ("[off_tbl]", {"S.Reg": ["S"]}, 40),
-    ("[win_p]", {"S.Reg": ["N"]}, 65),
-    ('CONCATENATEX(VALUES(S[Reg]), [off_p], ",", S[Reg], ASC)', None, "30,40"),
+    ("[off_allcol]", {"S.Reg": ["S"]}, 40),                         # u_reg_s_off_allcol
 ])
 def test_several_current_rows_unite(expr, filters, want):
     assert _ev(expr, filters) == want
 
 
+@pytest.mark.parametrize("expr,filters,fn", [
+    # a total: the previous row of every row, per partition
+    ("[off_p]", None, "OFFSET"),                                    # u_total_off_p
+    ("[idx_p]", None, "INDEX"),                                     # u_total_idx_p
+    ("[win_p]", None, "WINDOW"),                                    # u_total_win_p
+    ("[off_all]", None, "OFFSET"),                                  # u_total_off_all
+    ("[off_all]", {"S.Reg": ["S"]}, "OFFSET"),                      # u_reg_s_off_all
+    ("[off_tbl]", {"S.Reg": ["S"]}, "OFFSET"),                      # u_reg_s_off_tbl
+    ("[win_p]", {"S.Reg": ["N"]}, "WINDOW"),                        # u_reg_n_win_p
+    ('CONCATENATEX(VALUES(S[Reg]), [off_p], ",", S[Reg], ASC)', None, "OFFSET"),  # u_values_off_p
+])
+def test_several_current_rows_of_a_relation_without_a_key(expr, filters, fn):
+    err = _err(expr, filters)
+    assert DUP in err and f"of {fn} " in err, err
+
+
 def test_a_scalar_window_function_of_several_rows():
-    # RANK: the Reg = S rows share the rank; ROWNUMBER has no one answer
-    assert _ev("[rk_reg]", {"S.Reg": ["S"]}) == 2
-    assert _ev("[rn_reg]", {"S.Reg": ["S"]}) is None
+    # RANK of the Reg = S rows, which share the rank: BLANK (u_rk_reg_s);
+    # ROWNUMBER: ALL(S) ties on S[Reg] (u_rn_reg_s)
+    assert _ev("[rk_reg]", {"S.Reg": ["S"]}) is None
+    assert de._engine.eval_errors.get("m") is None
+    assert TIE in _err("[rn_reg]", {"S.Reg": ["S"]})
 
 
 def test_a_total_sorts_each_partition_once(monkeypatch):
-    # four current rows in two partitions: two sorts, not one per row
+    # four current rows in two partitions: two sorts, not one per row. The
+    # relation is a column list, which Desktop accepts (build_b253.py
+    # o_allcols_p ',A,,C' per row); at the total B and D are united with
+    # their previous rows A and C: 30 + 40
     calls = []
     orig = de.DAXEngine._win_sort
 
@@ -201,7 +256,12 @@ def test_a_total_sorts_each_partition_once(monkeypatch):
         return orig(self, rows, *a, **k)
 
     monkeypatch.setattr(de.DAXEngine, "_win_sort", counting)
-    assert _ev("[off_p]") == 70
+    MEASURES["off_lp"] = ("CALCULATE(SUM(S[V]), OFFSET(-1, ALL(S[Reg], S[Cat]), "
+                          "ORDERBY(S[Cat]), PARTITIONBY(S[Reg])))")
+    try:
+        assert _ev("[off_lp]") == 70
+    finally:
+        del MEASURES["off_lp"]
     assert sorted(calls) == [2, 2]
 
 

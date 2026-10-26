@@ -479,9 +479,13 @@ class TestEngineMemoAgreesWithFreshEvaluation:
         r, errors = self._run(names)
         assert r[measure] == value
         # eval_errors keeps what a requested measure let through, not what
-        # an IFERROR / ISERROR caught
-        uncaught = {"Plus", "Twice", "BadThenSafe", "SafeThenBad"}
-        assert errors == ({"Bad": self.BOOM} if uncaught & set(names) else {})
+        # an IFERROR / ISERROR caught: Bad's error and every measure it
+        # failed on the way -- a referenced measure's error is its caller's
+        # (#266; Desktop 2.152, build_b134.py measure_used)
+        fails = {"Plus": {"Bad", "Plus"}, "Twice": {"Bad", "Plus", "Twice"},
+                 "BadThenSafe": {"Bad", "BadThenSafe"}, "SafeThenBad": {"Bad", "SafeThenBad"}}
+        want = set().union(*(fails.get(n, set()) for n in names))
+        assert errors == dict.fromkeys(want, self.BOOM)
 
     def test_a_shared_memo_keeps_the_values_and_the_errors(self):
         cache: dict = {}
@@ -493,7 +497,9 @@ class TestEngineMemoAgreesWithFreshEvaluation:
 
     def test_a_shared_memo_reports_the_nested_error_of_a_repeated_context(self):
         cache: dict = {}
-        want = ({"B": None, "N": None}, {"N": "[DAX_EVAL_FAILED] DAX ERROR(): bad x"})
+        # B fails with the N it references (#266)
+        want = ({"B": None, "N": None}, {"N": "[DAX_EVAL_FAILED] DAX ERROR(): bad x",
+                                         "B": "[DAX_EVAL_FAILED] DAX ERROR(): bad x"})
         assert self._run(["B", "N"]) == want
         assert self._run(["B", "N"], cache=cache) == want
         assert self._run(["B", "N"], cache=cache) == want

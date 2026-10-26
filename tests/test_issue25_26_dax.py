@@ -122,8 +122,11 @@ def test_r23_1_window_functions_grouped(tmp_path):
         {"table": "S", "name": "Base", "expression": "SUM(S[V])"},
         {"table": "S", "name": "rn", "expression":
             "ROWNUMBER(ORDERBY(S[Cat]))"},
+        # ORDERBY's order is its own argument: the space form
+        # ORDERBY(S[Cat] DESC), which this test used, is a syntax error in
+        # Power BI Desktop 2.152 (build_b253b.py g_space; #259)
         {"table": "S", "name": "rkw", "expression":
-            "RANK(ORDERBY(S[Cat] DESC))"},
+            "RANK(ORDERBY(S[Cat], DESC))"},
         {"table": "S", "name": "off", "expression":
             "CALCULATE(SUM(S[V]), OFFSET(-1,,ORDERBY(S[Cat])))"},
         {"table": "S", "name": "idx1", "expression":

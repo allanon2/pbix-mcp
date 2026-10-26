@@ -19,17 +19,21 @@ the conformance fixture.
 either matches Power BI Desktop through the per-function conformance
 harness, or Desktop/the engine itself refuses it in every authorable shape,
 with the refusal recorded. The exact tallies are derivable from the
-committed artifacts: 260 functions carry value goldens in
-`tests/conformance/golden.json`, 175 core functions predate the harness and
-are pinned by full-corpus parity, and 32 carry only Desktop-error records.
+committed artifacts: 257 functions carry value goldens in
+`tests/conformance/golden.json`, 178 core functions predate the harness and
+are pinned by full-corpus parity (INDEX, OFFSET and WINDOW among them since
+their fixture goldens became Desktop refusals -- the fixture's F has no key,
+issue #247 -- and are pinned by the Desktop battery tests instead), and 32
+carry only Desktop-error records.
 
-Implemented-and-verified means one of two proof levels: **260** functions have
+Implemented-and-verified means one of two proof levels: **257** functions have
 per-function goldens captured from the live Desktop engine and replayed by
 `tests/test_dax_conformance.py` (the ratchet: no "unsupported" escape hatch,
-1e-9 relative tolerance), and **175** core functions predate the harness and
+1e-9 relative tolerance), and **178** core functions predate the harness and
 are pinned by full-corpus parity (every comparable cell of the 24-report corpus,
-v0.9.63). An unimplemented function returns `None` with status
-`"unsupported"`; it is never guessed.
+v0.9.63; INDEX, OFFSET and WINDOW by the Desktop batteries of issue #247). An
+unimplemented function returns `None` with status `"unsupported"`; it is never
+guessed.
 
 `CEILING.MATH` and `FLOOR.MATH` appear in some DAX documentation but are
 **not in the engine's MDSCHEMA_FUNCTIONS inventory at all** — Desktop cannot

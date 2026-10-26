@@ -520,7 +520,7 @@ class ModelReader:
         return result
 
     def get_table(self, table_name: str, max_rows: int = 0,
-                  include_calculated: bool = True) -> dict:
+                  include_calculated: bool = True, with_storage: bool = False) -> dict:
         """
         Read actual table data from the VertiPaq store.
 
@@ -528,6 +528,11 @@ class ModelReader:
         (AMO Type=2), whose values are stored in VertiPaq just like data
         columns. They used to be omitted, so a table reported a calculated
         column in ``schema`` that never appeared in its data.
+
+        ``with_storage`` also returns the table's physical layout as
+        ``storage`` (read_table_from_abf): the DAX engine adds a Double column
+        along its runs, as Power BI Desktop's storage engine does (issue
+        #243). Rows cut by ``max_rows`` have no layout.
 
         Parameters
         ----------
@@ -545,11 +550,12 @@ class ModelReader:
 
         result = read_table_from_abf(
             self._abf_bytes, table_name, self._metadata_db_bytes,
-            include_calculated=include_calculated,
+            include_calculated=include_calculated, with_storage=with_storage,
         )
 
         if max_rows > 0 and len(result["rows"]) > max_rows:
             result["rows"] = result["rows"][:max_rows]
+            result.pop("storage", None)
 
         return result
 

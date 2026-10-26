@@ -324,7 +324,9 @@ def test_ties_pick_desktops_keys(probe, expr, want, key):
 def test_order_errors_name_the_function():
     eng = de.DAXEngine()
     ctx = de.DAXContext(TABLES, {})
-    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in the function SAMPLE"):
+    # Desktop's English text (build_b257c.py e_cx_iferror, e_topn_iferror;
+    # #330)
+    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in SAMPLE function"):
         eng._eval_expr(_sample(3, _t(10), "[v]", "2"), ctx)
     with pytest.raises(de._DAXEvaluationError, match="non-negative sample size"):
         eng._eval_expr(_sample(-1, _t(10), "[v]", "ASC"), ctx)

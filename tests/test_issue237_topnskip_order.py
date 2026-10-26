@@ -80,5 +80,7 @@ def test_no_ties_past_n():
 def test_an_order_that_is_no_order_is_an_error():
     assert _engine(_skip(3, 0, T10, "[v], 2")) == "ERROR"
     eng = de.DAXEngine()
-    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in the function TOPNSKIP"):
+    # Desktop's English text, as TOPN's (build_b257c.py e_topn_iferror;
+    # #330)
+    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in TOPNSKIP function"):
         eng._eval_expr(f"TOPNSKIP(3, 0, {T10}, [v], 2)", de.DAXContext(TABLES, {}))

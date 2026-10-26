@@ -200,8 +200,25 @@ def _convert_value_for_dict(value, data_type: str):
         elif isinstance(value, (int, float)):
             return float(value)
         else:
-            # Try parsing string
-            dt = _dt.datetime.fromisoformat(str(value))
+            # Text: an ISO 8601 date or date-time in the extended format, read
+            # as the engine reads it on every Python (engine._iso_moment, issue
+            # #242): an offset or 'Z' is dropped and the wall-clock time kept.
+            # This was datetime.fromisoformat, whose grammar widened in Python
+            # 3.11: one model built on 3.11+ and failed on 3.10 with a value
+            # '2024-01-10T12:30:15.5' or '...T00:00:00.0000000', which now
+            # builds on every version, or with '20240110' (the basic format)
+            # or '2024W021' (a week date), which now fails on every version,
+            # as the engine reads no date in them (issue #251). A text with an
+            # offset failed everywhere (an aware datetime minus the naive
+            # epoch: TypeError), one with 'Z' on 3.11+ (on 3.10 ValueError).
+            # The parsers' accidents the engine refuses fail too, although
+            # Python read them as another moment than written ('T12.500' as
+            # 12:00:00.5); anything else raises ValueError, as before.
+            from pbix_mcp.dax.engine import _iso_moment
+            s = str(value)
+            dt = _iso_moment(s)
+            if dt is None:
+                raise ValueError(f"Invalid isoformat string: {s!r}")
             epoch = _dt.datetime(1899, 12, 30)
             return (dt - epoch).total_seconds() / 86400.0
     elif data_type == "Decimal":

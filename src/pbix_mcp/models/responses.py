@@ -129,7 +129,7 @@ class DAXResult(BaseModel):
     value: Any = None
     status: str = "ok"  # "ok" | "blank" | "unsupported" | "error"
     error_message: str | None = None
-    data_type: str | None = None  # "Int64"|"Double"|"String"|"DateTime"|"Boolean"
+    data_type: str | None = None  # "Int64"|"Double"|"Decimal"|"String"|"DateTime"|"Boolean"
     # The unsupported DAX functions THIS measure's evaluation depended on,
     # directly or through the measures it references. A value may still be
     # present: the engine reads an unsupported call as BLANK and carries on,
@@ -161,6 +161,14 @@ class DAXResult(BaseModel):
                 # bare (5, not 5.00). Labelling them "Double" made consumers
                 # pad counts to decimals (issue #40).
                 self.data_type = "Int64"
+            elif type(v).__name__ == '_Currency':
+                # A Fixed Decimal (Currency) result (the engine's _Currency,
+                # named here to keep this module free of the engine): the
+                # model's name for the type, as a Fixed Decimal column's
+                # DataType reads. Labelled "Double", it hid a Currency that
+                # Desktop types as one (ISCURRENCY TRUE: build_b254.py a_col,
+                # t_add; #317).
+                self.data_type = "Decimal"
             elif isinstance(v, float):
                 self.data_type = "Double"
             elif isinstance(v, str):

@@ -6,9 +6,10 @@
   orderBy (descending): TOPN(3, T, [a], [v]) ordered by [a] and then [v], and
   TOPN(3, T, [v], 2) by [v] and then the constant 2. Desktop pairs the
   arguments by position -- the one after an orderBy is its order -- and
-  refuses both queries: "Unexpected value for the ORDER argument in the
-  function TOPN. Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for
-  ascending order".
+  refuses both queries: "Unexpected value for ORDER argument in TOPN
+  function. Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for
+  ascending order." (Desktop's English, build_b257c.py e_topn_iferror;
+  #330).
 
 Expected values: Power BI Desktop 2.152 over ADOMD, one EVALUATE ROW("v", ...)
 per probe, run twice with the same answers (the TOPN side probes of
@@ -55,7 +56,8 @@ def test_matches_desktop(probe, expr, want):
 
 def test_order_error_names_topn():
     eng = de.DAXEngine()
-    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in the function TOPN"):
+    # Desktop's English text (build_b257c.py e_topn_iferror; #330)
+    with pytest.raises(de._DAXEvaluationError, match="ORDER argument in TOPN function"):
         eng._eval_expr(f"TOPN(3, {T10}, [v], 2)", de.DAXContext(TABLES, {}))
 
 

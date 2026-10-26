@@ -671,12 +671,12 @@
  ],
  "INDEX": [
   {
-   "expr": "SUMX(INDEX(1, F, ORDERBY(F[v])), F[v])",
-   "value": "50"
+   "error": "Desktop 2.152, build_b253b.py q_cf_index (EVALUATE ROW of this expression; issue #247): Query (1, 33) Relasjonsparameteren INDEX kan ha dupliserte rader. Dette er ikke tillatt. (The 2026-07-31 capture's 50 was over a fixture whose F was the one side of D -> F.)",
+   "expr": "SUMX(INDEX(1, F, ORDERBY(F[v])), F[v])"
   },
   {
-   "expr": "SUMX(INDEX(-1, F, ORDERBY(F[v])), F[v])",
-   "value": "300"
+   "error": "Desktop 2.152, build_b253c.py b_cf_index_neg (this expression as a measure; issue #247): Relasjonsparameteren INDEX kan ha dupliserte rader. Dette er ikke tillatt. (The 2026-07-31 capture's 300 was over a fixture whose F was the one side of D -> F.)",
+   "expr": "SUMX(INDEX(-1, F, ORDERBY(F[v])), F[v])"
   }
  ],
  "INFO.ALTERNATEOFDEFINITIONS": [
@@ -1531,8 +1531,8 @@
  ],
  "OFFSET": [
   {
-   "expr": "SUMX(F, SUMX(OFFSET(-1, F, ORDERBY(F[v])), F[v]))",
-   "value": "350"
+   "error": "Desktop 2.152, build_b253b.py a_cf_offset (this expression as a measure; issue #247): Relasjonsparameteren OFFSET kan ha dupliserte rader. Dette er ikke tillatt. (The 2026-07-31 capture's 350 was over a fixture whose F was the one side of D -> F.)",
+   "expr": "SUMX(F, SUMX(OFFSET(-1, F, ORDERBY(F[v])), F[v]))"
   }
  ],
  "OPENINGBALANCEWEEK": [
@@ -2139,12 +2139,12 @@
  ],
  "WINDOW": [
   {
-   "expr": "SUMX(F, SUMX(WINDOW(1, ABS, 2, ABS, F, ORDERBY(F[v])), F[v]))",
-   "value": "600"
+   "error": "Desktop 2.152, build_b253b.py a_cf_window (this expression as a measure; issue #247): Relasjonsparameteren WINDOW kan ha dupliserte rader. Dette er ikke tillatt. (The 2026-07-31 capture's 600 was over a fixture whose F was the one side of D -> F.)",
+   "expr": "SUMX(F, SUMX(WINDOW(1, ABS, 2, ABS, F, ORDERBY(F[v])), F[v]))"
   },
   {
-   "expr": "SUMX(F, SUMX(WINDOW(-1, REL, 0, REL, F, ORDERBY(F[v])), F[v]))",
-   "value": "1000"
+   "error": "Desktop 2.152, build_b253c.py b_cf_window_rel (this expression as a measure; issue #247): Relasjonsparameteren WINDOW kan ha dupliserte rader. Dette er ikke tillatt. (The 2026-07-31 capture's 1000 was over a fixture whose F was the one side of D -> F.)",
+   "expr": "SUMX(F, SUMX(WINDOW(-1, REL, 0, REL, F, ORDERBY(F[v])), F[v]))"
   }
  ],
  "XIRR": [

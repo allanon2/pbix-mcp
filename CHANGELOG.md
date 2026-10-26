@@ -5,6 +5,802 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.148] - 2026-10-26
+
+The open issues #243 and #247-#252, and the 93 further defects (#254-#346) that their Power BI Desktop 2.152 batteries exposed. Every rule adopted here was measured on Desktop in four rounds of black-box probes (1,489 probes over built files and Desktop-saved files: `build_b243*.py`, `build_b253*.py`, `build_b254*.py` / `build_b248c.py` / `build_b248g.py`, `build_b255*.py`, `build_b256*.py`, `build_b257*.py`), or follows from exact arithmetic or Microsoft's published DAX reference where Desktop gave no answer.
+
+- **Sums of Double columns** now add as Desktop's storage engine does, bit for bit on one segment: the column's stored runs in storage order, an RLE run as value x rows, bit-packed runs in chunks of 16,384 rows, filter columns cutting the pieces, aggregations of one scan fused, value-encoded columns as exact integers (#243 and follow-ups). Over several segments Desktop's own answer varies from session to session; segment partials are added in segment order.
+- **Window functions** refuse what Desktop refuses (relations that may have duplicate rows, MATCHBY duplicates, ROWNUMBER ties, table-function columns) and name the current row as Desktop does; their ORDERBY values are read straight from the relation rows, 3 to 6.5 times faster.
+- **Fixed Decimal (Currency)** values keep their type through arithmetic, aggregates, functions, lineage and FORMAT, with Desktop's rounding and range.
+- **Evaluation order**: && / || evaluate every operand in an iteration's rows, CALCULATE's boolean filters mean FILTER(ALL(<columns>), <boolean>) and are never silently dropped, a referenced measure's error fails its caller, and errors Desktop raises outside IFERROR's reach escape it.
+
+Verified before release:
+
+- **Tests:** full suite 10,800 passed, 7 xfailed, on Python 3.13. The 2,468 tests this release adds (109 files) all pass; 1,602 of them fail on 0.9.147. On Python 3.10 2,467 pass; the other reads a Desktop-saved corpus file whose dictionaries need `xmhuffman`, a declared dependency missing from the local 3.10 install (0.9.147 cannot read that file there either; CI installs it).
+- **Desktop batteries:** 991 of the 995 value probes of this release's 21 batteries answer as Desktop does (0.9.147: 445); the other four are infinities and NaN that print alike on both sides (B243 78 of 78, 0.9.147 31). Earlier batteries: b210 56 of 56 (51), b247 47 of 47 (40), b234 25 of 26 (`1 / BLANK()`, infinity on both), b200 756 of 756.
+- **regress_check:** the earlier batteries' probes answer as on 0.9.147, two more as Desktop does (b133 `true_eq_1`, b134 `measure_used`).
+- **Corpus census** (1,508 measures in 31 files): 4 measures newly match Desktop, none that matched stopped matching. Measures that reference a measure missing from their model now report its error instead of BLANK.
+- **Lint and types:** ruff is clean. mypy is at 131 (0.9.147: 137).
+
+### Fixed — Double sums add as Desktop's storage engine adds them (issue #243)
+
+SUM, AVERAGE and AVERAGEA added a Double column correctly rounded (#246), and SUMX and AVERAGEX added left to right across the rows. Power BI Desktop 2.152 adds along the column's storage layout, so the last bits differed. SUM of ten rows of 0.1 is 0.9999999999999999 in Desktop and was 1; Agents' Total Sales ended ...215398 in Desktop and ...2154 here. Now:
+- **The layout reaches the engine.** The decoder hands over each column's runs (start, RLE or bit-packed), its encoding and Magnitude, and the segments (`read_table_from_abf(with_storage=True)`, `tables[t]['storage']`). A table without a decoded layout is one bit-packed run in row order. That is how Desktop reads what our builder writes; for calculated and hand-built tables it is an assumption no battery has probed.
+- **The kernel** (`pbix_mcp.dax.se_scan`). Pieces are the union of the run boundaries of the summed columns and of the filters' columns, through a relationship's join column too. An RLE piece adds value x rows. A bit-packed piece adds 16,384-row chunks, each folded left to right. A value-encoded column adds its integers exactly and divides once. Whole numbers and Fixed Decimal stay exact.
+- **SUMX and AVERAGEX** of an expression over a table's own columns, a FILTER's included, add over the same pieces. A bare column is read straight off the rows, 2.1x faster than 0.9.147.
+- **Averages** are that sum over the count.
+- **Running totals** (#231) replay the scan per window where the sums are not exact.
+
+Desktop batteries, 0.9.147 → now:
+- build_b243.py: 18 → 78 of 78 exact.
+- Agents: 9 → 42 of 42, and the follow-up 4 → 45 of 45.
+- Root Cause: 5 → 6 of 6, and 3 → 4 of 4.
+- b210: 51 → 56 of 56.
+- Census: 557 → 599 of 605 numeric answers; none that matched stopped matching.
+
+The correctly rounded rule of #246 is superseded. On the hot paths measured side by side, no case is more than 3.5% slower than 0.9.147. Tests: `tests/test_issue243_storage_kernel.py` (38; 31 fail on 0.9.147). test_issue241's Double expectations and test_issue246 now follow Desktop's b210 answers, and test_issue231's plain path is the scan.
+
+### Fixed — OFFSET / INDEX / WINDOW refuse a relation that may have duplicate rows (issue #247)
+
+Before it reads a row, Desktop (build_b253.py, build_b253b.py, build_b253c.py, build_b253d.py, b247) refuses an explicit relation of OFFSET / INDEX / WINDOW that it cannot prove duplicate-free when no MATCHBY is given: "The relation parameter of INDEX may have duplicate rows. This is not allowed." 0.9.147 answered most such relations with a value: `INDEX(1, ALL(S), ORDERBY(S[V]))` 'A', `SUMX(Fact, [prevf])` 22, `[off_all]` 105 at a total. An empty context or an empty SUMX gave BLANK.
+- **What Desktop proves duplicate-free:**
+  - a table with a key column: the one side of a relationship, active or not; both sides of a 1:1; never a many-to-many side;
+  - column lists, DISTINCT, SUMMARIZE, GROUPBY, SUMMARIZECOLUMNS and ALLEXCEPT;
+  - EXCEPT / INTERSECT of such a set;
+  - a SELECTCOLUMNS that keeps the key as columns;
+  - a CROSSJOIN of column lists or DISTINCT;
+  - TREATAS of a set, and TREATAS of another table onto a key column;
+  - GENERATESERIES and CALENDAR under INDEX / WINDOW where no current row is needed.
+- **What keeps its kind:** FILTER, TOPN, ADDCOLUMNS, CALCULATETABLE, VALUES, ALLSELECTED and ALLNOBLANKROW keep the kind of the table they wrap. A variable has its expression's kind.
+- **What is refused:**
+  - a table that no relationship keys;
+  - UNION, table constructors, DATATABLE and ROW;
+  - TREATAS of a constructor, and TREATAS of a bag or a keyed table onto columns none of which is a key;
+  - EXCEPT / INTERSECT of a table that may have duplicate rows;
+  - a CROSSJOIN with a keyed table (beside a column list or GENERATESERIES too) or with such a table;
+  - GENERATESERIES / CALENDAR where a current row is needed (OFFSET; WINDOW with a REL bound).
+  An ORDERBY over every column does not help.
+- **Static:** an empty relation, an empty context, a total and a query's own expression are refused alike. SUMX, AVERAGEX, MINX, MAXX, COUNTX, COUNTAX, PRODUCTX, STDEVX.P, GEOMEANX and FILTER over an empty table refuse too, outside IF / IFERROR. MEDIANX and PERCENTILEX.INC answer BLANK there, and RANKX answers 1. Each window call is checked with the variables of the measure it is written in.
+- **Errors:** the refusal fails the query, also from a measure the query only references. IFERROR / ISERROR around the function do not catch it. Around a reference to its measure they do: `IFERROR([h_off_all], -1)` is -1, where 0.9.147 gave 105.
+- **Conformance goldens:** INDEX, OFFSET and WINDOW over the fixture's F were captured with F the one side of D -> F. With F the many side, as the fixture is built today, Desktop refuses all five: build_b253b.py q_cf_index, a_cf_offset, a_cf_window; build_b253c.py b_cf_index_neg, b_cf_window_rel. golden.json records those refusals (354 value probes).
+
+Tests: `tests/test_issue247_window_duplicates.py` (147; 74 fail on 0.9.147). `tests/test_issue236_window_current_row.py` now holds b247's answers (26 of its 51 fail on 0.9.147).
+
+### Fixed — Fixed Decimal (Currency) keeps its type through arithmetic, aggregates and reads (issue #248, after #241)
+
+Desktop (b254, b254b, b248c, b247) holds a Currency as a signed 64-bit count of 1/10,000.
+
+- **Arithmetic:**
+  - Currency ± Currency or Int64 and Currency × Int64 are exact, wrapping past the range.
+  - Currency × Double is the count's Double product, rounded half away from zero: `CURRENCY(0.0001) * 0.5` is 0.0001.
+  - Currency / Int64 or Double is the count's quotient, rounded: `CURRENCY(1) / 3` is 0.3333.
+  - Anything divided by a Currency, and Currency × Currency, is a Double.
+  - Unary minus keeps the type.
+  - DIVIDE converts its alternate result to the division's type.
+- **Aggregates:**
+  - AVERAGE / AVERAGEX / AVERAGEA are the exact total over the count, rounded half away: `AVERAGE` of 0.1, 0.1, 0.2 is the Currency 0.1333.
+  - MEDIAN / MEDIANX / PERCENTILE(X) round a tie up.
+  - MIN / MAX / MINX / MAXX / MAXA / MINA are Currency.
+- **Reads:** a Currency column is a Currency when read in a row context, through RELATED, LOOKUPVALUE, VALUES, SELECTEDVALUE, EARLIER, SELECTCOLUMNS / ADDCOLUMNS copies or a natural join / GENERATE row, or as DATATABLE's CURRENCY.
+
+All of these were unrounded Doubles: `SUMX(TCur, TCur[v] * 2)` added Doubles, off by -22.2 in units of 1E-17. Model rows keep plain floats; the type comes from the schema at the read.
+
+Tests: `tests/test_issue248_currency_types.py` (57; 50 fail on 0.9.147).
+
+### Fixed — && / || / AND / OR in an iteration's rows, and FILTER's conjuncts (issue #249)
+
+Desktop (B255-B255d) evaluates every operand of a logical operator that reads the current row: `SUMX(TM, IF(TM[d] <> 0 && MOD(TM[n], TM[d]) = 1, 1))` is an error (ours 2).
+
+Operands that read nothing the row changes:
+- They are evaluated first, and one that decides decides alone, even if another of them fails.
+- Under a filter on a table they read, every operand runs.
+
+FILTER:
+- Over a model table, FILTER applies its column predicates first, including `RELATED(...) = value` and `RELATED(...) IN V`.
+- Its row-free conjuncts run next, once per scan, and then the rest as written.
+- Over VALUES, DISTINCT or ALL of one column, and in a one-column CALCULATE boolean filter, the conjuncts run as written.
+
+Tests: `tests/test_issue249_eager_logic.py` (137), `tests/test_issue249_hoisting_and_scans.py` (24), `tests/test_issue249_b255d_desktop.py` (66) and `tests/test_issue249_filter_free_once.py` (19).
+
+### Fixed — USERELATIONSHIP over an inactive DatePartOnly relationship joins by date part in every CALCULATE shape and every evaluation order (issue #250)
+
+Desktop (b256):
+- `CALCULATE([ShipSum], Cal[Date] = DATE(2024, 1, 2))` is 24.
+- `b_repro_inner` is 6431 (ours 15295).
+- The per-day series is "2048,1,6,24,8224,192,1536" (ours ",1,4,16,,64,1024").
+
+Ours answered by value in the measure-reference, nested, TREATAS, IN, Year, iterator and DATESYTD shapes:
+- `a_ship_jan2`, `a_nested_jan2` and `a_treatas_jan2` were 16.
+- `a_in_jan1_jan3` was 4 (Desktop 8230), `a_year2024` 1108 (9982), `e_iter_sumx` 1109 (12031) and `c_dytdshipinner_jan3` 20 (8254).
+- Only the filter-argument shape joined by date part (`a_arg_jan2` 24).
+
+In one cache the answers depended on what ran first: 8 probes on the fast path and 40 with `_FAST_PROPAGATION` off. `b_rtship_jan2` was 6431 fresh and 6175 after other probes, and the #231 review gave 303 or 355.
+
+The DatePartOnly joins are now those of every relationship, active or not, and a USERELATIONSHIP / CROSSFILTER context takes its own list's. The memo keys carry them, and #231's guard (`_range_joins_current`) is gone.
+
+b256: 118 of 118 (58 on 0.9.147). The answers are the same fresh, in one cache in both orders and in one batch, on both propagation paths. Tests: `tests/test_issue250_userelationship_date_part.py` (207; 97 fail on 0.9.147). `tests/test_issue231_aggregate_memo.py`'s date-part test and plant now encode Desktop's reading.
+
+### Fixed — calc_tables' date reading and the encoder's DateTime parse read ISO text the same way on every Python (issue #251)
+
+0.9.147 (#242) made the engine read ISO date-time text the same way on every Python version. `calc_tables._to_date` (the generated calendar's range over a fact table's date columns) and the encoder's DateTime parse (a text value in a DateTime column of a built model) kept their own `fromisoformat` call, whose grammar widened in Python 3.11: '20240110' and week dates read on 3.11+ only, '...T12:30:15.5' and .NET's '...T00:00:00.0000000' built on 3.11+ and failed on 3.10, and any 'Z' or offset failed with a TypeError. Both now read text as the engine does (`engine._iso_moment`): the extended format on every version, an offset dropped and the wall-clock time kept; the basic format, week dates and the parsers' accidents ('T12.500' read as 12:00:00.5) are refused. `_to_date` reads every spelling Python 3.10 read as before. A differential over 937,019 generated strings gives one answer per string on 3.10, 3.11 and 3.13. Tests: `tests/test_issue251_version_independent_dates.py` (103; 30 fail on 0.9.147 under 3.13, 18 under 3.10).
+
+### Fixed — TOPN, TOPNSKIP, SAMPLE, CONCATENATEX's order, RANKX, RANK.EQ and FIRST/LASTNONBLANK order Int64 values exactly past 2^53 (issue #252)
+
+Desktop (b257, b257c), over 2^53 - 1 .. 2^53 + 4:
+- `TOPN(1, TK, TK[K], DESC)` is one row; ours returned two, tied through their shared Double.
+- `RANKX(ALL(TK), TK[K])` ranks 6,5,4,3,2,1 (ours 6,4,4,3,1,1).
+- `SAMPLE(4, TK, TK[K], ASC, TK[L], DESC)` picks a, c, d, f (ours a, b, d, e).
+- `CONCATENATEX(TKR, TKR[L], "", TKR[K], ASC)` is abcdef (ours acbdfe).
+- `RANK.EQ(9007199254740993, TK[K], 1)` is 3 (ours 2).
+- `RANKX(ALL(TK), TK[K], 9007199254740991.0, DESC, DENSE)` is 4 (ours 3): the value is compared with each key as a Double, but the keys stay distinct.
+
+The sort keys, RANKX's keys and RANK.EQ keep each number's exact value. A Double among one orderBy's numbers, or among RANKX's keys, makes its Int64 values Doubles (#325). Tests: `tests/test_issue252_order_past_2_53.py` (66; 38 fail on 0.9.147).
+
+Window functions (part of #252): RANK, ROWNUMBER, INDEX, OFFSET and WINDOW order Int64 values past 2^53 exactly. Examples, as Desktop answers (build_b257.py, build_b257b.py): w_rank_dense_r '1,2,3,4,5,6' where 0.9.147 gave '1,3,2,4,6,5', and wi_keyed 'f' where it gave 'e'. A plain date sorts as the moment it starts, no longer as text. Tests: `tests/test_issue252_window_order_exact.py` (13; 10 fail on 0.9.147).
+
+### Fixed — MATCHBY values that repeat are refused (issue #254)
+
+Desktop (build_b253.py, build_b253b.py, build_b253c.py) fails INDEX, OFFSET, ROWNUMBER and RANK when the MATCHBY values, with the PARTITIONBY values, repeat in the relation's data: "Despite MatchBy columns being specified, duplicate rows occur in the relation parameter of INDEX. This is not allowed." IFERROR / ISERROR catch it neither around the function nor around a reference to its measure (a_ife_mb_ref, a_iserr_mb_ref). 0.9.147 took the first matching row: i_mb_reg 'A', rn_mb_reg '1,2,3,4', a_ife_mb_ref 'A'. Values that repeat only across partitions, or two columns unique together, are accepted (i_mb_part ',A,,A', i_mb_two ',A,B,A'). Tests: `tests/test_issue254_matchby_duplicates.py` (14; 7 fail on 0.9.147).
+
+### Fixed — ROWNUMBER refuses tied rows (issue #255)
+
+Desktop (build_b253.py, build_b253b.py, b247) fails ROWNUMBER over a relation that may have duplicate rows when two rows tie on PARTITIONBY and ORDERBY: "Duplicate rows detected in the relation parameter of the ROWNUMBER function." The tie counts anywhere in the relation, whatever the current row (rn_t3_c, rn_t3_d), identical rows included (hp_rn_sd2). Neither IFERROR around ROWNUMBER nor IFERROR around a reference to its measure catches it. 0.9.147 numbered the tied rows ('1,2,3,4' for w_rownumber_ties, '1,1,3' for hp_rn_sd2) or answered BLANK. Tests: `tests/test_issue255_rownumber_ties.py` (12; 9 fail on 0.9.147).
+
+### Fixed — ROWNUMBER / RANK refuse a relation of table-function columns only (issue #256)
+
+Desktop (build_b253.py, build_b253b.py, build_b253c.py) refuses ROWNUMBER and RANK over a relation whose every column was added by a table function, such as a table constructor or GENERATESERIES, inline or through a variable: "The relation parameter of ROWNUMBER contains only columns added by DAX table functions. This is not supported." IFERROR catches it neither around the function nor around a reference to its measure (a_ife_built_ref). 0.9.147 numbered and ranked them (rn_ctor '1,2,3', rk_ctor '1,1,2'; a_ife_built_ref '21'). A SELECTCOLUMNS of a model column keeps the column's lineage and is accepted (b_selcols_rn). Tests: `tests/test_issue256_built_columns.py` (8; 7 fail on 0.9.147).
+
+### Fixed — ORDERBY ties are broken by the relation's key, ascending (issue #257)
+
+Desktop (build_b253.py, build_b253b.py group D) appends a duplicate-free relation's key to ORDERBY to break its ties, always ascending: a keyed table's key and not its other columns, a column list's columns in the list's order, MATCHBY's columns. 0.9.147 kept tied rows in storage order (rn_dim2_cat '2,1,3' for '1,2,3', o_dim2_cat '2,,1' for ',1,2'). Tests: `tests/test_issue257_tiebreak_key.py` (13; 7 fail on 0.9.147).
+
+### Fixed — RANK / ROWNUMBER name the current row by the relation's columns (issue #258)
+
+Where no row context names the current row, Desktop (build_b253.py, build_b253b.py, b247) names it by the relation's own columns: the key, the columns of a keyless table, the column list, or MATCHBY. It takes their values in the filter context, cross-filtered values included. Several current rows make RANK / ROWNUMBER BLANK even when their ranks agree. 0.9.147 read only direct filters on the ORDERBY / PARTITIONBY columns: `CALCULATE([rn], S[Cat] = "C")` was BLANK where Desktop answers 3. It also returned the shared rank of several rows: rk_dim2_g1 was 1 where Desktop answers BLANK. Tests: `tests/test_issue258_current_row.py` (26; 9 fail on 0.9.147).
+
+### Fixed — ORDERBY's argument after an expression is its order (issue #259)
+
+Desktop (build_b253b.py group G, build_b253c.py) reads the argument after each ORDERBY expression as its order. ASC / 1 / TRUE / TRUE() sort ascending and DESC / 0 / FALSE / FALSE() descending. Anything else, a column or 2 included, fails the measure: "Unexpected value for the ORDER argument in the function ORDERBY. Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order." That happens wherever the call is, even in an IF branch never taken (a_order_untaken). IFERROR does not catch it around the call, only around a reference to the measure. Comments are no part of an argument. The space form `ORDERBY(T[C] DESC)` is an error, which IFERROR around a reference also catches (a_ife_space_ref). 0.9.147 sorted 0 / FALSE ascending, read a second column as the next sort key, accepted the space form, and answered "ok" for a_order_untaken. Tests: `tests/test_issue259_orderby_order.py` (27; 13 fail on 0.9.147).
+
+### Fixed — ALLEXCEPT as a table is the other columns' distinct rows (issue #260)
+
+Desktop (build_b253b.py group J) answers COUNTROWS(ALLEXCEPT(T3, T3[Cat])) 3, T3's distinct (Reg, V), and an INDEX over ALLEXCEPT(S, S[Cat]) reads its S[Reg] (build_b253.py i_allexcept_s 'N'). 0.9.147 returned the first column's value once per distinct full row: 4 rows, and the column markers printed as text in CONCATENATEX. Tests: `tests/test_issue260_allexcept_table.py` (3 + 1 xfail; 3 fail on 0.9.147).
+
+### Fixed — window functions in a row context find the row in a narrower relation (issue #261)
+
+Inside an iteration of T, Desktop (build_b257.py, build_b257b.py group G) finds the iterated row in a relation of some of T's columns, such as ALL(T[c]) or ALL(T[a], T[b]), with PARTITIONBY too: `CONCATENATEX(TS3, ROWNUMBER(ALL(TS3[G], TS3[H]), ...))` is '1,2,3,1'. 0.9.147 found no row (',,') or took the relation's first row for every row ('1,1,1,1'). Tests: `tests/test_issue261_narrow_relation.py` (5; all fail on 0.9.147).
+
+### Fixed — PARTITIONBY over columns a table function added fails the measure (issue #262)
+
+Desktop (build_b253c.py c_gs_idx_part; build_b253d.py group A) refuses a window function whose PARTITIONBY names a column a DAX table function added, such as GENERATESERIES' [Value] or a column ADDCOLUMNS added: "The function PARTITIONBY cannot be used with columns added by DAX table functions."
+- It is a definition error of the measure: it fails the measure also in an IF branch never taken, and it comes before the duplicate-rows and built-columns refusals.
+- IFERROR around a reference to the measure catches it.
+
+0.9.147 answered `CONCATENATEX(GENERATESERIES(1, 3), CONCATENATEX(INDEX(1, GENERATESERIES(1, 3), ORDERBY([Value]), PARTITIONBY([Value])), [Value]), ",", [Value], ASC)` with '1,2,3', answered the untaken branch 'ok', and failed an ADDCOLUMNS column with "Measure or column '[g]' cannot be found".
+
+Tests: `tests/test_issue262_partitionby_built_columns.py` (8; 6 fail on 0.9.147).
+
+### Fixed — TREATAS used as a table has the rows of its target columns (issue #263)
+
+Desktop (build_b253c.py d_treatas_set, d_treatas_bag_cols) reads a TREATAS relation of OFFSET / INDEX / WINDOW / ROWNUMBER / RANK as rows of its target columns: `INDEX(1, TREATAS(VALUES(Dim[Region]), S[Reg]), ORDERBY(S[Reg]))` gives S[Reg] 'N'.
+
+0.9.147 answered BLANK, and read no row of a TREATAS anywhere a table is read:
+- `COUNTROWS(TREATAS(VALUES(S[Reg]), Dim[Region]))` was BLANK where the table holds two regions, and SUMX, CONCATENATEX and FILTER over it were BLANK.
+- A variable holding a TREATAS filtered nothing as a CALCULATE filter.
+- TREATAS of a one-column SELECTCOLUMNS kept the source column's lineage. As a CALCULATE filter it filtered nothing, so `CALCULATE(SUM(Fact[Value]), TREATAS(SELECTCOLUMNS(ALL(S), "c", S[Reg]), Dim[Region]))` was 42, where the regions N and S keep 35.
+
+As Desktop answers (build_b253d.py), the rows keep repeated values (`COUNTROWS(TREATAS(SELECTCOLUMNS(ALL(S), "c", S[Reg]), Dim[Region]))` is 4) and drop values the target column lacks (`COUNTROWS(TREATAS({"X", "N"}, Dim[Region]))` is 1).
+
+Tests: `tests/test_issue263_treatas_relation.py` (16; 13 fail on 0.9.147).
+
+### Fixed — CALCULATE boolean filters that are not one column against a value (issue #264)
+
+`CALCULATE(COUNTROWS(TM), TM[d] <> 0 && TM[n] = 7)` was read as `TM[d] <> (0 && TM[n] = 7)` (ours 3, Desktop 1). Some booleans applied no filter at all:
+- booleans that do not start with a column, such as `TC[n] + TC[d] = 3`, `T[k] * 2 > 4` or `MOD(TC[d], 2) = 1`;
+- booleans with a function at the top: `IF`, `SWITCH`, `COALESCE`, `CONTAINSROW`, `IFERROR`.
+
+A bare numeric column, `CALCULATE(COUNTROWS(TM), TM[d])`, applied the column's visible values; Desktop treats it as a boolean, 2 (ours 4). Such a filter is now `FILTER(ALL(<its columns>), <boolean>)`, as Microsoft Learn defines it. An && of one-column predicates on one table is applied as one column filter each. Desktop's answers k1-k5, k12, k14, k17, k18, k20 and k29-k37 all match. Tests: `tests/test_issue264_calculate_boolean_filters.py` (51; 40 fail on 0.9.147).
+
+### Fixed — CALCULATE intersects its filter arguments before a row error counts (issue #265)
+
+`CALCULATE(COUNTROWS(TM), TM[d] <> 0, FILTER(TM, MOD(TM[n], TM[d]) = 1))` failed on the rows that `TM[d] <> 0` excludes; Desktop answers 2 (B255 c4). An argument's row error now stands only when a row with those values survives the other filters and the outer filters the argument does not replace. That includes nested FILTERs and SUMMARIZE rows (B255c c29, c30). Desktop's answers c3, c4, c9, c10, c12-c21, c23, c29 and c30 all match. Tests: `tests/test_issue265_calculate_intersects_filter_args.py` (17; 11 fail on 0.9.147).
+
+### Fixed — a referenced measure's error fails the measure that references it (issue #266)
+
+A nested measure's error was degraded to BLANK. So `VAR x = [Bad] RETURN x` was BLANK, and `[Bad] + 1` answered 1 with status ok. Desktop fails the caller with the nested measure's error (b134 measure_used; B255 x18, f33, i12). IFERROR / ISERROR around the reference still catch it (b134: `IFERROR([Bad], 13)` is 13). eval_errors now names every measure the error failed. Tests: `tests/test_issue266_nested_measure_errors.py` (9; 4 fail on 0.9.147). `tests/test_issue134_135_lazy_vars_iferror.py` and `tests/test_issue233_evaluate_dax_batch.py` are updated.
+
+### Fixed — IFERROR / ISERROR do not catch an error raised in an iteration's rows (issue #267)
+
+`IFERROR(SUMX(TM, MOD(TM[n], TM[d])), -1)` answered -1. Desktop fails the query (B255b r9), and does the same for every iterator, for SUMMARIZECOLUMNS' groups and filter tables, for TOPN's and SAMPLE's N, and for CONCATENATEX's orderBy (B255c r26, r27; B255d r31, r32, r34).
+
+These are still caught: an IFERROR inside the row, an infinite result, CONCATENATEX's delimiter, RANKX's value and PERCENTILEX's k (B255c r28, B255d r29, r30). Tests: `tests/test_issue267_iferror_outside_iteration.py` (27; 20 fail on 0.9.147).
+
+### Fixed — ERROR with an argument that is not a text literal is refused (issue #268)
+
+Desktop refuses a query whose measure calls `ERROR(<not a text literal>)`, even in a branch that is never taken (B255b e16, e17, e18, e20; B255 e13; `ERROR(5)`, B255c y13). The message is "Function 'ERROR' expects argument number 1 to be a constant", and IFERROR does not catch it (y14). The engine now refuses before evaluating; it used to answer 0 or BLANK, or raise the computed text. Tests: `tests/test_issue268_error_needs_a_constant.py` (8; all fail on 0.9.147).
+
+### Fixed — SUMMARIZECOLUMNS drops rows whose expressions are all BLANK (issue #269)
+
+Groups on which every expression was BLANK were kept, so COUNTROWS / MAXX over the result counted them. Desktop (b118 raw queries) and Microsoft Learn leave them out: by_zone with `[s_in_calc]` is the one row (Z1, 4) (ours 2 rows), and with `[f_rows_allsel]` there is no row (ours 2). Tests: `tests/test_issue269_summarizecolumns_blank_rows.py` (7; 5 fail on 0.9.147).
+
+### Fixed — DIVIDE refuses an alternate result that is no constant (issue #270)
+
+Desktop refuses the alternate whether or not the division needs it, and whether or not the DIVIDE is ever reached, with "The alternate result to return on division by zero must be a constant numeric value":
+- `DIVIDE(1, 1, MOD(1, [m_zero]))` (B255b y3, y4);
+- a measure, `INT(2.5)` and `COUNTROWS(TM)` (B255c y10, y15, y16);
+- `1 + 1`, `-CURRENCY(2)`, `"7" & ""`, `INT(2.5) + 0` and a VAR bound to a measure (B255d y20, y21, y23, y24, y27);
+- the same DIVIDE in an IF branch that is never taken (y19).
+
+IFERROR does not catch the refusal. Literals, `.5`, `(-3)`, `TRUE()`, `DATE()`, `TIME()`, `CURRENCY()` and a VAR bound to a constant are taken. Tests: `tests/test_issue270_divide_alternate_constant.py` (17) and `tests/test_issue249_b255d_desktop.py` y19-y27.
+
+### Fixed — CALCULATE boolean filters with a measure, a nested CALCULATE, two tables or no column are refused (issue #271)
+
+Desktop refuses these with its messages (B255b k7, k9, k10, k11, k22; B255c k24, k35; B255d k40), and IFERROR does not catch the refusal (k25). The measure refusal applies even in an IF branch that is never taken (B255d k38). An aggregate is still fine, with a measure or a CALCULATE inside it (k8, k23, k39). Tests: `tests/test_issue271_boolean_filter_refusals.py` (9) and `tests/test_issue249_b255d_desktop.py` k38-k44.
+
+### Fixed — test isolation around the module's per-thread engine (issue #272)
+
+Undoing a monkeypatch of `_engine._eval_expr` put the bound method back onto the thread's engine, where it shadowed the class from then on. `tests/test_issue131_memo_shield.py` then failed when run after `tests/test_issue233_evaluate_dax_batch.py` (also after the #186 and #193 tests). The proxy now removes the attribute when the engine's own method is put back. Tests: `tests/test_issue272_engine_proxy_isolation.py` (2; both fail on 0.9.147).
+
+### Fixed — IN compares BLANK strictly (issue #273)
+
+`TM[d] IN {0, 2}` was TRUE for a BLANK `TM[d]`. IN is strict, as Microsoft Learn documents and Desktop answers: B255b k15 is 2, B255c k26 `IF(BLANK() IN {0, 2}, 1, 0)` is 0. Tests: `tests/test_issue273_in_is_strict_on_blank.py` (8; 6 fail on 0.9.147).
+
+### Fixed — comparison chains group from left to right, and IN binds tighter (issue #274)
+
+`IF(0 = 0 = TRUE(), 1, 0)` was 0, `1 < 2 = TRUE()` was read as `1 < (2 = TRUE())`, and `CALCULATE(COUNTROWS(TM), TM[d] = 0 = TRUE())` filtered nothing. Desktop groups comparisons from the left and applies IN first:
+- `2 IN {1, 2} = TRUE()` is 1;
+- `TM[d] IN {0, 2} = TRUE()` keeps 3 rows;
+- `1 = 1 IN {TRUE()}` is an error (B255d d1-d11).
+
+Tests: `tests/test_issue274_comparison_chains.py` (26; 17 fail on 0.9.147).
+
+### Fixed — a table of several values used as a value is an error (issue #275)
+
+`VALUES(TM[d]) = 7` over two values was FALSE, and `VALUES(TM[d]) + 0` was BLANK. Desktop fails both with "A table of multiple values was supplied where a single value was expected", and IFERROR catches it (B255c v15; B255d m1-m3). Tests: `tests/test_issue275_table_compared_as_value.py` (5) and `tests/test_issue249_b255d_desktop.py` m1-m3.
+
+### Fixed — a TRUE / FALSE IF or SWITCH returns FALSE, not BLANK, for an omitted or BLANK() branch (issue #276)
+
+`IF(FALSE(), TRUE())` was BLANK; Desktop answers FALSE. The same holds for a comparison, a measure that is one, IF.EAGER, a nested IF, an explicit `BLANK()` else and `SWITCH` without an else (B255c y6-y9, B255d b1-b9). IFs of numbers or text still return BLANK. Tests: `tests/test_issue276_boolean_if_omitted_else.py` (6) and `tests/test_issue249_b255d_desktop.py` b1-b9.
+
+### Fixed — DIVIDE's date alternate result is a number (issue #277)
+
+`DIVIDE(1, 0, DATE(2020, 1, 1))` returned the date; Desktop returns 43831, its serial number (B255c y18). TRUE() and text alternates stay as they are (y17, b139). Tests: `tests/test_issue277_divide_date_alternate.py` (3; 1 fails on 0.9.147).
+
+### Fixed — a column name with an apostrophe in comparisons and arithmetic (issue #278)
+
+`CALCULATE(COUNTROWS(TQ), TQ[it's] = 2)` applied no filter, and `FILTER(TQ, TQ[it's] = 2)` and `SUMX(TQ, TQ[it's] * 2)` were BLANK. The scanners read the apostrophe as the start of a quoted table name. Tests: `tests/test_issue278_apostrophe_in_column_name.py` (9; 7 fail on 0.9.147).
+
+### Fixed — TRUE / FALSE compared with a number is an error (issue #279)
+
+`IF(2 = 2 = 2, 1, 0)` answered 0, and `IF(1 = 1 IN {TRUE()}, 1, 0)` answered 1. Desktop fails both: "DAX comparison operations do not support comparing values of type True/False with values of type Integer", and the same from CONTAINSROW for IN (B255d d5, d11). Tests: `tests/test_issue279_true_false_compared_with_number.py` (14; 10 fail on 0.9.147).
+
+### Fixed — a bare text column as a CALCULATE filter (issue #280)
+
+`CALCULATE(COUNTROWS(TS), TS[s])` applied the column's visible values (3). Desktop converts each value to TRUE / FALSE and fails with "Cannot convert value 'x' of type Text to type True/False.", also under an outer filter on the column (B255d k41, k45). Tests: `tests/test_issue280_text_column_boolean_filter.py` (5; 4 fail on 0.9.147).
+
+### Fixed — an inactive DatePartOnly relationship gives its one side a blank row only for keys whose date part is missing (issue #281)
+
+Desktop (b256), Cal2 / G: the inactive DatePartOnly G[Ship] has ships that all fall on calendar days, four of them at a time of day.
+- `COUNTROWS(VALUES(Cal2[Date]))` is 5 with or without USERELATIONSHIP. Ours was 6 in both cases.
+- `g_blank_ship` is BLANK (ours 45).
+- The window is 3 whether it is written inside or beside the USERELATIONSHIP (ours 47 and 3).
+- The series is ",3,4,16,40" (ours "45,,2,,16,").
+
+The blank-row walk compares every relationship's keys by its own join, over the fact column's distinct values. Fixed by the same change as #250. Tests: `tests/test_issue281_inactive_date_part_blank_row.py` (32; 21 fail on 0.9.147).
+
+### Fixed — TOTALYTD / TOTALQTD / TOTALMTD and OPENING/CLOSINGBALANCE* apply their filter arguments (issue #282)
+
+`TOTALxTD(e, d, f)` is `CALCULATE(e, DATESxTD(d), f)`. Desktop (b256, b256b), under January 3:
+- `TOTALYTD(SUM(F[v]), Cal[Date], USERELATIONSHIP(F[Ship], Cal[Date]))` is 8254 (ours 8696, the filter dropped). TOTALMTD and TOTALQTD give the same.
+- With `F[pk] = 1` all three are 72 (ours 8696).
+- `ALL(F[pk])` lifts an outer `F[pk] = 1`: 8696 (ours 72).
+- `Cal[Year] = 2023` meets the 2024 dates: BLANK (ours 8696).
+- `CLOSINGBALANCEMONTH(.., USERELATIONSHIP(..))` is 1536 (ours 4096), and the opening balances are 1 (ours 4).
+
+TOTALYTD's lone third argument is the year end only when it is a string literal; a fourth argument is the year end (`t_ytd_ur_ye_j2` 31, ours 120). A filter on the date column itself intersects the period's dates (#294). Tests: `tests/test_issue282_totalxtd_filter_argument.py` (42; 38 fail on 0.9.147).
+
+### Fixed — USERELATIONSHIP and CROSSFILTER(.., None) of one relationship in one CALCULATE is Desktop's error (issue #283)
+
+The error is "The USERELATIONSHIP and CROSSFILTER functions are used in a single CALCULATE function to specify incompatible settings." (b256, b256b). It applies in either argument order, in either column order, and on the active relationship too; 0.9.147 let the last one written win (16383, 24).
+
+Desktop reports it before evaluating (b256c): IFERROR around it in the measure does not catch it, and a branch never taken fails too (ours 16383 and 1). IFERROR around a reference to such a measure catches it (b256d: -1). CROSSFILTER None on the other relationship of the pair is fine (24). Tests: `tests/test_issue283_userelationship_crossfilter_none.py` (12; 10 fail on 0.9.147); a_ref_conflict in `tests/test_issue284_related_without_row_context.py`.
+
+### Fixed — RELATED with no row context, or with no active relationship, is Desktop's error (issue #284)
+
+The error is "The column 'Cal[Bit]' either doesn't exist or doesn't have a relationship to any table available in the current context." It applies to (b256 `d_related_userel`, b256b `rl_*`, b256c `c_*`):
+- RELATED in CALCULATE's expression, which consumes the row, with or without USERELATIONSHIP / CROSSFILTER;
+- RELATED with no iterator;
+- RELATED with no active relationship to the column's table.
+
+0.9.147 read the related table's first visible row (172, 8, ...) or answered BLANK. Desktop checks a measure before evaluating it: `IF(FALSE(), <it>, 1)` fails too, and IFERROR in the same measure does not catch the error. Around a reference to such a measure it does: `IFERROR([RelBitUR], -1)` is -1, and so for every error Desktop reports before evaluating (b256d). `SUMX(F, VAR b = RELATED(..) RETURN CALCULATE(b, ..))` stays 172. Tests: `tests/test_issue284_related_without_row_context.py` (52; 49 fail on 0.9.147).
+
+### Fixed — a row transition's own filter does not reach a table its expansion holds (issue #285)
+
+Desktop (b256, b256b): `SUMX(F, CALCULATE(SUM(Cal[Bit]), USERELATIONSHIP(F[Ship], Cal[Date]), CROSSFILTER(F[Ship], Cal[Date], Both)))` is 172, each row's order day through the expansion. Ours was 16: the row's F filter and its P part also crossed F[Ship] both ways and met the order day only for row 13.
+
+The expansion holds Cal only while it filters Cal[Date], F's filters are the row's, and nothing is written on another part of it (b256c, b256d):
+- With `REMOVEFILTERS(Cal[Date])` it is 16.
+- With `F[pk] = 1` or `P[x] = 1`, kept or not, it is BLANK.
+- With `Cal[Bit] >= 1`, kept or not, it is 16.
+- With `REMOVEFILTERS(Cal)` it is 251, the ship days.
+
+Tests: `tests/test_issue285_transition_held_by_expansion.py` (54; 30 fail on 0.9.147).
+
+### Fixed — under USERELATIONSHIP a row's expansion reaches the iterated table through the activated relationship (issue #286)
+
+Desktop (b256b): `SUMX(F, CALCULATE(SUM(F[v]), USERELATIONSHIP(F[Ship], Cal[Date])))` is 8192 (ours 16383). Each row's order day, carried back through F[Ship], keeps only the rows shipped that day. The engine skipped that filter as implied by the row's own key, which holds only through the relationship the expansion was built through. Tests: `tests/test_issue286_expansion_reaches_iterated_table.py` (24; 10 fail on 0.9.147).
+
+### Fixed — a column read where no row context holds it is Desktop's error (issue #287)
+
+Desktop (b256c, b256b, b253c, b256d) answers "A single value for column 'v' in table 'F' cannot be determined. ..." in these cases:
+- Inside CALCULATE in an iteration: `SUMX(FILTER(F, F[Id] = 3), CALCULATE(F[v]))` (ours 8, the one visible value) and `SUMX(F, CALCULATE(F[v] + 0))` (ours BLANK).
+- Under an inner iteration past a CALCULATE: `SUMX(F, CALCULATE(SUMX(P, P[x] + F[v])))` (ours BLANK).
+- Under an iteration over other columns: `CONCATENATEX(ALL(S[Reg]), S[Cat], ",")` (ours ",") and `SUMX(FILTER(ALL(F[pk]), F[v] > 1), 1)` (ours BLANK).
+
+An unqualified `[v]` that is no measure under `SUMX(VALUES(F[pk]), ..)` is "Column 'v' cannot be found or may not be used in this expression." (ours BLANK).
+
+Desktop refuses these before evaluating: `IF(FALSE(), <it>, 1)` fails too, and IFERROR in the same expression does not catch the error. Around a reference to such a measure IFERROR does catch it (-1). A measure's expression is now checked first, conservatively. Tests: `tests/test_issue287_column_without_row_context.py` (48; 30 fail on 0.9.147).
+
+### Fixed — RELATED over a DatePartOnly relationship joins by date part (issue #288)
+
+Desktop (b256b):
+- `SUMX(H, RELATED(Cal3[Bit3]))` over the active DatePartOnly H[Order] is 8 (ours 1).
+- RELATED through an activated DatePartOnly F[Ship] is 251 (ours 110).
+
+Calculated columns: #295. Tests: `tests/test_issue288_related_date_part.py` (3; 2 fail on 0.9.147).
+
+### Fixed — an ISO year end ("2023-12-30") for DATESYTD / TOTALYTD (issue #289)
+
+Only "m/d" was read. Desktop (b256b):
+- `TOTALYTD(SUM(F[v]), Cal[Date], "2023-12-30")` under January 2 2024 is 124, as "12/30" is (ours 120).
+- Under December 31 2023 it is 4 (ours 7).
+
+The year part is ignored. Tests: `tests/test_issue289_iso_year_end.py` (4; 3 fail on 0.9.147).
+
+### Fixed — CROSSFILTER's OneWay_LeftFiltersRight / OneWay_RightFiltersLeft (issue #290)
+
+They were read as Both. Left is the first column's side.
+- On a many-to-one relationship, the one side filtering the many side is OneWay. Desktop (b256b): `x_rfl_bits` is 127 (ours 8).
+- The many side alone filtering the one side is Desktop's error, "The CROSSFILTER function cannot be used to enable only the many side of the many-to-one relationship to filter the one side." (ours 8, 192, 96).
+- Desktop reports it before evaluating: IFERROR does not catch it, and a branch never taken fails too (b256c). Around a reference to such a measure IFERROR catches it (b256d: -1).
+
+Tests: `tests/test_issue290_crossfilter_oneway_sides.py` (15; 9 fail on 0.9.147); a_ref_lfr in `tests/test_issue284_related_without_row_context.py`.
+
+### Fixed — a date filter clears the row transition's filters on the rest of the date table (#78) (issue #291)
+
+Desktop (b256b):
+- `SUMX(F, CALCULATE(SUM(Cal[Bit]), Cal[Date] = DATE(2024, 1, 2)))` is 112 (ours 16).
+- `SUMX(F, CALCULATE([XShipBits], Cal[Date] = ..))` is 16 (ours BLANK).
+
+The transition's Cal[Year] and Cal[Bit] counted as filters the CALCULATE wrote. Tests: `tests/test_issue291_date_filter_clears_transition.py` (6; 4 fail on 0.9.147).
+
+### Fixed — two CROSSFILTERs of one relationship in one CALCULATE are Desktop's error (issue #292)
+
+The error is "The cross-filtering direction of a relationship cannot be set (using the CROSSFILTER function) more than once in a single CALCULATE function." (b256b `x_two_cf`; ours 16383). Desktop reports it before evaluating: IFERROR does not catch it, and a branch never taken fails too (b256c). Around a reference to such a measure IFERROR catches it (b256d: -1). Two USERELATIONSHIPs of one pair are accepted (96). Tests: `tests/test_issue292_two_crossfilters.py` (4; 3 fail on 0.9.147); a_ref_two_cf in `tests/test_issue284_related_without_row_context.py`.
+
+### Fixed — CROSSFILTER and USERELATIONSHIP of one relationship across nested CALCULATEs (issue #293)
+
+Desktop (b256b, b256c, b256d):
+- An inner None under an outer USERELATIONSHIP(F[Ship]) gives back F[Order]: 96 (ours 16383, no relationship).
+- An inner USERELATIONSHIP under an outer None has no effect: 96 (ours 16), also through a measure.
+- An inner CROSSFILTER Both takes an outer None back: 96 (ours 16383). When that None had undone an outer USERELATIONSHIP(F[Ship]), the USERELATIONSHIP is back too: 24 (ours 16383).
+- An inner Both beside a USERELATIONSHIP of the same relationship lets the USERELATIONSHIP apply: 24.
+
+Tests: `tests/test_issue293_nested_crossfilter_none.py` (32; 26 fail on 0.9.147).
+
+### Fixed — a time-intelligence or DATEADD filter and another filter argument on the same date column intersect (issue #294)
+
+CALCULATE combines its filter arguments with AND. Three kinds of argument did not take part:
+- a time-intelligence table (DATESYTD, PREVIOUSDAY, ENDOFMONTH, ..., and the dates of TOTALxTD and the balances);
+- a DATEADD / SAMEPERIODLASTYEAR shift;
+- a `FILTER(ALL(T[c]), ..)`.
+
+The later of two arguments on the date column replaced the earlier. Desktop (b256c d_*) answers, under January 3 2024:
+- `CALCULATE(SUM(F[v]), DATESYTD(Cal[Date]), Cal[Date] >= DATE(2024, 1, 2))` is 8672 in either order (ours 13280, or 8696 with the arguments swapped).
+- `CALCULATE(SUM(F[v]), Cal[Year] = 2023, DATESYTD(Cal[Date]))` is BLANK (ours 8696).
+- `CALCULATE(SUM(F[v]), DATEADD(Cal[Date], -1, DAY), Cal[Date] < DATE(2024, 1, 2))` is BLANK (ours 3103).
+- `TOTALYTD(SUM(F[v]), Cal[Date], Cal[Date] <= DATE(2024, 1, 2))` is 120, so a YTD capped at the last date with data keeps its year.
+
+Two arguments on a date column whose filter clears the date table (#78) still clear it. `CALCULATE(SUM(F[v]), Cal[Date] >= DATE(2024, 1, 2), Cal[Date] <= DATE(2024, 1, 3))` under `Cal[Year] = 2023` is 8672 in Desktop (ours BLANK). Tests: `tests/test_issue294_ti_filter_same_column.py` (78; 52 fail on 0.9.147).
+
+### Fixed — RELATED in a calculated column joins a DatePartOnly relationship by date part (issue #295)
+
+Take a calculated column `RELATED(Cal3[Bit3])` over an active DatePartOnly relationship whose keys carry a time of day. It was BLANK on those rows: `[BLANK, 1, BLANK, BLANK]`. Desktop joins each row to its day: `[1, 1, 2, 4]` (b256b `rl_dp_active` is 8). Auto date/time joins are DatePartOnly too. Tests: `tests/test_issue295_calc_column_related_date_part.py` (3; 2 fail on 0.9.147).
+
+### Fixed — TOTALYTD / TOTALQTD / TOTALMTD without a filter are CALCULATE(e, DATESxTD(d)) in a row context and on an empty period (issue #296)
+
+Desktop (b256c):
+- `SUMX(F, TOTALYTD(SUM(F[v]), Cal[Date]))` is 13311, as the CALCULATE form is. Ours was 16383: each row read the whole year to date.
+- TOTALYTD under Cal's blank row is BLANK. Ours was 3072, the expression unfiltered.
+
+Tests: `tests/test_issue296_totalxtd_without_filter.py` (24; 16 fail on 0.9.147).
+
+### Fixed — OPENINGBALANCEYEAR / CLOSINGBALANCEYEAR apply their year end (issue #297)
+
+Desktop (b256c), with year end "12/30":
+- `OPENINGBALANCEYEAR(SUM(F[v]), Cal[Date], "12/30")` under January 3 2024 is December 30's 3. Ours was December 31's 4.
+- `CLOSINGBALANCEYEAR(.., "12/30")` under December 30 2023 is 3 (ours 4).
+- With USERELATIONSHIP beside it, the closing balance is 2048 (ours 1).
+
+Tests: `tests/test_issue297_balance_year_end.py` (21; 13 fail on 0.9.147).
+
+### Fixed — RELATED over a table of columns is Desktop's error (issue #298)
+
+In Desktop (b256c, b256d), `SUMX(VALUES(F[Order]), RELATED(Cal[Bit]))`, `SUMX(SUMMARIZE(F, F[Order]), RELATED(Cal[Bit]))` and the same over Cal's own columns (`VALUES(Cal[Date])`, `SUMMARIZE(F, Cal[Date])`) all fail with "The column 'Cal[Bit]' either doesn't exist or doesn't have a relationship to any table available in the current context." Ours answered BLANK or 127. Such rows have no expanded table. ADDCOLUMNS over F keeps F's rows (172), and RELATEDTABLE's rows are rows of their table: `SUMX(P, SUMX(RELATEDTABLE(F), RELATED(Cal[Bit])))` stays 172. Tests: `tests/test_issue298_related_over_columns_table.py` (54; 24 fail on 0.9.147).
+
+### Fixed — STARTOFYEAR / ENDOFYEAR with a year end are no longer empty (issue #299)
+
+With a year end argument, the whole argument text was read as the dates. It named no column, so the result was empty: `CALCULATE(SUM(F[v]), ENDOFYEAR(Cal[Date], "12/30"))` was BLANK. The year end now bounds the year as Microsoft's reference describes and as DATESYTD reads it. Power BI Desktop agrees (b256d): under December 30 2023 that gives December 30's 3, and STARTOFYEAR under January 3 2024 gives December 31's 4. Tests: `tests/test_issue299_startof_endof_year_end.py` (18; 14 fail on 0.9.147).
+
+### Fixed — - columns of GENERATE's inner rows and of a natural join's right-hand rows (issue #300, refs #248)
+
+These columns now read the inner or right-hand row's own value, BLANK where no row joined:
+- `T[k]` of `GENERATE(D, FILTER(T, ...))` / GENERATEALL rows;
+- `D[p]` of `NATURALINNERJOIN(T, D)` / `NATURALLEFTOUTERJOIN(T, D)` rows, including a join of a join and an empty inner / right table.
+
+A bare `[z]` of `GENERATE(T, ROW("z", ...))` resolves.
+
+They leaked an internal `('T', 'k')` marker (printed as text, BLANK in SUMX) or raised, in 0.9.147 and before.
+
+Desktop (b248c l_reads, b248g g1_*): `SUMX(NATURALINNERJOIN(T3, D3), D3[pc])` is the Currency 2.5. A NATURALLEFTOUTERJOIN left row no right row matched reads a right-hand table its row reaches through a relationship as the related row: `NATURALLEFTOUTERJOIN(T, FILTER(D, D[g] = "a"))` reads D[p] 0.2 on T's "b" rows.
+
+Tests: `tests/test_issue300_joined_row_columns.py` (34; all fail on 0.9.147).
+
+### Fixed — - EARLIER inside another table's row context (issue #301, refs #248)
+
+Desktop (b248c l_reads, b248g g2_*): where the innermost row context is another table's, it counts as the first, so EARLIER(T[c]) is the nearest row context over T outside it.
+- `MAXX(GENERATE(VALUES(T3[k]), FILTER(D3, D3[k] = EARLIER(T3[k]))), D3[pc])` is 0.25; it failed with "EARLIER/EARLIEST refers to an earlier row context which doesn't exist".
+- `SUMX(T, SUMX(FILTER(ALL(T), T[k] <= EARLIER(T[k])), COUNTROWS(FILTER(D, D[p] > EARLIER(T[c])))))` reads the inner SUMX's row (7).
+
+Tests: `tests/test_issue301_earlier_in_another_tables_rows.py` (9; 7 fail on 0.9.147).
+
+### Fixed — - CALCULATE inside a GENERATE row sees the inner row (issue #302, refs #248)
+
+Desktop (b248g g3_trans): the context transition of a GENERATE / GENERATEALL row filters the inner row's columns too, and now so does the engine: `SUMX(GENERATE(D, FILTER(T, T[g] = D[g])), CALCULATE(SUM(T[c])))` filters each row's own T row.
+
+It filtered the outer table alone, so each group's total was added once per row of it. A GENERATEALL row with no inner row filters the inner columns to BLANK.
+
+Tests: `tests/test_issue302_generate_row_transition.py` (6; 5 fail on 0.9.147).
+
+### Fixed — - GENERATE over GENERATE's rows (issue #303, refs #248)
+
+`GENERATE(GENERATE(D, FILTER(E, ...)), FILTER(T, ...))` keeps both inner rows: E[q] reads E's row (Desktop, b248g g4_nested). The second inner row overwrote the first, so E[q] leaked an internal `('E', 'q')` marker.
+
+Tests: `tests/test_issue303_nested_generate_inner_rows.py` (4; all fail on 0.9.147).
+
+### Fixed — - a VAR named as a table in a measure (issue #304, refs #248)
+
+In a model with a table T, the measure `VAR t = FILTER(T3, T3[id] > 0) RETURN SUMX(t, T3[v] * 0.5)` failed with "A single value for column 'v' in table 'T3' cannot be determined.": the check made before a measure is evaluated read `t` as the table T. A VAR iterated by name is now the variable there too; a column reference such as `T3[v]` still names the model column. Desktop (b248g p_se_tables) answers 0.001.
+
+Tests: `tests/test_issue304_var_named_like_a_table.py` (5; 4 fail on 0.9.147, 3 on the merged base).
+
+### Fixed — ROUND, ROUNDUP, ROUNDDOWN, TRUNC, INT, FLOOR, CEILING, MROUND, ABS and MOD keep a Currency (issue #305, refs #248)
+
+Desktop (b254 f_round / r_round, b254b f_fns, b248c h_fn_edges / h_abs_min, b248g p_cur_sig):
+- These functions return a Currency for a Currency argument, rounding its exact count: `ROUND(CURRENCY(1.005), 2)` is 1.01 and `INT(CURRENCY(-1.5))` is the Currency -2.
+- `MOD(5, CURRENCY(2))` is a Currency; MOD by or of a Double is a Double.
+- A significance below one count rounds the value and keeps the Currency: `MROUND(CURRENCY(1.2345), 0.00001)` is 1.2345. So does one past the range: `FLOOR(CURRENCY(1.2345), 1E16)` is 0.
+- ABS of the least Currency is an error.
+- ROUNDUP / ROUNDDOWN of a Double stay Doubles: `ROUNDUP(1.5, 0)` is 2.0.
+
+They were Doubles, or Int64s for INT, FLOOR(x, 1) and CEILING(x, 1).
+
+Tests: `tests/test_issue305_functions_keep_currency.py` (39; 27 fail on 0.9.147).
+
+### Fixed — a Currency's text is its exact digits (issue #306, refs #248)
+
+Desktop (b254 m_fmt, b254b g_text, b248c g_text2):
+- `CURRENCY(123456789012.3456) & ""` and FORMAT "General Number" give 123456789012.3456. We printed the Double's 15 digits, 123456789012.346.
+- Custom formats work on the exact decimal.
+- A "General Number" in a culture uses its decimal separator: `FORMAT(CURRENCY(1234.5678), "General Number", "de-DE")` is 1234,5678.
+
+Tests: `tests/test_issue306_currency_text_exact.py` (4; 3 fail on 0.9.147).
+
+### Fixed — a Currency divided by zero is an error (issue #307, refs #248)
+
+Desktop (b254 d0_ci / d0_cb / d0_zz, b254b d0_cd / d0_cf, b248c d_div0_*):
+- `CURRENCY(1) / 0`, `/ BLANK()`, `/ 0.0` and `/ FALSE()` fail with "Division by zero was encountered.", which IFERROR / ISERROR catch.
+- A Currency zero divisor still gives the IEEE infinity / NaN.
+- In a pushed-down iteration such as `SUMX(T3, T3[v] / (T3[id] - 1))`, the quotient is out of range and fails the query.
+
+We returned ±Infinity / NaN.
+
+Tests: `tests/test_issue307_currency_division_by_zero.py` (7; 5 fail on 0.9.147).
+
+### Fixed — the Currency range (issue #308, refs #248)
+
+Desktop (b254 o_scalar / o_column, b254b g_ovf):
+- Integer Currency arithmetic wraps its signed 64-bit count: `CURRENCY(5E14) + CURRENCY(5E14)` is -844674407370955.1616, and a SUM wraps too.
+- `CURRENCY(1E15)` and `CURRENCY(5E14) * 2.5` fail with "The result of a conversion or arithmetic operation is either too large or too small.".
+
+We had no range. Tests: `tests/test_issue308_currency_range.py` (22; 20 fail on 0.9.147).
+
+### Fixed — CURRENCY() of text (issue #309, refs #248)
+
+Desktop (b254 r_cur_text, b254b a_text, b248c a_err_cur_text):
+- `CURRENCY("0.00015")` and `CONVERT("0.00015", CURRENCY)` read the exact decimal and round half to even: 0.0002, while "0.00005" gives 0.
+- `CURRENCY("abc")` and `CURRENCY("")` fail with "Cannot convert value 'abc' of type Text to type Currency.".
+- `CURRENCY(DATE(...))` is the serial and `CURRENCY(BLANK())` BLANK.
+
+Any text gave the Int64 0.
+
+Tests: `tests/test_issue309_currency_from_text.py` (19; 16 fail on 0.9.147).
+
+### Fixed — CURRENCY() of a Double rounds as Desktop does (issue #310, refs #248)
+
+Desktop (b254 r_cur_lit / r_conv_col, b254b a_fe_conv): `CURRENCY(x)`, `CONVERT(x, CURRENCY)` and DATATABLE's CURRENCY literals round x × 10000 (in Double) half away from zero: `CURRENCY(0.03125)` is 0.0313 and `CURRENCY(0.00035)` 0.0004. CURRENCY() rounded half to even on the binary value, and CONVERT and DATATABLE did not round at all. Tests: `tests/test_issue310_currency_from_double.py` (14; all fail on 0.9.147).
+
+### Fixed — CONVERT(x, INTEGER) rounding and range (issue #311, refs #248)
+
+Desktop (b254 r_to_int, b254b a_int / g_ovf_int, b248c a_err_int_text):
+- CONVERT(.., INTEGER) rounds half away from zero, in Double arithmetic: 2.5 gives 3, -2.5 gives -3, and 0.49999999999999994 gives 1.
+- Text rounds half to even: "2.5" gives 2; "abc" fails with "Cannot convert value 'abc' of type Text to type Integer.".
+- A date converts as its serial.
+- `CONVERT(1E19, INTEGER)` is an overflow error.
+
+We rounded half to even and returned a Python int past Int64.
+
+Tests: `tests/test_issue311_convert_integer_rounding.py` (15; 11 fail on 0.9.147).
+
+### Fixed — CONVERT of a date to DOUBLE (issue #312, refs #248)
+
+Desktop (b254 t_mixed, b254b a_int): `CONVERT(DATE(2024, 1, 1) + 0.25, DOUBLE)` is 45292.25 and `CONVERT(DATE(...), CURRENCY)` is its Currency serial. CONVERT to DOUBLE gave BLANK for a date. Tests: `tests/test_issue312_convert_date_to_double.py` (5; 4 fail on 0.9.147).
+
+### Fixed — type predicates and CONVERT on a one-row table (issue #313, refs #248)
+
+Desktop (b254 l_scalars): ISCURRENCY / ISDOUBLE / ... and CONVERT read a one-row, one-column table such as `CALCULATE(VALUES(T[c]), ...)` as its value. They took the table: every predicate was FALSE and CONVERT BLANK. Tests: `tests/test_issue313_one_row_table_type_predicates.py` (1; fails on 0.9.147).
+
+### Fixed — the ^ operator (issue #314, refs #248)
+
+Desktop (b254b h_pow, b248c b_pow / b_pow2 / a_err_pow00):
+- `^` is a Double power, right-associative (`2 ^ 3 ^ 2` is 512), binding tighter than the sign (`-2 ^ 2` is -4) and than `*` (`2 * 3 ^ 2` is 18).
+- A BLANK exponent is 0 (`2 ^ BLANK()` is 1); a BLANK base is BLANK, except `BLANK() ^ BLANK()`, which is 0 ^ 0 (b248g p_pow).
+- `(-8) ^ (1 / 3)` is -2.
+- `0 ^ 0`, `0 ^ -1`, `10 ^ 400` and `(-8) ^ 0.5` fail with POWER's message.
+
+`2 ^ 3` was BLANK and `f(x) ^ y` answered f(x).
+
+Tests: `tests/test_issue314_power_operator.py` (21; 19 fail on 0.9.147).
+
+### Fixed — FORMAT of a Double at 15 significant digits, an Int64 exactly (issue #315, refs #248)
+
+Desktop (b254b h_fmt_big, b248c g_text2, b248g p_fmt):
+- FORMAT with a custom number format shows a Double's 15 significant digits: `FORMAT(0.1 + 0.2, "0.00000000000000000000")` is 0.30000000000000000000.
+- An Int64 shows its exact digits, custom or General Number: `FORMAT(123456789012345678, "General Number")` is 123456789012345678.
+
+We printed the repr's 17 digits and converted Int64s to Doubles.
+
+Tests: `tests/test_issue315_format_fifteen_digits.py` (9; 8 fail on 0.9.147).
+
+### Fixed — FORMAT of numbers past 28 digits (issue #316, refs #248)
+
+`FORMAT(1E19, "0.000000000")` and `FORMAT(1E30, "0")` raised decimal.InvalidOperation; they now give Desktop's digits (b254b h_fmt_big). Tests: `tests/test_issue316_format_past_28_digits.py` (2; both fail on 0.9.147).
+
+### Fixed — a Currency result's data_type (issue #317, refs #248)
+
+pbix_evaluate_dax reports `data_type: "Decimal"`, the model's name for Fixed Decimal, for a Currency result; it said "Double". Tests: `tests/test_issue317_result_data_type.py` (2; both fail on 0.9.147).
+
+### Fixed — the storage engine's Currency × Double (issue #318, refs #248)
+
+Desktop (b254b b_se_*, b254 s_order, b248c d_se_*) takes a pushed-down Currency × Double on the values: x 10000 in Double, rounded half away.
+- This covers SUMX / AVERAGEX / MINX / MAXX or FILTER over a model table, ALL / ALLSELECTED / ALLNOBLANKROW of it, RELATEDTABLE / CALCULATETABLE of it, a FILTER of one or a VAR holding one (b248g p_se_tables).
+- The row expression must be + - * / of the table's columns, RELATED columns and constants; an IF whose condition is a constant is the branch it takes (b248g p_fe_div0_iter).
+- `SUMX(T3, T3[v] * 0.5)` over ten rows of 0.0003 is 0.001. The formula engine's count-space product gives 0.002 (inside IF, ROUND, ADDCOLUMNS, TOPN, SAMPLE, a CONCATENATEX row).
+- A Currency divided by zero in such an iteration fails the query with "The result of a conversion or arithmetic operation is either too large or too small.".
+
+The engine now picks the same side for those shapes.
+
+Tests: `tests/test_issue318_storage_engine_value_space.py` (23; 22 fail on 0.9.147).
+
+### Fixed — two-argument MIN / MAX with a BLANK (issue #319, refs #248)
+
+Desktop (b254b c_minmax_blank, b248c c_minmax_tie, b248g p_minmax) reads a BLANK beside a number as 0 and answers BLANK when it wins: `MAX(1, BLANK())` is 1 and `MIN(1, BLANK())` BLANK. On a tie the number wins: `MIN(BLANK(), 0)` is 0.
+
+Any BLANK gave BLANK.
+
+Tests: `tests/test_issue319_minmax_blank_as_zero.py` (14; 10 fail on 0.9.147).
+
+### Fixed — IF, SWITCH, COALESCE and two-argument MIN / MAX type their result from every branch (issue #320, refs #248, #252)
+
+Desktop (b254b c_if / c_coalesce, b257b if_unify ..., b248c f_if_types, b248g p_if_variant): an Int64 or Currency result beside a Double branch is a Double, and an Int64 beside a Currency branch is a Currency.
+- `IF(TRUE(), 1, 2.5)` is 1.0 and `IF(FALSE(), CURRENCY(1.5), 2)` the Currency 2.
+- `MIN(1, 2.5)` is 1.0.
+- `IF(c, 9007199254740993, 9007199254740992.0)` is the Double 2^53.
+
+A branch that is not a number (text, TRUE / FALSE, a date, or an IF mixing them) beside a number leaves the result as it is: `IF(TRUE(), 1, IF(FALSE(), 2.5, "x"))` is the Int64 1.
+
+The other branches are typed from their text and the model, measures included, and memoized on the model's own cache. Each branch had kept its own type.
+
+Tests: `tests/test_issue320_branch_types_unify.py` (42; 29 fail on 0.9.147).
+
+### Fixed — - POWER's errors and odd roots (issue #321, refs #248)
+
+POWER is the ^ operator's arithmetic (Desktop b248c: the error of `0 ^ 0` names POWER).
+- `POWER(0, -1)`, `POWER(10, 400)` and `POWER(-8, 0.5)` fail with "An argument of function 'POWER' has the wrong data type or the result is too large or too small.". They raised Python's "math domain error" / "math range error".
+- `POWER(-8, 1 / 3)` is -2.
+- A BLANK exponent is 0, and `BLANK() ^ BLANK()` is 0 ^ 0, an error (Desktop b248g p_pow).
+
+Tests: `tests/test_issue321_power_function.py` (14; 11 fail on 0.9.147).
+
+### Fixed — - DIVIDE's alternate result is of the division's type (issue #322, refs #248)
+
+Desktop (b248c e_divide_alt, b248g p_divide): `DIVIDE(1, 0, 5)` is the Double 5, `DIVIDE(CURRENCY(1), 0, 5)` the Currency 5, and `DIVIDE(1, 0, TRUE())` stays TRUE.
+
+An Int64 alternate stayed an Int64.
+
+Tests: `tests/test_issue322_divide_alternate_double.py` (7; 5 fail on 0.9.147).
+
+### Fixed — - TRUNC of an Int64 is an Int64 (issue #323, refs #248)
+
+Desktop (b248c h_type_int): `TRUNC(5)` is the Int64 5, as `ROUNDDOWN(5, 0)` is. It was the Double 5.
+
+Tests: `tests/test_issue323_trunc_int64.py` (9; 1 fails on 0.9.147).
+
+### Fixed — calculated columns keep Int64 values past 2^53 apart (issue #324)
+
+The calculated-column path keyed numbers through float(), so Int64 values past 2^53 that share a Double merged:
+- A `LOOKUPVALUE` over the keys 2^53, 2^53 + 1, 2^53 + 2 was refused as ambiguous.
+- `CALCULATE(SUM(T[A]), FILTER(T, T[K] <= EARLIER(T[K])))` counted 2^53 + 1 with 2^53, and DISTINCTCOUNT counted them once.
+- A running SUM over 2^53, 1, 1 stayed at 2^53.
+
+They are exact now, as Desktop keeps two Int64 values apart (#240, #252), and an Int64 meeting a Double still compares as a Double (#325). Tests: `tests/test_issue324_calc_column_int64_past_2_53.py` (7; 5 fail on 0.9.147).
+
+### Fixed — an Int64 that meets a Double compares as a Double (#325; refines #240)
+
+Two Int64 values still compare exactly (#240). Desktop (b257, b257b) converts an Int64 that meets a Double to that Double:
+- `9007199254740993 = 9007199254740992.0` is TRUE (ours FALSE).
+- `CALCULATE(..., TK[K] = 9007199254740992.0)` keeps 2^53 and 2^53 + 1 (ours 2^53 alone).
+- `TK[K] > 9007199254740992.0` starts at 2^53 + 2.
+- A Double column filtered by `9007199254740993` keeps its 2^53.0 (ours nothing).
+- `MAX(9007199254740993, 9007199254740992.0)` is the Double.
+- `COUNTROWS(EXCEPT(VALUES(TC[K]), VALUES(TD[D])))` is 0 (ours 1).
+- `TOPN(1, TC, IF(TC[L] = "c", TC[K], TC[K] + 0.0), DESC)` returns both rows, tied as the Double 2^53.
+- `MIN(1, 2.5)` is the Double 1 (b254b).
+
+This covers comparisons, IN, CALCULATE / KEEPFILTERS / NOT IN filters, FILTER, LOOKUPVALUE, CONTAINS, CONTAINSROW, SWITCH, ISAFTER / ISONORAFTER, EXCEPT / INTERSECT, two-argument MIN / MAX, the value RANKX / RANK.EQ rank, and the sort keys of TOPN, TOPNSKIP, SAMPLE, CONCATENATEX and FIRST/LASTNONBLANK. Tests: `tests/test_issue325_int64_meets_double.py` (49; 39 fail on 0.9.147); two assertions of `tests/test_issue240_int_keys_past_2_53.py` follow Desktop.
+
+### Fixed — a UNION or table-constructor column of mixed number types has one type (issue #326)
+
+Desktop (b257, b257b, b257c, b257d):
+- `MAXX({9007199254740993, 9007199254740992.0}, [Value])` is 2^53, and `COUNTROWS(DISTINCT(...))` of it is 1 (ours 2).
+- A UNION of an Int64 and a Currency column is Currency (ours Int64), also when the Currency side is a model table's own rows (ours Double).
+- A UNION of a Currency and a Double column is Double, at every row (MINX was Currency).
+- The type is static: an empty Double side, also an empty ADDCOLUMNS over one, makes the column Double.
+- `9007199254740993 IN {9007199254740992, 5.0}` is TRUE.
+
+Tests: `tests/test_issue326_mixed_number_columns.py`.
+
+### Fixed — LOOKUPVALUE with several different results is an error, or alternateResult (issue #327)
+
+Desktop (b257b), over TS = (1, p), (1, q), (2, r):
+- `LOOKUPVALUE(TS[L], TS[G], 1)` raises "A table of multiple values was supplied where a single value was expected."; ours returned "p".
+- With an alternateResult it returns that ("alt").
+- `IFERROR` catches the error.
+- Rows that agree give their value: `LOOKUPVALUE(TS[G], TS[G], 1)` is 1.
+
+The agreement check reads the matching rows' cells in C and is memoized per searched value, so a lookup that matches many rows of one value costs what it did. Tests: `tests/test_issue327_lookupvalue_multiple_values.py` (10; 5 fail on 0.9.147).
+
+### Fixed — CONCATENATEX orders by every orderBy / order pair (issue #328)
+
+Desktop (b257, b257b, b257c):
+- `CONCATENATEX(TS, TS[L], "", TS[G], ASC, TS[L], DESC)` is "qpr" (ours "pqr", the second pair ignored).
+- An order of 0 or FALSE() descends ("rqp"; ours ascended).
+- A trailing orderBy without an order ascends.
+- An order that is no order word (2, or an orderBy where the order is due) is refused with "Unexpected value for ORDER argument in CONCATENATEX function. ...", which IFERROR cannot catch, as TOPN and SAMPLE refuse (#330).
+
+Tests: `tests/test_issue328_concatenatex_order_pairs.py` (8; 6 fail on 0.9.147).
+
+### Fixed — GENERATESERIES of Int64 values is exact and never silently cut short (issue #329)
+
+Desktop (b257): `COUNTROWS(GENERATESERIES(9007199254740991, 9007199254740996))` is 6 distinct rows. Ours gave 1,000,000 rows of two values: float steps, stopped by the cap. `COUNTROWS(GENERATESERIES(1, 1200000))` is 1,200,000 (ours 1,000,000). Int64 series step exactly. A series past 5,000,000 rows (`_GENERATESERIES_MAX_ROWS`) is refused with an error instead of being cut off. Tests: `tests/test_issue329_generateseries_exact.py` (6; all fail on 0.9.147).
+
+### Fixed — the ORDER refusal of TOPN, TOPNSKIP, SAMPLE, CONCATENATEX and ORDERBY has Desktop's text, is not caught by IFERROR, and fails the measure wherever the call is (issue #330)
+
+Desktop (b257c, b257d):
+- `IFERROR(COUNTROWS(TOPN(1, TS, TS[L], 2)), -1)` fails the query with "Unexpected value for ORDER argument in TOPN function. Use 0/FALSE/DESC for descending order or 1/TRUE/ASC for ascending order." TOPNSKIP's, CONCATENATEX's and ORDERBY's read the same. Ours said "... for the ORDER argument in the function TOPN.", and around TOPNSKIP IFERROR caught it.
+- `IF(FALSE(), CONCATENATEX(TS, TS[L], "", TS[L], 2), "ok")` fails although the branch is never taken (ours "ok").
+
+Comments on #211, #212, #237 and #247.
+
+Tests: `tests/test_issue330_order_refusal_text.py`, `tests/test_issue259_orderby_order.py`.
+
+### Fixed — IF / SWITCH / COALESCE type a branch that mixes + and - or * and / (issue #331)
+
+`IF(TRUE(), 1, 2.5 + 1 - 1)` stayed the Int64 1, and so did `IF(TRUE(), 1, CURRENCY(2) + 1 - 1)` and `IF(TRUE(), 1, 6 / 2 * 1)`. Desktop answers the Double 1, the Currency 1 and the Double 1 (b257d d_if_*).
+
+Tests: `tests/test_issue331_mixed_chain_static_type.py`.
+
+### Fixed — GENERATESERIES over Doubles, Currency, dates and times; a step of zero or less, or a BLANK argument, is an error IFERROR cannot catch (issue #332)
+
+Desktop (b257b, b257c, b257d, b254b, b254):
+- A Double step accumulates with no tolerance: `COUNTROWS(GENERATESERIES(0, 0.3, 0.1))` is 3 (ours 4).
+- A series whose start or step is Currency is Currency.
+- Dates and times step.
+- A step of 0 or less is an error.
+- A BLANK start, end or step is an error: "The arguments in the GenerateSeries function cannot be blank." Ours read it as 0 or 1.
+- `IFERROR(COUNTROWS(GENERATESERIES(5, 1, -1)), -1)` and the same under ISERROR fail the query, as Desktop's do.
+
+Tests: `tests/test_issue332_generateseries_steps.py`.
+
+### Fixed — ROUND, ROUNDUP, ROUNDDOWN, TRUNC, CEILING and FLOOR read a number as its 15-digit decimal (issue #333)
+
+Desktop (b257b, b257c, b257d):
+- `TRUNC(9007199254740993)`, `ROUNDDOWN(.., 0)`, `ROUNDUP(.., 0)`, `ROUND(.., 0)`, `CEILING(.., 1)` and `FLOOR(.., 1)` are 9007199254740990.
+- `TRUNC(0.29, 2)` and `FLOOR(0.29, 0.01)` are 0.29 (ours 0.28).
+- `ROUNDUP(2.0000000001, 0)` is 3 (ours 2).
+- `ROUND(1.0049999999999997, 2)` is 1.01 (ours 1).
+- `ROUND(1.000000000000025, 14)` is 1.00000000000003: the number is its Double's exact value rounded to 15 significant digits.
+- `CEILING(0.25, 0.1)` is 0.1 * 3 in Doubles.
+
+An Int64 stays an Int64 at any digits: `TRUNC(5)` and `ROUND(5, 2)` (ours Doubles). `CEILING(2.5, 1)` is an Int64 and `CEILING(5, 0.5)` a Double.
+
+Tests: `tests/test_issue333_round_through_15_digits.py`.
+
+### Fixed — Int64 scalars past 2^53: INT through the Double; CONVERT, FORMAT and DATATABLE exact (issue #334)
+
+Desktop (b257b, b257c, b257d):
+- `INT(9007199254740993)` is 2^53.
+- `CONVERT(9007199254740993, INTEGER)` keeps the value.
+- `FORMAT(<Int64>, "0")` and `FORMAT(<Int64>, "General Number")` print the exact digits: `FORMAT(-9007199254740993, "General Number")` is "-9007199254740993".
+- A DATATABLE INTEGER literal stays exact.
+
+Tests: `tests/test_issue334_int64_scalars_past_2_53.py`.
+
+### Fixed — a mix of + and - (or * and /) groups from the left (issue #335)
+
+`a + b - c` evaluated as `a + (b - c)` and `a * b / c` as `a * (b / c)`. That is exact in the reals but not in Doubles. Desktop (b257b): `POWER(2, 53) + 1 - 9007199254740992` is 0 (ours 1). Operators of one precedence now fold left to right in one flat pass, as Microsoft's operator reference states; chains of thousands of operators work. A division by zero inside a chain stays the IEEE value the rest of the chain works on (`5 / 0 / -1` is -inf). Tests: `tests/test_issue335_left_associative_arithmetic.py` (33; 16 fail on 0.9.147).
+
+### Fixed — TREATAS converts its values to the target column's type (issue #336)
+
+Desktop (b257, b257b, b257c, b257d, b254, b254b):
+- Onto an Int64 column:
+  - A Double rounds half away from zero: `TREATAS({1.6}, TS[G])` is G = 2, `{2.5}` is G = 3.
+  - Text rounds half to even: `{"2.5"}` and `{"1.5"}` are G = 2.
+  - TRUE is 1 and FALSE 0.
+  - Text that is no number is an error.
+- Onto a Double column, an Int64 becomes its Double, and TRUE is 1.0.
+- Onto a Currency column, a number rounds to 4 decimals half away from zero (0.09995 is 0.1), text rounds half to even, and TRUE is 1.
+
+Comparisons, LOOKUPVALUE, CONTAINS, IN, INTERSECT and EXCEPT still convert nothing.
+
+Tests: `tests/test_issue336_treatas_converts_to_column_type.py`.
+
+### Fixed — UNION reads every table (issue #337)
+
+`UNION` takes two or more tables (Microsoft's reference); we read the first two and dropped the rest: `COUNTROWS(UNION({1}, {2}, {3}))` was 2 and `UNION(A, A, A)` had two copies of A. Every table now counts, and a column's Int64 / Double typing (#326) sees them all. Tests: `tests/test_issue337_union_more_tables.py` (7; 6 fail on 0.9.147).
+
+### Fixed — UNION names its columns after the first table (issue #338)
+
+Microsoft's UNION reference gives the result the first table's column names, with columns matched by position. A later table's rows kept their own names, so reading a column by the first table's name found nothing on them. Over TS(G, L) and TCU(v, L), `SUMX(UNION(TS, TCU), [G])` was 7 where exact arithmetic gives 10.5; a UNION of `SELECTCOLUMNS(TS, "a", ...)` and `SELECTCOLUMNS(TD, "b", ...)` could not be read as `[a]` at all (10 is right). Later tables' rows are now copies named as the first table's columns (single-column, model-table, SELECTCOLUMNS / ADDCOLUMNS and row-constructor rows, any number of tables); the first table's rows, and rows already named alike, are kept as they are. A renamed row belongs to no model table, so a context transition over it filters no table: `SUMX(UNION(TS, TCU), CALCULATE(COUNTROWS(TCU)))` is 14 (ours 12). Tests: `tests/test_issue338_union_column_names.py` (26; 24 fail on 0.9.147).
+
+### Fixed — The storage-engine fusion follows the fourth round of Desktop answers. COUNTA is scanned with the sums beside it, and so are MIN / MAX under a filter. An IF whose condition reads the data scans the branch it takes on its own. The columns of one ROW, and the transitions of one ADDCOLUMNS row, are scanned together (#339).
+
+
+### Fixed — a group's sum adds as Desktop's grouped scan (issue #340)
+
+A SUMMARIZECOLUMNS group, a visual's row and an iteration's member summed their rows like any filtered sum. Power BI Desktop 2.152 adds a grouped scan into one accumulator per group:
+- **Group column RLE in a piece:** the piece adds as an ungrouped scan.
+- **Group column bit-packed in a piece:** each row is added to its group on its own.
+
+The rule was found offline from Desktop's per-group answers on Agents (build_b243b.py): gb_ch 4 of 4, gb_chname 4 of 4, gb_store 306 of 306, gb_emp_mtd 262 of 262, where 0.9.147 got 0, 0, 47 and 169. A filter an iteration put there (a grouping, an iterated row) is a group-by of the scan; any other filter is a WHERE. evaluate_per_dimension's buckets keep their group column, so they add as the per-value path does. A stretch of group-bit-packed pieces is folded at once, so per-member scans cost about what they did on 0.9.147. Tests: `tests/test_issue340_grouped_scans.py` (5; all fail on 0.9.147).
+
+### Fixed — Unchanged from the previous report. (issue #341)
+
+
+### Fixed — Unchanged from the previous report. (issue #342)
+
+
+### Fixed — SUMX of a constant in a grouped scan (SUMMARIZECOLUMNS) adds value x the group's rows per 16,384-row chunk, as Power BI Desktop does, not row by row (#343).
+
+
+### Fixed — CALCULATE(..., KEEPFILTERS(FILTER(T, <condition>))) cuts the storage-engine scan of T at the columns its condition reads, as the plain table filter does and as Power BI Desktop does (#344).
+
+
+### Fixed — SUMX / AVERAGEX over one column's values now add the formula engine's values as Power BI Desktop does. In data-ID order the blank member comes first. An IF or SWITCH whose condition reads the data is a branch (it reorders), and a constant IF is not. A FILTER whose condition reads only its own column keeps the table's order. VALUES of a hash-encoded column adds in dictionary order with a measure too (#345).
+
+
+### Fixed — Unchanged from the previous report. (issue #346)
+
 ## [0.9.147] - 2026-10-25
 
 @allanon2's pull requests #205 and #206, redesigned around what their reviews measured, plus the follow-ups that 0.9.146's units found and Power BI Desktop 2.152 settled. Desktop batteries: `build_b234.py` (31 probes) and `build_b247.py` (73 probes).

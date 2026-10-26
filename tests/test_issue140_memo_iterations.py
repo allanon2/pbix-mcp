@@ -46,7 +46,10 @@ def test_two_passes_share_a_measure_without_allselected(monkeypatch):
 
     monkeypatch.setattr(de.DAXEngine, "_eval_expr", counting)
     assert _eval(["Avg Adjusted"])["Avg Adjusted"] == pytest.approx(3.5)
-    # once per key in FILTER's pass; AVERAGEX's pass over 6 of them reuses it
+    # once per key in FILTER's pass, and AVERAGEX's pass over the 6 it keeps
+    # reuses it; unshared, the two passes would take 16. A FILTER over
+    # VALUES of a column tries its conjuncts as written (issue #249; Desktop
+    # 2.152, build_b255c.py c24), so NOT ISBLANK([S]) runs on all 10 keys.
     assert calls["n"] == 10
 
 
