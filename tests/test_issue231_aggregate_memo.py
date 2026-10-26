@@ -795,14 +795,18 @@ def test_entries_are_named_and_weighed(eager):
     # counts over the 90 dates, the base filter set the key holds, and the
     # scan replayed over the window (#243: these Doubles do not add exactly
     # in any order) -- a term per segment, run and chunk, with a position
-    # per fact row
+    # per fact row, and for a chunk its rows by position (order, sorted
+    # positions) and its last window's mask (_RangePartials._window_values,
+    # #348); the axis holds each key's number of D rows as
+    # well (_range_key_position)
     assert len(owners[0]) == len(tables["Sales"]["rows"])
-    assert len(axes[0]) == 90 + 2 + 90
+    assert len(axes[0]) == 90 + 2 + 90 + 90
     pkey, part = partials[0]
     assert part.mode == "kernel" and part.sums is None
     terms = part.terms
     assert sum(len(t[2]) for t in terms if t[0] != "s") == len(tables["Sales"]["rows"])
-    assert len(part) == 2 * 91 + len(pkey[5]) + len(terms) + sum(len(t[2]) for t in terms if len(t) > 2)
+    assert len(part) == 2 * 91 + len(pkey[5]) + len(terms) + sum(
+        len(t[2]) * (1 if t[0] == "r" else 4) for t in terms if len(t) > 2)
     assert all(isinstance(k[1], str) for k in cache if isinstance(k, tuple) and len(k) > 1
                and k[1] in ("agg", "range-seen", "range-partials", "range-owners", "range-axis",
                             "range-hops"))

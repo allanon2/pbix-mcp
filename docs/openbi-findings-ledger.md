@@ -40,8 +40,14 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-26 (0.9.148): docs 1-66 and GitHub issues #1-#252 and
-#254-#346 are closed; PR #253 is open.** 0.9.148 closes #243 (Desktop's
+**Updated 2026-10-26 (0.9.149): docs 1-66 and GitHub issues/PRs #1-#351 are
+closed.** 0.9.149 closes PR #253 (@allanon2), re-implemented as #347-#349 (a
+grouped visual's rows off per-key totals in a batch, a faster storage-order
+replay, VAR blocks split once), and #350-#351 (two defects of the running-total
+route its differential found).
+
+As of 0.9.148 (2026-10-26): docs 1-66 and GitHub issues #1-#252 and
+#254-#346 were closed; PR #253 was open. 0.9.148 closes #243 (Desktop's
 storage-engine summation order), #247 (window relations that may have
 duplicate rows), #248 (Fixed Decimal results), #249 (eager evaluation in
 iterations), #250 (USERELATIONSHIP over DatePartOnly joins), #251 (ISO text in
@@ -569,6 +575,12 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **GH #253, #347-#351** (PR #253 by @allanon2, re-implemented; #350-#351
+  found by its differential) -- CLOSED (0.9.149). Grouped visuals off per-key
+  totals in a batch (#347), fast storage-order replay (#348), VAR blocks split
+  once (#349), RLE runs per chunk in the replay (#350), whole-number windows
+  keep the scan's integer (#351). Regression: tests/test_issue347_*.py (40).
 
 - **GH #243, #247-#252, #254-#346** (#243 and #247-#252 reported in the
   0.9.147 work; #254-#346 found by their Desktop batteries) -- CLOSED (0.9.148).

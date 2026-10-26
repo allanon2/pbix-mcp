@@ -14524,6 +14524,41 @@ _JSON_TYPE_NAMES = {dict: "an object", list: "an array", str: "a string",
                     type(None): "null"}
 
 
+def _visual_of(item) -> tuple | None:
+    """A batch context's visual: what its rows share -- the grouped
+    columns, every other filter and the selected filters -- as a hashable
+    tuple, the values by their repr (a predicate whose keys come in another
+    order makes another visual: fewer rows counted, never another answer);
+    None for a context without group_by or one the batch refuses. A
+    json.dumps per context cost 7% of a 2,000-row MIN/MAX batch."""
+    if not isinstance(item, dict) or _batch_context_problem(item) is not None:
+        return None
+    grouped = item.get("group_by")
+    if not (isinstance(grouped, list) and grouped and all(isinstance(c, str) for c in grouped)):
+        return None
+    by = frozenset(grouped)
+    rest = sorted((key, repr(val)) for key, val in (item.get("filter_context") or {}).items()
+                  if key not in by)
+    return by, tuple(rest), repr(item.get("selected_filter_context"))
+
+
+def _rows_still_to_come(items: list) -> list[int]:
+    """Per batch context, the number of contexts after it that are rows of
+    the same visual (_visual_of): the engine evaluates the context inside
+    dax_engine.grouped_rows_pending of that number (#347;
+    after PR #253 by @allanon2). Read from the end of the list, each
+    visual's tally growing by one per row passed."""
+    visuals = [_visual_of(item) for item in items]
+    passed: dict = {}
+    pending = [0] * len(visuals)
+    for i in range(len(visuals) - 1, -1, -1):
+        v = visuals[i]
+        if v is not None:
+            pending[i] = passed.get(v, 0)
+            passed[v] = pending[i] + 1
+    return pending
+
+
 def _batch_context_problem(item) -> str | None:
     """Why ``item`` is not a context pbix_evaluate_dax_batch takes, or None.
 
@@ -14564,7 +14599,11 @@ def pbix_evaluate_dax_batch(
     per-item totals a RANKX ranks, an ALL(...) denominator -- is computed
     for the first context and reused by the rest (issue #233). The memo is
     restarted when it reaches 100,000 values; that changes the time a call
-    takes, never its answers.
+    takes, never its answers. Contexts that differ only in their group_by
+    values are taken as the rows of one visual: knowing how many are still
+    to come, the engine builds a running total's or a grouped key's per-key
+    totals after a visual's first rows rather than its last ones -- again a
+    matter of time only.
 
     results[i] is what pbix_evaluate_dax returns for context i when called
     with apply_default_filters=False and that context's filter_context,
@@ -14641,7 +14680,11 @@ def pbix_evaluate_dax_batch(
                     len(measure_names), len(items), alias)
         cache: dict = {}
         answers = []
-        for item in items:
+        # how many rows of its visual follow each context: when building a
+        # base's per-key totals pays, for the running-total route
+        # (#347)
+        pending = _rows_still_to_come(items)
+        for i, item in enumerate(items):
             problem = _batch_context_problem(item)
             if problem is not None:
                 answers.append(ToolResponse.error(problem, "INVALID_INPUT").to_text())
@@ -14650,12 +14693,13 @@ def pbix_evaluate_dax_batch(
             # parses, validates and answers them; omitted or null is the
             # argument's default.
             fc, gb, sel = (item.get(k) for k in _BATCH_CONTEXT_KEYS)
-            answers.append(_evaluate_dax_for_context(
-                ctx, alias, measure_names,
-                "" if fc is None else json.dumps(fc), False, -1,
-                "" if gb is None else json.dumps(gb),
-                "" if sel is None else json.dumps(sel),
-                cache))
+            with dax_engine.grouped_rows_pending(pending[i]):
+                answers.append(_evaluate_dax_for_context(
+                    ctx, alias, measure_names,
+                    "" if fc is None else json.dumps(fc), False, -1,
+                    "" if gb is None else json.dumps(gb),
+                    "" if sel is None else json.dumps(sel),
+                    cache))
             if dax_engine.query_memo_entries(cache) > _BATCH_MEMO_MAX_ENTRIES:
                 cache = {}
         # Each answer is a complete response object already: they are joined

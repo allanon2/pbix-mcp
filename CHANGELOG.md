@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.149] - 2026-10-26
+
+@allanon2's pull request #253, re-implemented on our side against 0.9.148: the PR was written against 0.9.147, whose correctly rounded Double totals are no longer the scan's answer (#243), so every route here is checked against 0.9.148's plain scan instead. The rework's differential also found two defects of 0.9.148's running-total route.
+
+- **A grouped visual through `pbix_evaluate_dax_batch`:** a running total plus income by 4,017 dates takes 2.9 s instead of 6.75 s over 7,500 fact rows and 11.3 s instead of 75.5 s over 100,000 (interleaved, medians). A VAR running total takes 2.3 s instead of 6.0 s. Lone `pbix_evaluate_dax` calls cost what they did (0.735 s against 0.737 s for 1,500 calls).
+
+Verified before release:
+
+- **Answers:** every route equals 0.9.148's plain scan bit for bit: a differential over 20 random models (Int64, Currency, value-encoded and storage-order Doubles, decoded layouts with RLE runs and segments, BLANK keys, date/serial collisions, many-to-one, 1:1, bidirectional and many-to-many relationships, DatePartOnly joins, USERELATIONSHIP, CROSSFILTER, tuple filters, row transitions) catches 8 planted defects; an independent review's own differential (370 seeds, about 47,000 cells the route answered) found no mismatch.
+- **Tests:** full suite 10,809 passed, 7 xfailed. The 40 new tests all pass; 20 of them fail on 0.9.148 (the other 20 are the random differentials).
+- **Desktop batteries:** b210 56 of 56, b200 756 of 756, B243 78 of 78, unchanged.
+- **Lint and types:** ruff is clean. mypy is at 131.
+
+### Changed — a grouped visual reads its rows off per-key totals (issue #347; ideas of PR #253 by @allanon2)
+
+A visual grouped by a dimension column asks one filter context per row, and each scanned the fact table again: the running-total route built its per-key totals only after about 3,700 of 4,017 rows (`_range_pays` waits for 20x payback), and a comparison on the fact table's own column (`F[Amount] > 0`) refused the route. Inside `pbix_evaluate_dax_batch`, a single grouped key on another table is now the route's window, when its rows, found as the scan finds them, are every row of one axis position and hold no BLANK; the scan's layout is part of the totals' key. Comparisons on the fact table's own columns stay in the base. The batch counts each context's later rows of the same visual (a thread-local holder, restored on exit), and a base builds once those rows are predicted to cost twice its build estimate. `_RangeAxis` counts the rows per key. MIN / MAX per grouped batch, the PR's fourth idea, is not changed: 0.9.148 already answers 2,000 groups of a 200k-row dimension in 0.8 s. Lone calls keep 0.9.148's path and cost. Tests: `tests/test_issue347_grouped_windows.py` (40; 20 fail on 0.9.148).
+
+### Changed — the running-total route replays a storage-order Double sum about 15x faster per window (issue #348)
+
+For a Double column that adds in Desktop's storage-engine order (#243), 0.9.148's route compared every kept row's position per window: 1.6 ms, more than the scan it replaced. A window's rows are now picked by bisection, each chunk keeps its last window's mask and changes only the difference (about 0.1 ms), and under a grouped key each key's own total is built once from the same terms.
+
+### Changed — a VAR block is split once per text (issue #349; reported in PR #253 by @allanon2)
+
+`_var_block_parts` parsed a VAR block's declarations on every evaluation (5% of a VAR running total); it is a pure function of the text and is now computed once, each caller still getting its own list.
+
+### Fixed — the running-total route adds an RLE run longer than 16,384 rows per chunk, as the scan does (issue #350)
+
+The storage kernel adds one value x rows product per 16,384-row chunk of a long RLE run (#346); the running-total route replayed the whole run as one product, so a window the scan sums to 396.00000000000006 answered 396.0.
+
+### Fixed — the running-total route answers a window of whole numbers as the scan's integer (issue #351)
+
+Where a window holds only whole numbers of a column with Doubles in other rows, the scan returns an exact int (3) and the route returned the float 3.0.
+
 ## [0.9.148] - 2026-10-26
 
 The open issues #243 and #247-#252, and the 93 further defects (#254-#346) that their Power BI Desktop 2.152 batteries exposed. Every rule adopted here was measured on Desktop in four rounds of black-box probes (1,489 probes over built files and Desktop-saved files: `build_b243*.py`, `build_b253*.py`, `build_b254*.py` / `build_b248c.py` / `build_b248g.py`, `build_b255*.py`, `build_b256*.py`, `build_b257*.py`), or follows from exact arithmetic or Microsoft's published DAX reference where Desktop gave no answer.

@@ -1369,6 +1369,59 @@ _RANGE_HOP_FLOOR = 16.0
 _RANGE_CLAIM_FACTOR = 1.0
 _RANGE_AXIS_FACTOR = 4.0
 _RANGE_PARTIALS_FACTOR = 1.5
+# #347 Inside grouped_rows_pending(n) -- pbix_evaluate_dax_batch
+# opens it around each context with the number of its later contexts that
+# are rows of the same visual -- a base's scans so far tell what each of
+# those rows will cost: their mean, the index-building first scan left out.
+# When n times that mean is at least _RANGE_AHEAD_FACTOR times the estimate
+# of building the base's totals, they are built. Without it, the visual's
+# own scans had to pay for the build twenty times over first, which a
+# running total over 4,017 dates reached near its 3,700th row. Outside a
+# batch nothing is known of later rows and _RANGE_BUILD_FACTOR decides
+# alone. Only the moment of the build depends on this, never an answer.
+# (After PR #253 by @allanon2.)
+_RANGE_AHEAD_FACTOR = 2.0
+# A scan of a grouped key reads a row or two, and its time per row is all
+# overhead (60 us a row where a running total's windows measured 1.8 us, the
+# pr253 benchmark): the rate a build is estimated by is the table's least
+# over scans of at least this many visible rows, when one was seen
+# (DAXEngine._range_scan).
+_RANGE_RATE_ROWS = 256
+# ... and a cross filter's time per D row hopped is taken from hops of at
+# least this many D rows (DAXEngine._range_scan).
+_RANGE_HOP_ROWS = 16
+
+
+class _PendingRows(threading.local):
+    """Per thread: how many rows of the visual being evaluated follow the
+    current one (0 outside grouped_rows_pending). #347"""
+
+    count = 0
+
+
+_PENDING = _PendingRows()
+
+
+class grouped_rows_pending:
+    """``with grouped_rows_pending(count):`` evaluates the block knowing
+    that ``count`` more rows of the same grouped query come after it in
+    this thread; the previous knowledge is back afterwards, whatever the
+    block raised. A class, not a generator: a batch opens one per context.
+    #347"""
+
+    __slots__ = ('count', 'before')
+
+    def __init__(self, count: int):
+        self.count = count
+        self.before = 0
+
+    def __enter__(self) -> 'grouped_rows_pending':
+        self.before = _PENDING.count
+        _PENDING.count = self.count
+        return self
+
+    def __exit__(self, *exc) -> None:
+        _PENDING.count = self.before
 
 
 def _predicate_filters(fc: dict) -> list:
@@ -1382,6 +1435,12 @@ def _predicate_filters(fc: dict) -> list:
         if issubclass(t, dict):
             return [(k, v) for k, v in fc.items() if isinstance(v, dict)]
     return []
+
+
+def _has_group_values(fc: dict) -> bool:
+    """Does filter set ``fc`` hold a query's grouping (GroupByValues)? One
+    type test per distinct value type, in C, as _predicate_filters."""
+    return GroupByValues in set(map(type, fc.values()))
 
 
 def _is_inequality(spec) -> bool:
@@ -1471,16 +1530,25 @@ class _RangeAxis:
     (D's blank row, every column BLANK) and ``pos[nd + 1]`` is -2 (no D row),
     so ``pos`` reads a _RangeOwners entry directly. An ordering filter on x
     keeps the D rows of a window of positions, plus the -1 rows when it keeps
-    BLANK."""
+    BLANK. ``members[p]`` is the number of D rows at position p: a grouped
+    key's rows stand for its position only when they are that many
+    (DAXEngine._range_key_position, #347)."""
 
-    __slots__ = ('keys', 'pos')
+    __slots__ = ('keys', 'pos', 'members')
 
     def __init__(self, keys: list, pos):
         self.keys = keys
         self.pos = pos
+        members = [0] * len(keys)
+        for p in itertools.islice(pos, max(len(pos) - 2, 0)):
+            if p >= 0:
+                members[p] += 1
+        self.members = members
 
     def __len__(self) -> int:
-        return len(self.keys) + len(self.pos)
+        # weighed by what it holds (#229): positions, and per key its number
+        # and its row count
+        return len(self.pos) + 2 * len(self.keys)
 
 
 class _RangePartials:
@@ -1515,7 +1583,7 @@ class _RangePartials:
     loop doing all of it per row cost 3 s over 267k fact rows."""
 
     __slots__ = ('keys', 'mode', 'nonblank', 'nums', 'sums', 'scale',
-                 'nonblank_blank', 'nums_blank', 'sums_blank', 'nkey', 'terms', 'mag')
+                 'nonblank_blank', 'nums_blank', 'sums_blank', 'nkey', 'terms', 'mag', 'cursor', 'whole')
 
     def __init__(self, keys: list, pos: list, vals: list, nkey: int = 0, currency: bool = False,
                  se: Optional[tuple] = None):
@@ -1543,6 +1611,9 @@ class _RangePartials:
         self.sums_blank: Any = 0
         self.terms: Optional[list] = None
         self.mag = 1.0
+        # 'kernel': each chunk's mask of the rows of its last window
+        # (_window_values), a byte per kept row at most
+        self.cursor: dict = {}
         if num_types and not all(map(math.isfinite, num_vals)):
             self.mode = 'nonfinite'
         elif currency and num_types:
@@ -1583,18 +1654,41 @@ class _RangePartials:
             self.sums_blank = blank_sum
         else:
             self.mode = 'none'
+        self.whole: Optional[tuple] = None
+        if ints and floats and self.mode in ('float', 'value'):
+            # whole numbers beside Doubles: a window holding no Double is the
+            # scan's exact whole-number total, an int (_se_total), not the
+            # Double the scaled total gives (#351)
+            fmask = list(map(isinstance, num_vals, repeat(float)))
+            nfl, nfl_blank = self._counts(list(compress(num_pos, fmask)), n)
+            iper: list = [0] * n
+            iblank: Any = 0
+            for p, v, f in zip(num_pos, num_vals, fmask):
+                if f:
+                    continue
+                if p < 0:
+                    iblank += v
+                else:
+                    iper[p] += v
+            self.whole = (nfl, nfl_blank, list(accumulate(iper, initial=0)), iblank)
         self.nkey = nkey
 
     @staticmethod
     def _kernel_terms(pos: list, vals: list, se: tuple) -> list:
         """The scan of se_scan.scan_sum over the kept rows, as terms to replay
         for any window (``answer``), in storage order: ``('s',)`` a new
-        segment; ``('r', value, axis positions sorted, rows at -1)`` an RLE
-        piece, adding value x (its rows in the window); ``('c', values, axis
-        positions, full fold, least and greatest position, any at -1)`` a
-        chunk, folded over its rows in the window; ``('g', values, axis
-        positions)`` a piece of several groups of a grouped scan, its rows in
-        the window added one by one."""
+        segment; ``('r', value, axis positions sorted, rows at -1)`` a chunk
+        of 16,384 rows of an RLE piece (counted from the piece's start, as
+        the scan counts them: a longer piece adds one product per chunk,
+        #346; #350), adding value x (its rows in the window);
+        ``('c', values, axis
+        positions, full fold, least and greatest position, any at -1, order,
+        sorted positions)`` a chunk, folded over its rows in the window;
+        ``('g', values, axis positions, order, sorted positions)`` a piece of
+        several groups of a grouped scan, its rows in the window added one by
+        one. ``order`` lists a term's rows by position (storage order within
+        one), ``sorted positions`` their positions: a window's rows are a
+        slice of it, found by bisection (_window_values)."""
         pieces, kept, grouped, _enc, _mag = se
         starts = pieces.starts
         n = pieces.n
@@ -1620,12 +1714,23 @@ class _RangePartials:
             if grp_rle is not None and not grp_rle[pi]:
                 sel = [(v, ap) for v, ap in zip(vals[j:hi], pos[j:hi]) if isinstance(v, num)]
                 if sel:
-                    terms.append(('g', [v for v, _a in sel], [ap for _v, ap in sel]))
+                    ca = [ap for _v, ap in sel]
+                    terms.append(('g', [v for v, _a in sel], ca) + _RangePartials._by_position(ca))
             elif own_rle[pi]:
                 v = vals[j]
                 if isinstance(v, num):
-                    aps = sorted(ap for x, ap in zip(vals[j:hi], pos[j:hi]) if isinstance(x, num))
-                    terms.append(('r', v, aps, bisect.bisect_left(aps, 0)))
+                    # one product per chunk of the piece, as scan_sum adds an
+                    # RLE piece longer than a chunk (#346): one per piece gave
+                    # 396.0 where the scan gives 396.00000000000006 for 0.1 x
+                    # 3,960 rows over three chunks
+                    q = j
+                    while q < hi:
+                        cend = a + ((kept[q] - a) // B + 1) * B
+                        r = hi if cend >= z else bisect.bisect_left(kept, cend, q, hi)
+                        aps = sorted(ap for x, ap in zip(vals[q:r], pos[q:r]) if isinstance(x, num))
+                        if aps:
+                            terms.append(('r', v, aps, bisect.bisect_left(aps, 0)))
+                        q = r
             else:
                 q = j
                 while q < hi:
@@ -1638,10 +1743,62 @@ class _RangePartials:
                         nonneg = [x for x in ca if x >= 0]
                         terms.append(('c', cv, ca, _se_scan.seq_sum(cv),
                                       min(nonneg) if nonneg else 0, max(nonneg) if nonneg else -1,
-                                      len(nonneg) != len(ca)))
+                                      len(nonneg) != len(ca)) + _RangePartials._by_position(ca))
                     q = r
             j = hi
         return terms
+
+    @staticmethod
+    def _by_position(ca: list) -> tuple:
+        """``(order, sorted positions)`` of a term's axis positions ``ca``:
+        its row numbers by position, storage order within a position (a
+        stable sort), and their positions, as compact arrays."""
+        order = sorted(range(len(ca)), key=ca.__getitem__)
+        return array.array('i', order), array.array('i', map(ca.__getitem__, order))
+
+    def _window_values(self, ti: int, cv: list, order, sp, lo: int, hi: int, blank: bool) -> tuple:
+        """``(values, how many)``: the values of term ``ti``'s rows at
+        positions lo..hi-1 (and -1 when ``blank``), in storage order, as an
+        iterable read once -- a mask of the rows, read back in storage
+        order (C loops). The rows of a window are slices of
+        ``order``, found by bisection of ``sp``; the mask of the term's last
+        window is kept (``cursor``) and changed by the slices the two
+        windows do not share -- a running total's next window adds one
+        key's rows. A mask computed by comparing every row's position took
+        1.6 ms a window over 7,500 rows, longer than the scan it replaces
+        (the pr253 benchmark, #348). A kept mask is never
+        changed: a thread reads the one it found, copies and stores anew."""
+        a = bisect.bisect_left(sp, lo)
+        b = bisect.bisect_left(sp, hi)
+        if b < a:
+            b = a
+        nb = bisect.bisect_left(sp, 0)
+        m = len(cv)
+        k = (b - a) + (nb if blank else 0)
+        if not k or k == m:
+            return (cv if k else ()), k
+        held = self.cursor.get(ti)
+        if held is None:
+            mask = bytearray(m)
+            spans: list = [(a, b, 1)]
+            if blank and nb:
+                spans.append((0, nb, 1))
+        else:
+            a0, b0, blank0, old = held
+            if (a0, b0, blank0) == (a, b, blank):
+                return compress(cv, old), k
+            mask = bytearray(old)
+            # [a0, b0) minus [a, b) cleared, [a, b) minus [a0, b0) set
+            spans = [(a0, min(b0, a), 0), (max(a0, b), b0, 0),
+                     (a, min(b, a0), 1), (max(a, b0), b, 1)]
+            if blank != blank0 and nb:
+                spans.append((0, nb, 1 if blank else 0))
+        put = mask.__setitem__
+        for x, y, bit in spans:
+            if y > x:
+                collections.deque(map(put, order[x:y], repeat(bit)), 0)
+        self.cursor[ti] = (a, b, blank, mask)
+        return compress(cv, mask), k
 
     def _kernel_total(self, lo: int, hi: int, blank: bool) -> Any:
         """The scan's total over the window positions lo..hi-1 (and -1 when
@@ -1649,8 +1806,8 @@ class _RangePartials:
         acc: Any = 0
         parts: list = []
         have = False
-        and_, or_ = operator.and_, operator.or_
-        for t in self.terms or ():
+        window = self._window_values
+        for ti, t in enumerate(self.terms or ()):
             tag = t[0]
             if tag == 's':
                 if have:
@@ -1664,7 +1821,6 @@ class _RangePartials:
                     acc += t[1] * k
                     have = True
             else:
-                cv, ca = t[1], t[2]
                 if tag == 'c':
                     if lo <= t[4] and t[5] < hi and (blank or not t[6]):
                         acc += t[3]
@@ -1672,11 +1828,10 @@ class _RangePartials:
                         continue
                     if (t[5] < lo or t[4] >= hi) and not (blank and t[6]):
                         continue
-                mask: Any = map(and_, map(lo.__le__, ca), map(hi.__gt__, ca))
-                if blank:
-                    mask = map(or_, mask, map((-1).__eq__, ca))
-                sel = list(compress(cv, mask))
-                if sel:
+                    sel, k = window(ti, t[1], t[7], t[8], lo, hi, blank)
+                else:
+                    sel, k = window(ti, t[1], t[3], t[4], lo, hi, blank)
+                if k:
                     if tag == 'c':
                         acc += _se_scan.seq_sum(sel)
                     else:
@@ -1712,8 +1867,13 @@ class _RangePartials:
         # the items of the base filter set its key holds included
         terms = 0
         if self.terms:
-            terms = len(self.terms) + sum(len(t[2]) for t in self.terms if len(t) > 2)
-        return len(self.nonblank) + len(self.nums) + len(self.sums or ()) + self.nkey + terms
+            # a chunk's or grouped piece's positions, order and sorted
+            # positions, and the mask of its last window (``cursor``, made
+            # later, weighed here); an RLE chunk's positions
+            terms = len(self.terms) + sum(len(t[2]) * (1 if t[0] == 'r' else 4)
+                                          for t in self.terms if len(t) > 2)
+        whole = len(self.whole[0]) + len(self.whole[2]) if self.whole is not None else 0
+        return len(self.nonblank) + len(self.nums) + len(self.sums or ()) + self.nkey + terms + whole
 
     def answer(self, kind: str, lo: int, hi: int, blank: bool) -> Any:
         """``kind`` over the positions lo..hi-1, and position -1 when
@@ -1733,6 +1893,11 @@ class _RangePartials:
             return total if kind == 'SUM' else total / count
         if self.sums is None:
             return _MISSING
+        whole = self.whole
+        if whole is not None and not (whole[0][hi] - whole[0][lo] + (whole[1] if blank else 0)):
+            # no Double in the window: the whole numbers' exact total
+            itotal = whole[2][hi] - whole[2][lo] + (whole[3] if blank else 0)
+            return itotal if kind == 'SUM' else itotal / count
         total = self.sums[hi] - self.sums[lo] + (self.sums_blank if blank else 0)
         if self.mode == 'float':
             total = total / (1 << self.scale)        # int / int: exact here
@@ -1744,6 +1909,72 @@ class _RangePartials:
             total = _wrap64(total)
             return _cur_make(total) if kind == 'SUM' else _cur_avg(total, count)
         return total if kind == 'SUM' else total / count
+
+    def needs_key_totals(self, kind: str) -> bool:
+        """Does answer_key need key_totals for ``kind``?"""
+        return self.mode == 'kernel' and kind in ('SUM', 'AVERAGE')
+
+    def key_totals(self) -> list:
+        """Each position's own 'kernel' total (_kernel_key_totals)."""
+        return self._kernel_key_totals(self.terms or (), len(self.keys))
+
+    def answer_key(self, kind: str, p: int, totals: Optional[list] = None) -> Any:
+        """``kind`` over position p alone, BLANK not kept: ``answer(kind, p,
+        p + 1, False)``. A 'kernel' total replayed the whole scan for every
+        position asked -- every fact row the base keeps, once per row of a
+        visual grouped by the key -- so it is read off ``totals``, each
+        position's own total made once from the same terms (key_totals; the
+        caller keeps them). #347"""
+        if not self.needs_key_totals(kind):
+            return self.answer(kind, p, p + 1, False)
+        count = self.nums[p + 1] - self.nums[p]
+        if not count:
+            return None
+        total = totals[p] if totals is not None else None
+        if total is None:
+            return _MISSING
+        return total if kind == 'SUM' else total / count
+
+    @staticmethod
+    def _kernel_key_totals(terms, n: int) -> list:
+        """``_kernel_total(p, p + 1, False)`` for every position p, in one
+        pass over the terms: each term's rows of a position go to that
+        position's own accumulator exactly as the replay of its window adds
+        them -- an RLE chunk's product of its rows, a chunk's rows folded
+        from 0 and the fold added, a grouped piece's rows folded into the
+        accumulator one by one -- and each segment's accumulators become
+        the positions' partials, added in segment order. Rows at -1 (BLANK)
+        belong to no position."""
+        acc: dict = {}
+        parts: dict = {}
+        for t in terms:
+            tag = t[0]
+            if tag == 's':
+                for p, a in acc.items():
+                    parts.setdefault(p, []).append(a)
+                acc = {}
+            elif tag == 'r':
+                v = t[1]
+                aps = t[2]
+                for p, grp in itertools.groupby(aps[t[3]:]):
+                    acc[p] = acc.get(p, 0) + v * sum(1 for _x in grp)
+            else:
+                per: dict = {}
+                for v, p in zip(t[1], t[2]):
+                    if p >= 0:
+                        per.setdefault(p, []).append(v)
+                if tag == 'c':
+                    for p, vs in per.items():
+                        acc[p] = acc.get(p, 0) + _se_scan.seq_sum(vs)
+                else:
+                    for p, vs in per.items():
+                        acc[p] = _se_scan.seq_sum(itertools.chain((acc.get(p, 0),), vs))
+        for p, a in acc.items():
+            parts.setdefault(p, []).append(a)
+        out: list = [None] * n
+        for p, ps in parts.items():
+            out[p] = ps[0] if len(ps) == 1 else _se_scan.seq_sum(ps)
+        return out
 
 
 @lru_cache(maxsize=100_000)
@@ -3189,17 +3420,33 @@ def _var_block_keywords(text: str) -> list:
 def _var_block_parts(text: str):
     """([(name or None, expression)], RETURN expression or None) of a VAR
     block (_var_block_keywords); the RETURN expression runs to the end. A
-    declaration that is no `name = expression` has the name None."""
-    decls: list = []
+    declaration that is no `name = expression` has the name None.
+
+    The split depends on nothing but ``text``, so _var_block_split keeps it
+    per text: a VAR measure evaluated once per row of a visual re-read its
+    keywords every time, 5% of a 4,017-date running total written with a
+    VAR (after PR #253 by @allanon2; #349). The cached
+    declarations are copied into a fresh list for every caller."""
+    parts, tail = _var_block_split(text)
+    return list(parts), tail
+
+
+@lru_cache(maxsize=4096)
+def _var_block_split(text: str) -> tuple:
+    """_var_block_parts' answer with the declarations as a tuple, memoized."""
+    found: list = []
+    returned: Optional[str] = None
     kws = _var_block_keywords(text)
     for k, (_pos, kw, end) in enumerate(kws):
         if kw == 'RETURN':
-            return decls, text[end:].strip()
+            returned = text[end:].strip()
+            break
         stop = kws[k + 1][0] if k + 1 < len(kws) else len(text)
         block = text[end:stop].strip()
         m = re.match(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)', block, re.DOTALL)
-        decls.append((m.group(1), m.group(2).strip()) if m else (None, block))
-    return decls, None
+        found.append((m.group(1), m.group(2).strip()) if m else (None, block))
+    frozen = tuple(found)
+    return frozen, returned
 
 
 def _strip_line_comments(expr):
@@ -15777,8 +16024,9 @@ class DAXEngine:
         column BEFORE this runs, so a memo hit does both as before.
 
         On a miss SUM, AVERAGE, COUNT and COUNTA first try the running-total
-        route (_range_aggregate), which answers only where it gives the scan's
-        exact answer, and otherwise may have the scan timed (_range_scan)."""
+        route (_range_aggregate) under an ordering comparison or a query's
+        grouping, which answers only where it gives the scan's exact answer,
+        and otherwise may have the scan timed (_range_scan)."""
         actx = self._agg_ctx(ctx)
         key = None
         tname, idx = '', -1
@@ -15802,7 +16050,7 @@ class DAXEngine:
             return None if hit is _AGG_BLANK else hit
         got: Any = _MISSING
         note = None
-        if preds and kind in _RANGE_KINDS:
+        if kind in _RANGE_KINDS and (preds or (_PENDING.count and _has_group_values(actx.filter_context))):
             got, note = self._range_aggregate(kind, actx, tname, tbl, idx, preds)
         if got is _MISSING:
             got = (self._aggregate_scan(kind, col, actx, compute) if note is None
@@ -15882,26 +16130,47 @@ class DAXEngine:
         many times over (_range_pays), and never on its first request: a
         visual grouped by something other than the dates asks for each base
         once, and a dimension much larger than the windows costs many scans
-        to claim."""
+        to claim. Inside a batch's grouped_rows_pending the visual's later
+        rows count as well.
+
+        Beyond PR #231's single comparison, after PR #253 by @allanon2:
+
+        - #347 comparisons on columns of T itself filter the
+          base, not the window: the base's T rows are read with T's own
+          filters applied, exactly as the scan applies them, so a running
+          total of the positive amounts takes the route too;
+        - #347 in a grouped batch (grouped_rows_pending), when
+          no comparison is left for the window, a grouped column x of a
+          table D other than T -- the only such column -- is the window: its
+          value's position on the axis, provided that position's D rows are
+          exactly the ones the value keeps and it keeps no BLANK
+          (_range_key_position). Every row of the visual then asks one base.
+          Its scan is a group of a grouped scan, laid out unlike a
+          comparison's: the totals' key holds the layout (_range_layout_key).
+          Totals of Doubles in the storage engine's order are read off each
+          position's own total (_RangePartials.answer_key)."""
         fc = ctx.filter_context
-        rkey = None
-        for k, spec in (_predicate_filters(fc) if preds is None else preds):
-            if _is_inequality(spec):
-                if rkey is not None:
-                    return _RANGE_NO
-                rkey = k
-        if rkey is None or ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
+        picked = self._range_window_filter(ctx, fc, tname, preds)
+        if picked is None or ctx._no_prop_keys or ctx._no_propagate or ctx.has_tuple_filters():
             return _RANGE_NO
+        rkey, by_group = picked
         if self._range_row_transition(fc, tname):
             return _RANGE_NO
         dname, sep, xcol = rkey.partition('.')
         if not sep or dname == tname:
             return _RANGE_NO
-        spec = fc[rkey]
-        bounds = _range_bounds(spec)
         dtbl = ctx.tables.get(dname)
-        if bounds is None or not dtbl:
+        if not dtbl:
             return _RANGE_NO
+        spec = fc[rkey]
+        bounds: Optional[list] = None
+        if by_group:
+            if not isinstance(spec, list):
+                return _RANGE_NO
+        else:
+            bounds = _range_bounds(spec)
+            if bounds is None:
+                return _RANGE_NO
         x_idx = ctx._find_col_idx(dtbl.get('columns') or [], xcol)
         hop = self._range_hop(ctx, tname, tbl, dname, dtbl) if x_idx >= 0 else None
         if hop is None:
@@ -15917,10 +16186,14 @@ class DAXEngine:
         fused = (self._se_fused_beyond(ctx, tname, tbl['columns'][col_idx])
                  if kind in ('SUM', 'AVERAGE') else _NO_COLUMNS)
         try:
-            # the base filter set's signature, as without_filters' context signs it
+            # the base filter set's signature, as without_filters' context
+            # signs it; and the layout of the scans the windows stand for --
+            # a grouped key's scan is grouped by T's join column, a
+            # comparison's cut by it -- so the two never share totals (P1)
             base_sig = ctx._filters_sig() - {(rkey, ctx._filters_sigd()[rkey])}
             pkey = (id(tbl), 'range-partials', col_idx, dname, x_idx, base_sig, ctx._rels_sig,
-                    ctx.date_table, ctx.date_column, ctx._date_part_joins, fused)
+                    ctx.date_table, ctx.date_column, ctx._date_part_joins, fused,
+                    self._range_layout_key(ctx, tname, tbl))
             part: Any = cache.get(pkey)
         except (TypeError, KeyError):
             return _RANGE_NO
@@ -15933,9 +16206,21 @@ class DAXEngine:
             note = (skey, hkey, dname, dtbl)
             seen = cache.get(skey)
             hops = cache.get(hkey) if hkey is not None else None
+            pending = _PENDING.count
+            if seen is not None:
+                # a scan of one key reads a row or two, and its time per row
+                # is its overhead: the table's rate from larger scans, when
+                # one was seen, is what a row costs (P3)
+                rkey_rate = (id(tbl), 'range-rate')
+                rate = cache.get(rkey_rate)
+                if rate is None and pending and seen[0] >= 2 and len(tbl['rows']) >= _RANGE_RATE_ROWS:
+                    rate = self._range_probe_rate(ctx, rkey, tname, tbl, col_idx)
+                    cache[rkey_rate] = rate
+                if rate is not None and rate < seen[3]:
+                    seen = seen[:3] + (rate,)
             if seen is None or not self._range_pays(
                     seen, hops[0] if hops is not None and hops[0] < math.inf else None,
-                    owners is None, axis is None, len(tbl['rows']), len(dtbl['rows'])):
+                    owners is None, axis is None, len(tbl['rows']), len(dtbl['rows']), pending):
                 return _MISSING, note
             if owners is None:
                 owners = self._range_owners(ctx, okey, tname, tbl, hop[0], dname, dtbl, hop[1])
@@ -15953,6 +16238,32 @@ class DAXEngine:
                               + (len(part) if part is not _RANGE_UNUSABLE else 0))
         if part is _RANGE_UNUSABLE:
             return _RANGE_NO
+        if by_group:
+            # looked at once the totals are there: the matcher costs more
+            # than a scan of one key's rows
+            if not self._range_key_spec(ctx, dtbl, x_idx, spec):
+                return _RANGE_NO
+            if not isinstance(axis, _RangeAxis):
+                # dropped from the model's cache while the totals stayed
+                axis = self._range_axis(cache, akey, dtbl, x_idx)
+                if axis is None:
+                    return _RANGE_NO
+            p = self._range_key_position(ctx, dtbl, x_idx, axis, spec)
+            if p is None:
+                return _RANGE_NO
+            if p < 0:
+                # the set keeps no D row, and not the blank row: no fact row
+                return part.answer(kind, 0, 0, False), None
+            totals = None
+            if part.needs_key_totals(kind):
+                # each key's own 'kernel' total, made once per base: weighed
+                # with the base filter set its key holds
+                kkey = pkey + ('keyed',)
+                totals = cache.get(kkey)
+                if totals is None:
+                    totals = part.key_totals()
+                    _put_filter_entry(cache, kkey, totals, 3 + ctx._filters_sig_weight() + len(totals))
+            return part.answer_key(kind, p, totals), None
         try:
             # whether the window keeps D's BLANK x and blank row, as the hop
             # decides it (_filters_admit_blank)
@@ -15961,7 +16272,7 @@ class DAXEngine:
             return _RANGE_NO
         keys = part.keys
         lo, hi = 0, len(keys)
-        for op, num in bounds:
+        for op, num in bounds or ():
             cut = _RANGE_UPPER.get(op)
             if cut is not None:
                 hi = min(hi, cut(keys, num))
@@ -15978,9 +16289,94 @@ class DAXEngine:
         return _ExpansionValues in set(map(type, fc.values())) and any(
             type(v) is _ExpansionValues and v.origin == tname for v in fc.values())
 
+    def _range_probe_rate(self, ctx: DAXContext, rkey: str, tname: str, tbl: dict,
+                          col_idx: int) -> float:
+        """The time per visible row of one scan of the base -- the filter
+        set without the window ``rkey`` -- of tbl's column col_idx: what a
+        row costs a scan, for a table whose scans so far each read a key's
+        row or two (_RANGE_RATE_ROWS). Asked once per table, in a grouped
+        batch only, after the base's second scan; it costs a scan of the
+        base, two thirds of the estimate of the totals alone. The answer is
+        thrown away. #347"""
+        col = (tname, tbl['columns'][col_idx])
+        try:
+            bctx = ctx.without_filters([rkey])
+            t0 = time.perf_counter()
+            values = bctx.get_column_data(*col)
+            self._aggregate_scan('SUM', col, bctx, _agg_sum, values)
+            dt = time.perf_counter() - t0
+        except (TypeError, ValueError, ArithmeticError, _DAXEvaluationError):
+            return math.inf
+        return dt / max(len(values), 1)
+
+    @staticmethod
+    def _range_layout_key(ctx: DAXContext, tname: str, tbl: dict) -> tuple:
+        """The part of a base's totals' key that names the layout of the
+        scans its windows stand for: what they cut by and group by
+        (se_scan_columns). #347"""
+        layout: tuple = ctx.se_scan_columns(tname, tbl)
+        return layout
+
+    @staticmethod
+    def _range_window_filter(ctx: DAXContext, fc: dict, tname: str,
+                             preds: Optional[list]) -> Optional[tuple]:
+        """``(filter key, grouped)``: the filter of ``fc`` the route reads
+        as its window over the rows of tname, or None for none.
+
+        Ordering comparisons on columns of tname belong to the base (P2).
+        Exactly one comparison on any other table is the window; two or
+        more leave the set to the scan. With none, and only inside
+        grouped_rows_pending, the window is the grouping (GroupByValues) on
+        a column of a table other than tname when there is exactly one such
+        column (#347): a lone grouped call keeps 0.9.148's
+        path and cost. Groupings on tname's own columns are base filters."""
+        others = [k for k, spec in (_predicate_filters(fc) if preds is None else preds)
+                  if _is_inequality(spec) and ctx.model_table(k.partition('.')[0]) != tname]
+        if others:
+            return (others[0], False) if len(others) == 1 else None
+        if not _PENDING.count or not _has_group_values(fc):
+            return None
+        grouped = [k for k, v in fc.items()
+                   if type(v) is GroupByValues and ctx.model_table(k.partition('.')[0]) != tname]
+        return (grouped[0], True) if len(grouped) == 1 else None
+
+    @staticmethod
+    def _range_key_spec(ctx: DAXContext, dtbl: dict, x_idx: int, spec) -> bool:
+        """Can grouped key ``spec`` on D[x] be a window at all: values, none
+        of them BLANK, keeping no BLANK cell (the blank row and the BLANK
+        x's rows are the scan's, as the window's position -1)?"""
+        if not isinstance(spec, list) or not spec or any(v is None for v in spec):
+            return False
+        try:
+            return not make_value_matcher(spec, ctx._text_column(dtbl, x_idx))(None)
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def _range_key_position(ctx: DAXContext, dtbl: dict, x_idx: int, where: _RangeAxis,
+                            value) -> Optional[int]:
+        """Where on the axis ``where`` the grouped value set ``value`` on
+        D[x] sits: the position all its D rows share, provided they are all
+        the D rows there (a date and its serial number share a position, the
+        axis ordering by _as_number, yet only one of them matches); -1 when
+        it keeps no D row at all; None otherwise. Its D rows are those the
+        scan's cross filter takes (_column_filter_rows, through the column's
+        typed index). #347"""
+        kept = ctx._column_filter_rows(dtbl, x_idx, value)
+        if not kept:
+            return -1
+        at = {where.pos[j] for j in kept}
+        if len(at) != 1:
+            return None
+        (spot,) = at
+        if spot < 0 or where.members[spot] != len(kept):
+            return None
+        found: int = spot
+        return found
+
     @staticmethod
     def _range_pays(seen: tuple, per_hop: Optional[float], owners_missing: bool,
-                    axis_missing: bool, n_rows: int, n_dim: int) -> bool:
+                    axis_missing: bool, n_rows: int, n_dim: int, pending: int = 0) -> bool:
         """Have the scans of a base (``seen``, see _range_scan) cost
         _RANGE_BUILD_FACTOR times what building its totals is estimated to
         cost -- with the owners and the axis when they are not built yet?
@@ -15991,7 +16387,14 @@ class DAXEngine:
         The first scan is not counted: it is usually the one that built the
         model's indexes (the fact column's value index, the dimension's typed
         index, its blank row), and took 0.5 to 1 s where every later one took
-        90 ms (scanlog.py of the #231 review fixes)."""
+        90 ms (scanlog.py of the #231 review fixes).
+
+        ``pending``: how many rows of the visual follow (grouped_rows_pending).
+        Each is taken to cost what the base's scans after the first cost on
+        average -- which needs two scans recorded -- and the totals are worth
+        building when all of them together come to _RANGE_AHEAD_FACTOR times
+        the estimate. #347"""
+        n: int = seen[0]
         total: float = seen[1]
         first: float = seen[2]
         per_row: float = seen[3]
@@ -16001,7 +16404,12 @@ class DAXEngine:
         if owners_missing:
             hop = max(per_hop or 0.0, per_row * _RANGE_HOP_FLOOR)
             est += n_dim * hop * _RANGE_OWNERS_FACTOR + n_rows * per_row * _RANGE_CLAIM_FACTOR
-        return total - first >= _RANGE_BUILD_FACTOR * est
+        spent = total - first
+        if spent >= _RANGE_BUILD_FACTOR * est:
+            return True
+        if pending <= 0 or n < 2:
+            return False
+        return pending * spent >= _RANGE_AHEAD_FACTOR * est * (n - 1)
 
     def _range_scan(self, ctx: DAXContext, note: tuple, tname: str, col: tuple, compute,
                     kind: str = '') -> Any:
@@ -16034,6 +16442,14 @@ class DAXEngine:
         n, total, first, per_row = cache.get(skey) or (0, 0.0, t2 - t0, math.inf)
         if fresh and values:
             per_row = min(per_row, (t2 - t1) / len(values))
+            if len(values) >= _RANGE_RATE_ROWS:
+                # the table's least rate over scans large enough to say
+                # what a row costs (_range_pays) #347
+                rkey = (skey[0], 'range-rate')
+                held_rate = cache.get(rkey)
+                rate = (t2 - t1) / len(values)
+                if held_rate is None or rate < held_rate:
+                    cache[rkey] = rate
         cache[skey] = (n + 1, total + (t2 - t0), first, per_row)
         held = cache.get(hkey) if hkey is not None else None
         if hkey is not None and (held is None or held[1] < 3):
@@ -16046,9 +16462,13 @@ class DAXEngine:
                 hopped = 0
             rate = (t1 - t0) / hopped if hopped else 0.0
             least = math.inf if held is None else held[0]
-            # a memoized cross filter takes microseconds in all
-            if rate >= 5e-7:
+            # a memoized cross filter takes microseconds in all; a hop of a
+            # few D rows (a grouped key's one) measures its overhead, 50 us
+            # a row where claiming one took 13 us (the pr253 benchmark): the
+            # floor of _range_pays stands for it (P3)
+            if rate >= 5e-7 and hopped >= _RANGE_HOP_ROWS:
                 least = min(least, rate)
+            # three scans looked at per relationship, as 0.9.148
             cache[hkey] = (least, 1 if held is None else held[1] + 1)
         return got
 
