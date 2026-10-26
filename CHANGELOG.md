@@ -645,7 +645,7 @@ The calculated-column path keyed numbers through float(), so Int64 values past 2
 
 They are exact now, as Desktop keeps two Int64 values apart (#240, #252), and an Int64 meeting a Double still compares as a Double (#325). Tests: `tests/test_issue324_calc_column_int64_past_2_53.py` (7; 5 fail on 0.9.147).
 
-### Fixed — an Int64 that meets a Double compares as a Double (#325; refines #240)
+### Fixed — an Int64 that meets a Double compares as a Double (issue #325; refines #240)
 
 Two Int64 values still compare exactly (#240). Desktop (b257, b257b) converts an Int64 that meets a Double to that Double:
 - `9007199254740993 = 9007199254740992.0` is TRUE (ours FALSE).
@@ -773,8 +773,24 @@ Tests: `tests/test_issue336_treatas_converts_to_column_type.py`.
 
 Microsoft's UNION reference gives the result the first table's column names, with columns matched by position. A later table's rows kept their own names, so reading a column by the first table's name found nothing on them. Over TS(G, L) and TCU(v, L), `SUMX(UNION(TS, TCU), [G])` was 7 where exact arithmetic gives 10.5; a UNION of `SELECTCOLUMNS(TS, "a", ...)` and `SELECTCOLUMNS(TD, "b", ...)` could not be read as `[a]` at all (10 is right). Later tables' rows are now copies named as the first table's columns (single-column, model-table, SELECTCOLUMNS / ADDCOLUMNS and row-constructor rows, any number of tables); the first table's rows, and rows already named alike, are kept as they are. A renamed row belongs to no model table, so a context transition over it filters no table: `SUMX(UNION(TS, TCU), CALCULATE(COUNTROWS(TCU)))` is 14 (ours 12). Tests: `tests/test_issue338_union_column_names.py` (26; 24 fail on 0.9.147).
 
-### Fixed — The storage-engine fusion follows the fourth round of Desktop answers. COUNTA is scanned with the sums beside it, and so are MIN / MAX under a filter. An IF whose condition reads the data scans the branch it takes on its own. The columns of one ROW, and the transitions of one ADDCOLUMNS row, are scanned together (#339).
+### Fixed — aggregations Desktop scans together cut each other (issue #339)
 
+Power BI Desktop 2.152 scans the sums of one table in one filter context as one storage-engine query, so each sum is also cut at the other columns' run boundaries. Agents' SUM(SalesAmount) + SUM(TotalCost) ends in ...445394 in Desktop, where two separate scans end in ...445398. The census 'Profit Margin' (DIVIDE([Profit], [Total Sales])) ends in ...951075.
+
+A cheap static reading of each evaluation now finds which SUM, AVERAGE, COUNT, SUMX and AVERAGEX share a scan:
+- It looks through measures, scalar functions (SELECTEDVALUE's alternate result included) and filterless CALCULATE, and reads a bare `[column]` with the measure's home table.
+- A CALCULATE with filters, TOTALYTD and its kin, and an iterator's expression are each a scan of their own.
+- Each group of SUMMARIZE / SUMMARIZECOLUMNS is one scan over all its extension columns.
+- An IF with a constant condition scans only the branch it takes.
+- A nested measure joins its own scope to the one in force.
+- A scope applies only under its own filters. It is part of the aggregate memo key, and part of a nested measure's memo key for every table that measure can reach, so answers no longer depend on evaluation order.
+- COUNTROWS reads no column; MIN, MAX and DISTINCTCOUNT are not scanned with a sum; a different filter is a different scan.
+
+Desktop batteries: build_b243b.py fu_* 10 of 10 and a_profit_split; build_b243c.py f_count, f_if_true, f_if_false, s_sel_alt, s_sel_meas and f_sc_two.
+
+Tests: `tests/test_issue339_fused_scans.py` (7 tests, all fail on 0.9.147) and `tests/test_issue339_fusion_limits.py` (5 tests, all fail on 0.9.147 and on rel148).
+
+The storage-engine fusion follows the fourth round of Desktop answers. COUNTA is scanned with the sums beside it, and so are MIN / MAX under a filter. An IF whose condition reads the data scans the branch it takes on its own. The columns of one ROW, and the transitions of one ADDCOLUMNS row, are scanned together (#339).
 
 ### Fixed — a group's sum adds as Desktop's grouped scan (issue #340)
 
@@ -784,22 +800,50 @@ A SUMMARIZECOLUMNS group, a visual's row and an iteration's member summed their 
 
 The rule was found offline from Desktop's per-group answers on Agents (build_b243b.py): gb_ch 4 of 4, gb_chname 4 of 4, gb_store 306 of 306, gb_emp_mtd 262 of 262, where 0.9.147 got 0, 0, 47 and 169. A filter an iteration put there (a grouping, an iterated row) is a group-by of the scan; any other filter is a WHERE. evaluate_per_dimension's buckets keep their group column, so they add as the per-value path does. A stretch of group-bit-packed pieces is folded at once, so per-member scans cost about what they did on 0.9.147. Tests: `tests/test_issue340_grouped_scans.py` (5; all fail on 0.9.147).
 
-### Fixed — Unchanged from the previous report. (issue #341)
+### Fixed — a column over several segments adds per segment (issue #341)
 
+A VertiPaq table past about 1,048,576 rows is cut into segments. The engine now starts a piece at each segment, keeps one partial per segment, and adds the partials in segment order. The decoder hands the segments over with the runs.
 
-### Fixed — Unchanged from the previous report. (issue #342)
+Power BI Desktop 2.152 itself combines the segments in no fixed order: on Contoso's 13 segments (build_b243b.py cs_*), two sessions gave different last bits, and so did two spellings of one query. Every one of those 32 answers is the engine's per-segment partials added in some order. Segment order matches 19 of them, with the long-RLE chunks of #346.
 
+Tests: `tests/test_issue341_segments.py` (3 tests; all fail on 0.9.147).
 
-### Fixed — SUMX of a constant in a grouped scan (SUMMARIZECOLUMNS) adds value x the group's rows per 16,384-row chunk, as Power BI Desktop does, not row by row (#343).
+### Fixed — AVERAGEX adds the formula engine's values in the iteration's order (issue #342)
 
+AVERAGEX used to add its values correctly rounded (#246), while SUMX folded them. Power BI Desktop 2.152 folds them left to right in the iteration's order. Agents' AVERAGEX(ALLSELECTED(DimEmployee[EmployeeKey]), [MTD Total Sales]) is the fold in DimEmployee's order, blank member last, divided by the count: 73514.796034732862609 (build_b243b.py gb_avgx_emp; census 'Employees Avg MTD Sales'). 0.9.147 gave ...28189528. The iteration's order over FILTER(VALUES(...)) and inside IF branches is #345.
 
-### Fixed — CALCULATE(..., KEEPFILTERS(FILTER(T, <condition>))) cuts the storage-engine scan of T at the columns its condition reads, as the plain table filter does and as Power BI Desktop does (#344).
+Tests: `tests/test_issue342_averagex_order.py` (3 tests; all fail on 0.9.147).
 
+### Fixed — SUMX of a constant adds per 16,384-row chunk (issue #343)
 
-### Fixed — SUMX / AVERAGEX over one column's values now add the formula engine's values as Power BI Desktop does. In data-ID order the blank member comes first. An IF or SWITCH whose condition reads the data is a branch (it reorders), and a constant IF is not. A FILTER whose condition reads only its own column keeps the table's order. VALUES of a hash-encoded column adds in dictionary order with a measure too (#345).
+SUMX(T, 0.1) used to add 0.1 once per row. Power BI Desktop 2.152 adds an expression that reads no column in its storage engine, value x rows per 16,384-row chunk. Agents' SUMX(FactSales, 0.1) - 19999 is 0.899999999997817 in Desktop (build_b243c.py x_const); adding row by row gave 0.8999999894549546. AVERAGEX of a constant is that total over the count.
 
+Tests: `tests/test_issue343_constant_sumx.py` (5 tests; 4 fail on 0.9.147 and on rel148).
 
-### Fixed — Unchanged from the previous report. (issue #346)
+SUMX of a constant in a grouped scan (SUMMARIZECOLUMNS) adds value x the group's rows per 16,384-row chunk, as Power BI Desktop does, not row by row (#343).
+
+### Fixed — RELATED and FILTER table filters read the join column in the storage engine (issue #344)
+
+Power BI Desktop 2.152 reads another table in a scan through the scanned table's join column:
+- SUMX(FactSales, SalesAmount * RELATED(DimChannel[ChannelKey])) adds over the pieces of SalesAmount and channelKey (Agents x_related 0.972300052642822). It used to be folded row by row.
+- RELATED(DimStore[StoreKey]) in a FILTER condition cuts at FactSales[StoreKey] (r_filter_related).
+- CALCULATE(SUM(SalesAmount), FILTER(FactSales, RELATED(DimStore[StoreKey]) <> 0)) cuts at what its condition reads, not at every column of FactSales (r_filter_related_calc 0.215399503707886; the old reading gave 0.2154003381729126).
+
+Tests: `tests/test_issue344_related_join_column.py` (4 tests; all fail on 0.9.147 and on rel148).
+
+CALCULATE(..., KEEPFILTERS(FILTER(T, <condition>))) cuts the storage-engine scan of T at the columns its condition reads, as the plain table filter does and as Power BI Desktop does (#344).
+
+### Fixed — SUMX / AVERAGEX over one column's values add the formula engine's values in Desktop's order (issue #345)
+
+Where the formula engine computes the values (a measure per member), Desktop adds them either in the rows' order or in data-ID order, and the last bits show which (Agents, the Desktop-saved file; build_b243c.py, build_b243d.py). Data-ID order is BLANK first, then ascending values for a value-encoded column or the dictionary's order for a hash-encoded one; SUMX and AVERAGEX use it for a FILTER of one column's values whose condition reads a measure, for VALUES / DISTINCT / ALL / ALLSELECTED of one column inside an IF or SWITCH whose condition reads the data, and for VALUES of a hash-encoded column. Otherwise the rows' order is kept (storage order, the blank member last), also for a FILTER whose condition reads only the column, and an IF with a constant condition is no branch. Examples: `IF([_ShowValueForDates], SUMX(ALLSELECTED(DimEmployee[EmployeeKey]), [MTD Total Sales])) - 19260876` is 0.561099998652935 on Desktop (0.9.147: 0.561100009828806); `SUMX(VALUES(DimStore[StoreName]), [MTD Total Sales]) - 19260876` is 0.561099994927645 (0.561099998652935); census 'Employees Avg MTD Sales PM' matches. A VAR is evaluated where it is defined, and the measure memo keeps the order apart, so an answer no longer depends on evaluation order. Tests: `tests/test_issue345_fe_order.py`, `tests/test_issue345_b243d_order.py`.
+
+### Fixed — a long RLE run adds per 16,384-row chunk (issue #346)
+
+An RLE run of the summed column used to add its value x rows as one product. Power BI Desktop 2.152 adds one product per 16,384-row chunk, for RLE runs too.
+
+On Contoso's 13 segments (build_b243b.py), cs_cur, cs_salesquantity and cs_discountquantity now match. Every answer from both Desktop sessions is the segments' partials added in some order. In segment order the battery goes from 15 to 19 of 32. Runs of 16,384 rows or fewer are unchanged.
+
+Tests: `tests/test_issue346_long_rle_runs.py` (3 tests; 2 fail on 0.9.147 and on rel148).
 
 ## [0.9.147] - 2026-10-25
 
