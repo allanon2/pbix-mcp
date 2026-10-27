@@ -4,14 +4,20 @@ write (GENERATE(CALENDAR(...), VAR ... RETURN ROW(...))) need."""
 from pbix_mcp.dax.calc_tables import evaluate_calc_table_expression as calc
 
 
+def day(v) -> str:
+    """A date cell as YYYY-MM-DD, whether the engine holds it as text or as a datetime."""
+    return v.strftime("%Y-%m-%d") if hasattr(v, "strftime") else str(v)[:10]
+
+
 def test_generate_keeps_both_tables_column_names():
     got, err = calc('GENERATE(CALENDAR(DATE(2024,1,1), DATE(2024,1,2)), ROW("Y", YEAR([Date])))', {})
-    assert err is None and got == {"columns": ["Date", "Y"], "rows": [["2024-01-01", 2024], ["2024-01-02", 2024]]}
+    assert err is None and got["columns"] == ["Date", "Y"]
+    assert [[day(r[0]), r[1]] for r in got["rows"]] == [["2024-01-01", 2024], ["2024-01-02", 2024]]
 
 
 def test_a_calendar_row_reads_its_date_in_any_case():
     got, err = calc('ADDCOLUMNS(CALENDAR(DATE(2024,1,1), DATE(2024,1,1)), "M", MONTH([DATE]), "D", DAY([date]))', {})
-    assert err is None and got["rows"] == [["2024-01-01", 1, 1]]
+    assert err is None and [[day(r[0]), *r[1:]] for r in got["rows"]] == [["2024-01-01", 1, 1]]
 
 
 def test_variables_over_the_outer_row():
