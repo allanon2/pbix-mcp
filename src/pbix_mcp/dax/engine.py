@@ -30904,7 +30904,7 @@ class DAXEngine:
             result.append({
                 '__table__': '__calendar__',
                 '__column__': 'Date',
-                '__value__': current.strftime('%Y-%m-%d')
+                '__value__': datetime(current.year, current.month, current.day)
             })
             current += timedelta(days=1)
         return result
@@ -30935,7 +30935,7 @@ class DAXEngine:
             result.append({
                 '__table__': '__calendar__',
                 '__column__': 'Date',
-                '__value__': current.strftime('%Y-%m-%d')
+                '__value__': datetime(current.year, current.month, current.day)
             })
             current += timedelta(days=1)
         return result
