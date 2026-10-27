@@ -6396,6 +6396,28 @@ def _shared_filter_cache(tables) -> dict:
     return hit
 
 
+_ROW_META = ('__table__', '__column__', '__value__', '__blank_row__', '__parts__', '__row__')
+
+
+def _current_row_column(row: dict, name: str):
+    """``(found, value)`` of the column ``name`` in a row dict: its own key, the
+    same name in another case (DAX names ignore case), or the single column a
+    ``__column__``/``__value__`` row carries (CALENDAR, VALUES). A SELECTCOLUMNS
+    row (_ColumnsRow) carries its source's ``__column__`` as lineage only, so an
+    enclosing row's column of that name is the one meant (#225)."""
+    if name in row:
+        return True, row[name]
+    low = name.lower()
+    for k, v in row.items():
+        if k not in _ROW_META and isinstance(k, str) and k[:1] != '_' and k.lower() == low:
+            return True, v
+    col = row.get('__column__')
+    if (isinstance(col, str) and '__value__' in row and col.lower() == low
+            and not isinstance(row, _ColumnsRow)):
+        return True, row['__value__']
+    return False, None
+
+
 def _extremum(cur, cand, want_max: bool):
     """Running MAX/MIN across the types DAX's MAXX/MINX accept.
 
@@ -12593,9 +12615,10 @@ class DAXEngine:
                         f"found or may not be used in this expression")
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
-                    _v = ctx._current_row[data]
+                if (ctx._current_row and not self._measure_exists(data, ctx)
+                        and (_hit := _current_row_column(ctx._current_row, data))[0]):
+                    # its own key, another case of it, or a CALENDAR / VALUES row's one column
+                    _v = _hit[1]
                     # a Fixed Decimal column reads as a Currency (issue #248),
                     # a natural join's right-hand one too (_joined_typed)
                     if type(_v) is float and ctx._cur_tcols:
@@ -12715,9 +12738,10 @@ class DAXEngine:
             if kind == _P_VARRET:
                 return self._eval_var_return(data, ctx, var_scope)
             if kind == _P_BRACKET2:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
-                    _v = ctx._current_row[data]
+                if (ctx._current_row and not self._measure_exists(data, ctx)
+                        and (_hit := _current_row_column(ctx._current_row, data))[0]):
+                    # its own key, another case of it, or a CALENDAR / VALUES row's one column
+                    _v = _hit[1]
                     if type(_v) is float and ctx._cur_tcols:
                         if ((ctx._current_row.get('__table__'), data) in ctx._cur_tcols
                                 and _cur_lineage(ctx._current_row, data)):
