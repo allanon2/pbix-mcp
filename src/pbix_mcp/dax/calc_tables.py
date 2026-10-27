@@ -1696,8 +1696,12 @@ def evaluate_row_context_column(
     target_table: str,
     all_tables: Dict[str, dict],
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ):
     """Evaluate a row-context calc-column expression against a table's rows.
+
+    ``culture`` is the model's (FORMAT's separators and names); None leaves the
+    engine's default.
 
     Returns ``(values, error)``. ``error`` is None on success; otherwise a
     string and ``values`` is None. The caller MUST have already cleared
@@ -1782,6 +1786,7 @@ def evaluate_row_context_column(
         try:
             actx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            actx.culture = culture
             base_scope[_AGG_MASK.format(n)] = engine._eval_expr(call, actx)
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
@@ -1865,6 +1870,7 @@ def evaluate_row_context_column(
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            ctx.culture = culture
             # Column refs resolve through the engine's own row context, so the
             # SAME text evaluates on every row and its plan is parsed once.
             ctx._current_row = {'__table__': target_table, **row_data}
@@ -1934,6 +1940,35 @@ def calc_table_unsupported_reason(expression: str) -> Optional[str]:
     return None
 
 
+def _generate_named(row: dict) -> dict:
+    """A GENERATE / GENERATEALL row (the engine prefixes the inner row's keys
+    ``_inner_``, one level deeper per nested GENERATE) as its columns by name:
+    the outer row's, then each inner row's, as DAX returns them. A row's one
+    cell carried as ``__column__``/``__value__`` (CALENDAR, VALUES) is that
+    column, but not a row of columns' (``__columns__``: SELECTCOLUMNS keeps its
+    source's ``__column__`` as lineage only). A name both sides have raises
+    ValueError, as Desktop refuses a repeated column."""
+    inner = {k[7:]: v for k, v in row.items() if str(k).startswith("_inner_")}
+    own = {k: v for k, v in row.items() if not str(k).startswith("_inner_")}
+    out = {k: v for k, v in own.items() if not str(k).startswith("_")}
+    col = own.get("__column__")
+    if (isinstance(col, str) and "__value__" in own and col not in own
+            and not own.get("__columns__") and not own.get("__parts__")
+            and type(row).__name__ != "_ColumnsRow"):
+        out[col] = own["__value__"]
+    for k in ("__table__", "__parts__", "__blank_row__"):
+        if k in own:
+            out[k] = own[k]
+    if inner:
+        for k, v in _generate_named(inner).items():
+            if str(k).startswith("_"):
+                continue
+            if any(k.lower() == c.lower() for c in out if not str(c).startswith("_")):
+                raise ValueError(f"a column named '{k}' comes from both tables")
+            out[k] = v
+    return out
+
+
 def _flatten_part_rows(result: list) -> list:
     """Rows that carry ``__parts__`` as plain rows of their columns.
 
@@ -1944,6 +1979,8 @@ def _flatten_part_rows(result: list) -> list:
     order written. A column name two parts share raises ValueError: Power BI
     Desktop 2.152 refuses CROSSJOIN(VALUES(Dim[Region]), VALUES(Orders[Region]))
     as a calculated table ("a column named Region already exists", #151)."""
+    if any(str(k).startswith("_inner_") for r in result if isinstance(r, dict) for k in r):
+        result = [_generate_named(r) if isinstance(r, dict) else r for r in result]
     out = []
     for r in result:
         parts = r.get("__parts__") if isinstance(r, dict) else None
@@ -1952,6 +1989,7 @@ def _flatten_part_rows(result: list) -> list:
             continue
         part_cols: list = []
         part_vals: list = []
+        cell_only = False   # a single-column part whose cell the row holds only in that part (GENERATE)
         for part in parts:
             plain = [k for k in part if not str(k).startswith("__")]
             if plain:
@@ -1960,10 +1998,11 @@ def _flatten_part_rows(result: list) -> list:
             elif part.get("__column__"):
                 part_cols.append(part["__column__"])
                 part_vals.append(part.get("__value__"))
+                cell_only = cell_only or part["__column__"] not in r
         dup = next((c for c in part_cols if part_cols.count(c) > 1), None)
         if dup is not None:
             raise ValueError(f"a column named '{dup}' comes from two tables")
-        if any(str(k).startswith("_2_") for k in r):
+        if cell_only or any(str(k).startswith("_2_") for k in r):
             row = dict(zip(part_cols, part_vals))
             row.update({k: v for k, v in r.items() if not str(k).startswith(("__", "_2_"))
                         and k not in row})
@@ -1978,8 +2017,16 @@ def evaluate_calc_table_expression(
     tables: Dict[str, dict],
     measures: Optional[Dict[str, str]] = None,
     relationships: Optional[List[dict]] = None,
+    *,
+    culture: Optional[str] = None,
+    measure_tables: Optional[Dict[str, str]] = None,
+    model_columns: Optional[dict] = None,
 ):
     """Evaluate a calculated-table DAX expression to ``{columns, rows}``.
+
+    ``culture``, ``measure_tables`` and ``model_columns`` are the model's, as
+    a measure evaluation gets them (FORMAT's culture; a measure's home table
+    for its bare column references; the model's own column list).
 
     Returns ``(result, error)``; ``error`` is None on success. Refuses (rather
     than returning a partial/blank table) when the engine reports an
@@ -1993,6 +2040,11 @@ def evaluate_calc_table_expression(
     engine = dax_engine.DAXEngine()
     ctx = dax_engine.DAXContext(
         tables, measures or {}, None, None, None, relationships or [])
+    ctx.culture = culture
+    if measure_tables is not None:
+        ctx.measure_tables = measure_tables
+    if model_columns is not None:
+        ctx.model_columns = model_columns
     try:
         result = engine._eval_expr(clean, ctx)
     except Exception as e:  # noqa: BLE001 — refuse, never persist garbage
@@ -2034,6 +2086,14 @@ def evaluate_calc_table_expression(
     for r in result:
         if [k for k in r.keys() if k not in meta] != cols:
             return None, "result rows have inconsistent columns"
+    # ADDCOLUMNS(VALUES(T[C]), "N", ...) keeps T[C] as __column__/__value__
+    # beside its added columns: it is the table's first column, not noise.
+    lead = result[0].get("__column__")
+    if (lead and "__value__" in result[0] and lead not in cols
+            and all(r.get("__column__") == lead and "__value__" in r for r in result)):
+        return _untype_currency({"columns": [lead, *cols],
+                                 "rows": [[r.get("__value__"), *(r.get(c) for c in cols)]
+                                          for r in result]}), None
     return _untype_currency({"columns": cols,
                              "rows": [[r.get(c) for c in cols] for r in result]}), None
 
