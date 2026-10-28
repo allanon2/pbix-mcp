@@ -1219,7 +1219,7 @@ wheels = [
 
 [[package]]
 name = "pbix-mcp"
-version = "0.9.151+pivotstudio.1"
+version = "0.9.151+pivotstudio.2"
 source = { editable = "." }
 dependencies = [
     { name = "apsw", version = "3.54.0.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
