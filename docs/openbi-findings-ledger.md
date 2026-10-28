@@ -40,8 +40,9 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-28 (0.9.150): docs 1-66 and GitHub issues/PRs #1-#359 are
-closed.** 0.9.150 closes PRs #352 and #353 (@allanon2), solved as #354-#357
+**Updated 2026-10-28 (0.9.151): docs 1-66 and GitHub issues/PRs #1-#360 are
+closed.** 0.9.151 publishes 0.9.150 (whose release gate failed under pytest
+9.2) with #360, the engine proxy's delete. 0.9.150 closes PRs #352 and #353 (@allanon2), solved as #354-#357
 (CALENDAR rows hold dates, a bare column over one-column rows and in any case,
 GENERATE and ADDCOLUMNS calculated tables named as DAX does), and #358-#359
 (a row's column wins over a measure of its name; TOCSV headings), settled by
@@ -584,7 +585,7 @@ Kept so the same items are not re-litigated:
 ## Recently closed
 
 - **GH #352, #353, #354-#359** (PRs #352 / #353 by @allanon2, solved on our
-  side; #358-#359 found by their Desktop battery) -- CLOSED (0.9.150). CALENDAR
+  side; #358-#359 found by their Desktop battery) -- CLOSED (0.9.150, published as 0.9.151; #360 the CI fix). CALENDAR
   rows hold dates (#354); bare columns over one-column rows, any case (#355);
   GENERATE / ADDCOLUMNS calculated tables (#356, #357); a row's column beats a
   measure of its name (#358); TOCSV headings (#359). Desktop: build_b358.py,

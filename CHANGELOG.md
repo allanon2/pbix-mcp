@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.151] - 2026-10-28
+
+0.9.150's changes, published: the 0.9.150 tag's release did not publish (its CI gate failed under pytest 9.2.0, which the local runs, on 9.0.2, did not use), and nothing of 0.9.150 reached PyPI. This release carries every 0.9.150 change below and the fix for that failure.
+
+### Fixed — the engine proxy forwards a delete to the thread's engine (issue #360)
+
+`monkeypatch.setattr(de._engine, "_eval_expr", f)` patches the module's per-thread engine proxy, which forwards the set to this thread's DAXEngine (#272). pytest 9.2 records that the proxy itself has no such attribute and undoes the patch with `delattr(proxy, "_eval_expr")`; the proxy forwarded getattr and setattr but not delattr, so the delete raised AttributeError and `f` stayed on the engine, shadowing the class for later tests (CI of the 0.9.150 tag on every platform: `tests/test_issue272_engine_proxy_isolation.py`, a teardown error in `tests/test_issue186_shared_memo.py`). The proxy now forwards delattr too. Tests: `tests/test_issue360_engine_proxy_delattr.py` (3; 2 fail on 0.9.149).
+
 ## [0.9.150] - 2026-10-28
 
 @allanon2's pull requests #352 and #353, solved on our side (their code read as a description only), and two defects their Desktop battery exposed. Desktop batteries: `build_b358.py` (38 probes) and `build_b358b.py` (13).

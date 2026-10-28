@@ -31139,6 +31139,15 @@ class _PerThreadEngine:
             return
         setattr(eng, name, value)
 
+    def __delattr__(self, name: str) -> None:
+        # What pytest 9.2's monkeypatch undo of setattr(_engine, "_eval_expr",
+        # f) calls, having found no such attribute on the proxy itself: the
+        # attribute the set put on this thread's engine goes. Without it the
+        # delete failed on the proxy's slots and f stayed on the engine,
+        # shadowing the class for later tests (#360; #272 was the undo through
+        # setattr).
+        delattr(self._get(), name)
+
 
 _engine: DAXEngine = _PerThreadEngine()  # type: ignore[assignment]
 
