@@ -256,3 +256,24 @@ class TestTableNames:
 
     def test_case_and_escapes(self):
         assert _dax_table_names("COUNTROWS(sales) + COUNTROWS('Fact A''s')", self.KNOWN | {"Fact A's"}) == {"Sales", "Fact A's"}
+
+
+class TestTypedValues:
+    """A calculated value as the column's declared type stores it (refresh._typed)."""
+
+    def test_a_date_difference_in_a_whole_number_column_is_its_days(self):
+        # BASEDATE - TODAY() over CALENDAR rows is a datetime in DAX; a column
+        # set to Whole number holds its OLE serial: the days between them
+        # (Microsoft's Artificial Intelligence sample, Case Calendar[RELATIVE DAY]).
+        import datetime as dt
+        from pbix_mcp.refresh import _typed
+        assert _typed(dt.datetime(1899, 12, 30), 6, "T", "C") == 0
+        assert _typed(dt.datetime(1900, 1, 2), 6, "T", "C") == 3
+        assert _typed(dt.datetime(1899, 12, 20), 6, "T", "C") == -10
+        assert type(_typed(dt.datetime(2024, 1, 1), 6, "T", "C")) is int
+
+    def test_a_datetime_with_a_time_in_a_whole_number_column_is_refused(self):
+        import datetime as dt
+        from pbix_mcp.refresh import _typed
+        with pytest.raises(RefreshError, match="Int64"):
+            _typed(dt.datetime(1900, 1, 2, 6), 6, "T", "C")

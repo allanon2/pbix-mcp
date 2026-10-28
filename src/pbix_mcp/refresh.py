@@ -426,6 +426,12 @@ def _typed(value: Any, amo: int, table: str, column: str) -> Any:
                 return got
     elif amo == 6 and isinstance(value, (int, float)) and not isinstance(value, bool) and float(value).is_integer():
         return int(value)
+    elif amo == 6 and isinstance(value, dt.datetime):
+        # a date difference (BASEDATE - TODAY()) is a datetime in DAX; a whole number column holds its OLE serial
+        from pbix_mcp.m.library import datetime_to_ole
+        serial = datetime_to_ole(value)
+        if float(serial).is_integer():
+            return int(serial)
     elif amo in (8, 10) and isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value)
     elif amo == 2 and isinstance(value, str):
