@@ -53,8 +53,12 @@ def test_measure_reference_costs_about_what_calculate_costs():
     t_calc, v_calc = _timed("SUMX(Fact, CALCULATE(SUM(Fact[Amt])))", tables, rels)
     t_meas, v_meas = _timed("SUMX(Fact, [S])", tables, rels)
     assert v_meas == pytest.approx(v_calc)
-    # 0.9.128: 1.8x; 0.9.127 1.1x; with the context's signature as the key 1.0x
-    assert t_meas < 1.45 * t_calc, (t_meas, t_calc)
+    # 0.9.128: 1.8x; 0.9.127 1.1x; with the context's signature as the key 1.0x.
+    # The bound sits between the defect it guards (2x) and the noise a loaded
+    # machine adds: 0.9.149 measured 1.40-1.48 on an Apple M4 under a parallel
+    # build (#361), 1.18 here. What #361's slowdown cost per row is pinned by
+    # count, not time, in tests/test_issue361_measure_reference_row_lookup.py.
+    assert t_meas < 1.6 * t_calc, (t_meas, t_calc)
 
 
 def test_memo_key_is_the_context_signature():
