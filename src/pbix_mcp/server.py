@@ -12499,6 +12499,7 @@ _CALC_COL_REF_RE = re.compile(r"(?:'([^']+)'|([A-Za-z_][A-Za-z0-9_]*))\s*\[\s*([
 
 def _infer_calc_type_name(values: list) -> str:
     """Best-effort AMO type NAME for a materialized calc column's values."""
+    from datetime import date as _date_type
     vals = [v for v in values if v is not None]
     if not vals:
         return "String"
@@ -12508,6 +12509,11 @@ def _infer_calc_type_name(values: list) -> str:
         return "Int64"
     if all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in vals):
         return "Double"
+    if all(isinstance(v, _date_type) for v in vals):
+        # dates as DATE() and CALENDAR return them (issue #354): a calculated
+        # table of CALENDAR(..) keeps a date column, where its days stored as
+        # the text '2024-01-01 00:00:00'
+        return "DateTime"
     return "String"
 
 

@@ -146,10 +146,19 @@ def test_without_a_home_column_the_argument_resolves_as_before(home):
     assert _ev("SUMX(VALUES(TBool[A]), SUM([A]))", home) == 30
 
 
-def test_a_measure_still_wins_over_a_column():
+def test_the_rows_column_wins_over_a_measure():
+    # was "a measure still wins" (200), a derived case; Power BI Desktop 2.152
+    # reads a model table row's column over a measure of its name (issue
+    # #358, build_b358b.py t_sumx: SUMX(T, [Amount]) with a measure Amount is
+    # 6, T's own Amount), here TBool's A = 10 + 5
     measures = {"m": "SUMX(TBool, [A])", "A": "100"}
     out = de.evaluate_measures_batch(["m"], TABLES, measures, measure_tables={"m": "TA", "A": "TA"})
-    assert out["m"] == 200
+    assert out["m"] == 15
+    # a row without the column, and no enclosing row, still reads the measure
+    # (build_b358b.py m_plain: [Amount] outside a row is the measure)
+    measures = {"m": "SUMX(D4, [A])", "A": "100"}
+    out = de.evaluate_measures_batch(["m"], TABLES, measures, measure_tables={"m": "TA", "A": "TA"})
+    assert out["m"] == 300
 
 
 def test_unknown_name_is_still_an_error():

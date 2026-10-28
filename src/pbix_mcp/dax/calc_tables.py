@@ -1934,6 +1934,104 @@ def calc_table_unsupported_reason(expression: str) -> Optional[str]:
     return None
 
 
+def _is_columns_row(row: dict) -> bool:
+    """Is ``row`` a SELECTCOLUMNS row (the engine's _ColumnsRow), whose
+    ``__column__`` is its source's lineage, not a column of its own?"""
+    from pbix_mcp.dax.engine import _ColumnsRow
+    return isinstance(row, _ColumnsRow)
+
+
+def _cells_by_name(row: dict) -> list:
+    """One engine row as ``(column, value)`` pairs in DAX's column order, read
+    as the engine's own _row_cells reads its cells (DISTINCT / EXCEPT, #234).
+
+    * A row of one column (VALUES / DISTINCT / ALL of a column, CALENDAR)
+      holds that cell as ``__value__``, named by ``__column__``, and ADDCOLUMNS
+      puts its columns after it: ADDCOLUMNS(VALUES(T[C]), "N", ..) is C then N
+      (issue #357), where the calculated table kept N alone. A row of columns
+      (_ColumnsRow, a SELECTCOLUMNS row) carries its source's ``__column__``
+      as lineage only (#225, #234), and a row that has a key of that name
+      (ROW, GENERATESERIES, DATATABLE) holds the cell there.
+    * A GENERATE / GENERATEALL row is its outer row's columns, then its inner
+      row's, kept under keys prefixed ``_inner_`` (one level deeper per
+      nested GENERATE; _generate_inner): the calculated table carried those
+      keys as its column names (issue #356). Microsoft's GENERATE: "a table
+      with the Cartesian product between each row in table1 and the table
+      that results from evaluating table2 in the context of the current row
+      from table1", table1's columns first, as Desktop stores the Artificial
+      Intelligence sample's Case Calendar (Date, then the ROW's DAY, DaySeq,
+      ...).
+    * A CROSSJOIN row's parts come first, then the columns ADDCOLUMNS put on
+      the joined row (the right part's copies are prefixed ``_2_``, #108)."""
+    parts = row.get("__parts__")
+    out: list = []
+    copied: set = set()
+    for part in parts or ():
+        out += _cells_by_name(part)
+        copied.update(part)
+    single = row.get("__column__")
+    lone = (isinstance(single, str) and not parts and single not in row and "__value__" in row
+            and not row.get("__columns__") and not _is_columns_row(row))
+    # GENERATE marks every level of its inner row with its table key, so a
+    # column a user named "_inner_x" on another row stays a column
+    generate = "_inner___table__" in row
+    inner: dict = {}
+    inner_at = -1
+    for raw_key, cell in row.items():
+        key = str(raw_key)
+        if key.startswith("__"):
+            if lone and key == "__value__":
+                out.append((single, cell))
+        elif key in copied or (parts and key.startswith("_2_")):
+            continue        # a part's own column, or the right part's copy of it
+        elif generate and key.startswith("_inner_"):
+            if inner_at < 0:
+                inner_at = len(out)
+            inner[key[len("_inner_"):]] = cell
+        else:
+            out.append((key, cell))
+    if inner_at >= 0:
+        # the inner row's columns go where its keys began
+        out[inner_at:inner_at] = _cells_by_name(inner)
+    return out
+
+
+def _needs_cell_names(row: dict) -> bool:
+    """Is ``row`` one the calculated table must read through _cells_by_name:
+    a GENERATE row (#356), or a row of one column that also carries columns
+    ADDCOLUMNS added (#357)? Rows of plain columns and CROSSJOIN / SUMMARIZE
+    rows (_flatten_part_rows) are read as before."""
+    if "_inner___table__" in row:
+        return True
+    single = row.get("__column__")
+    return (isinstance(single, str) and single not in row and "__value__" in row
+            and "__parts__" not in row and not row.get("__columns__")
+            and not _is_columns_row(row)
+            and any(not str(k).startswith("__") for k in row))
+
+
+def _named_row(row: dict) -> dict:
+    """``row`` as a plain row of its columns by name (_cells_by_name). A name
+    that comes twice, in any case, raises ValueError: Microsoft's GENERATE
+    and CROSSJOIN require "all column names from table1 and table2 [to] be
+    different", and Power BI Desktop 2.152 refuses a calculated table with a
+    repeated column (#151) -- a GENERATE row's in the words
+    _flatten_part_rows uses for CROSSJOIN, a column ADDCOLUMNS added beside a
+    one-column row's as one that exists already."""
+    named: dict = {}
+    folded: set = set()
+    for name, value in _cells_by_name(row):
+        if name.lower() in folded:
+            if "_inner___table__" in row:
+                raise ValueError(f"a column named '{name}' comes from two tables")
+            raise ValueError(f"a column named '{name}' already exists")
+        folded.add(name.lower())
+        named[name] = value
+    if row.get("__blank_row__"):
+        named["__blank_row__"] = row["__blank_row__"]
+    return named
+
+
 def _flatten_part_rows(result: list) -> list:
     """Rows that carry ``__parts__`` as plain rows of their columns.
 
@@ -1943,9 +2041,15 @@ def _flatten_part_rows(result: list) -> list:
     SUMMARIZE row over several tables (#117) keeps its merged columns in the
     order written. A column name two parts share raises ValueError: Power BI
     Desktop 2.152 refuses CROSSJOIN(VALUES(Dim[Region]), VALUES(Orders[Region]))
-    as a calculated table ("a column named Region already exists", #151)."""
+    as a calculated table ("a column named Region already exists", #151).
+
+    A GENERATE row, and a row of one column ADDCOLUMNS added to, is read by
+    its cells' names instead (_named_row; issues #356, #357)."""
     out = []
     for r in result:
+        if isinstance(r, dict) and _needs_cell_names(r):
+            out.append(_named_row(r))
+            continue
         parts = r.get("__parts__") if isinstance(r, dict) else None
         if not parts:
             out.append(r)

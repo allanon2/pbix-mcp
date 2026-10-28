@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.150] - 2026-10-28
+
+@allanon2's pull requests #352 and #353, solved on our side (their code read as a description only), and two defects their Desktop battery exposed. Desktop batteries: `build_b358.py` (38 probes) and `build_b358b.py` (13).
+
+Verified before release:
+
+- **Desktop:** b358 38 of 38 (0.9.149: 17), b358b 13 of 13 (0.9.149: 3). Microsoft's Artificial Intelligence sample's Case Calendar and Opportunity Calendar, calculated tables written as GENERATE(CALENDAR(..), ROW(..)), recompute equal to what Desktop stored in every column that does not read TODAY(): 1,827 rows, 19,732 cells (0.9.149 could not evaluate them).
+- **Tests:** full suite 10,898 passed, 7 xfailed. The 89 new tests all pass; 62 of them fail on 0.9.149.
+- **Earlier batteries:** b210, b200, b253 and the 0.9.148 batteries answer as on 0.9.149; regress_check unchanged; corpus census: no measure changed but those that call RAND.
+- **Lint and types:** ruff is clean. mypy is at 131.
+
+### Fixed — CALENDAR and CALENDARAUTO rows hold dates (issue #354; reported in PR #353 by @allanon2)
+
+Each row carried its day as ISO text ('2020-01-01'), and arithmetic reads text as a number, so over a CALENDAR row `[Date] - 3` was 43828.0 and `[Date] - 1 * WEEKDAY([Date])` 43827.0, where `DATE(2020, 1, 1) - 3` is a date. The rows now hold the day as a datetime at midnight, as DATE() returns it. Power BI Desktop 2.152 (build_b358.py d_*) prints "12/29/2019,12/30/2019" and ISDATETIME is TRUE. The Artificial Intelligence sample's Case Calendar[WEEK] now equals Desktop's stored dates. A calculated table or column of dates is typed DateTime (it stored text). Filters, FORMAT, TREATAS and DATEDIFF over CALENDAR read the dates as before; INTERSECT, EXCEPT and DISTINCT(UNION) with a date column now match it. Tests: `tests/test_issue354_calendar_rows_are_dates.py` (24; 16 fail on 0.9.149).
+
+### Fixed — a bare [Column] over a one-column row, and a row's column in another case (issue #355; reported in PR #352 by @allanon2)
+
+`ADDCOLUMNS(CALENDAR(..), "M", MONTH([DATE]))` failed ("Measure or column '[DATE]' cannot be found"). A one-column row's column (CALENDAR, VALUES, DISTINCT) was matched only in its exact spelling, and so were the columns ADDCOLUMNS, SELECTCOLUMNS, ROW or GENERATE's inner row made. DAX names ignore case. Power BI Desktop 2.152 answers m_month_day_case "1-30,1-31,2-1", m_month_sumx 4 and v_added_other_case "Ex,Nx,Wx" (build_b358.py; 0.9.149: BLANK). Currency typing (#248), natural-join typing and SELECTCOLUMNS' lineage-only column (#225) are unchanged; for a column against a measure of the same name, see #358. Tests: `tests/test_issue355_bare_column_any_case.py` (15; 11 fail on 0.9.149).
+
+### Fixed — a calculated table written GENERATE(...) names its columns as DAX does (issue #356; reported in PR #352 by @allanon2)
+
+It took GENERATE's internal keys (`_inner___table__`, `_inner_Y`, ...) as columns and lost the outer CALENDAR's Date. It now holds the outer table's columns, then the inner's (nested GENERATE too). A name both tables have is refused, as Desktop refuses a repeated column in a calculated table (#151; in a measure Desktop keeps both, g_shared_rows 3). GENERATEALL's unmatched rows keep the inner columns BLANK (#300). Both of the Artificial Intelligence sample's calendars recompute equal to Desktop's stored values. Tests: `tests/test_issue356_generate_calc_table_columns.py` (14 + the sample test; 8 fail on 0.9.149, the sample test too).
+
+### Fixed — ADDCOLUMNS over a one-column table keeps that column in a calculated table (issue #357; reported in PR #352 by @allanon2)
+
+`ADDCOLUMNS(VALUES(T[C]), "N", ..)` was the table N alone, and `ADDCOLUMNS(CALENDAR(..), ...)` lost Date. The calculated table now holds C first, then the added columns (Desktop 2.152: a_values_csv `'T'[Region],[N]`, a_cal_csv `[Date],[M]`); an added column named like C is refused ("already exists"). Tests: `tests/test_issue357_addcolumns_single_column_table.py` (8; 6 fail on 0.9.149).
+
+### Fixed — a row's column wins over a measure of its name, the current row's and an enclosing one's (issue #358)
+
+In a row context that holds the column, a bare `[name]` now reads the column, whatever the case: an ADDCOLUMNS column, a model table's own row, VALUES / SUMMARIZE / SELECTCOLUMNS / CROSSJOIN / CALENDAR rows, and an enclosing row's column under an inner iterator over a table without it. 0.9.149 read the measure whenever its name matched the reference exactly. Power BI Desktop 2.152, with measures MVAL = 100 and Amount = 100: `SUMX(ADDCOLUMNS(P, "MVAL", 1), [MVAL])` is 2 in every case variant (build_b358.py); `SUMX(T, [Amount])` 6, `COUNTROWS(FILTER(T, [Amount] > 1))` 2, `SUMX(CROSSJOIN(T, P), [Amount])` 12 and `SUMX(ADDCOLUMNS(P, "MVAL", 3), SUMX(T, [MVAL]))` 18 (build_b358b.py; 0.9.149: 300, 3, 600, 600). The measure still wins inside CALCULATE (`SUMX(T, CALCULATE([Amount]))` 300) and outside any row (`[Amount]` 100). FILTER no longer evaluates such a conjunct once for the whole scan as if it read no row (#249). Tests: `tests/test_issue358_row_column_wins_over_measure.py` (18; 14 fail on 0.9.149); `test_issue235_bare_columns.py`'s derived "a measure still wins" case now follows Desktop's rule.
+
+### Fixed — TOCSV heads GENERATE, GENERATEALL and one-column rows as Desktop does (issue #359)
+
+TOCSV printed the first row's keys as written, every one headed with the row's table: GENERATE printed `'__calendar__'[_inner_Y]`, GENERATE(T, U) dropped U's columns, and `ADDCOLUMNS(VALUES(T[Region]), "N", 1)` printed empty lines. TOCSV and TOJSON now head a model table's column `'T'[C]` and any other column `[C]` (an added column named like a model column too), in DAX's column order. Desktop 2.152 (build_b358.py *_csv) answers `'T'[Region],'T'[Amount],'U'[Region],'U'[X]` for TOCSV(GENERATE(T, U)) and `[Date],[Y]` for GENERATE(CALENDAR(..), ROW("Y", ..)); all seven probes match. Tests: `tests/test_issue359_tocsv_generate_addcolumns.py` (10; 10 fail on 0.9.149).
+
 ## [0.9.149] - 2026-10-26
 
 @allanon2's pull request #253, re-implemented on our side against 0.9.148: the PR was written against 0.9.147, whose correctly rounded Double totals are no longer the scan's answer (#243), so every route here is checked against 0.9.148's plain scan instead. The rework's differential also found two defects of 0.9.148's running-total route.

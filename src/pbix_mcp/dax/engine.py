@@ -6884,6 +6884,13 @@ class _ColumnsRow(dict):
     though Orders2 has only those two columns (build_b117.py, issue #152)."""
 
 
+class _NamedColumnsRow(_ColumnsRow):
+    """A SELECTCOLUMNS row: a row of columns it names itself. A column keeps
+    its source's lineage, but TOCSV heads it by its own name alone (issue
+    #359; Power BI Desktop 2.152, build_b358.py g_all_csv:
+    SELECTCOLUMNS(U, "X", U[X]) is [X], where U's own row is 'U'[X])."""
+
+
 class _TreatasTable(list):
     """TREATAS used as a table (DAXEngine._fn_treatas): the rows of its
     target columns, with ``marker``, the filter CALCULATE applies
@@ -6927,6 +6934,40 @@ def _part_value(part: dict, col: str):
     return part.get('__value__') if part.get('__column__') == col else None
 
 
+def _key_any_case(row: dict, name: str) -> Optional[str]:
+    """The key of ``row`` that names the column ``name`` in another case,
+    None when there is none. DAX names ignore case (issue #355). The engine's
+    own keys never match: the ``__`` markers, a CROSSJOIN's right-part copies
+    (``_2_``) and GENERATE's inner row (``_inner_``), which their own readers
+    walk."""
+    wanted = name.lower()
+    for k in row:
+        if (type(k) is str and k != name and k.lower() == wanted
+                and not k.startswith(('__', '_2_', '_inner_'))):
+            return k
+    return None
+
+
+def _calendar_days(first: datetime, last: datetime) -> list:
+    """CALENDAR's / CALENDARAUTO's rows: one per day from ``first`` to
+    ``last`` (their times of day dropped), each the column Date holding the
+    day as a date-time at midnight, the value DATE() returns (issue #354).
+    The rows held the day as ISO text ('2020-01-01'), which arithmetic reads
+    as a number, so [Date] - 3 over a CALENDAR row was 43828 where Microsoft
+    documents a date column of dates ("Returns a table with a single column
+    named "Date" that contains a contiguous set of dates") and the Artificial
+    Intelligence sample's Case Calendar[WEEK] ([Date] - 1 * WEEKDAY([Date]))
+    is stored by Desktop as dates."""
+    day = datetime(first.year, first.month, first.day)
+    stop = datetime(last.year, last.month, last.day)
+    one = timedelta(days=1)
+    rows = []
+    while day <= stop:
+        rows.append({'__table__': '__calendar__', '__column__': 'Date', '__value__': day})
+        day += one
+    return rows
+
+
 def _generate_outer(row) -> dict:
     """A copy of GENERATE's outer row to add the inner row's keys to, of the
     row's own kind, as ADDCOLUMNS copies it: a row of columns (_ColumnsRow)
@@ -6949,13 +6990,15 @@ def _generate_inner(item: dict, prefix: str = '_inner_') -> dict:
     column as lineage only, which its prefixed copy cannot tell;
     DAXEngine._row_cells would read it as a column, so it stays out (issue
     #234). A row of columns is marked ``__columns__``: its context
-    transition filters nothing here (DAXEngine._generate_row_filters)."""
+    transition filters nothing here (DAXEngine._generate_row_filters); a
+    SELECTCOLUMNS row's mark is ``'named'`` (its columns head TOCSV by their
+    own names, #359)."""
     if isinstance(item, _ColumnsRow):
         if item.get('__column__') not in item:
             out = {prefix + k: v for k, v in item.items() if k != '__column__' and k != '__value__'}
         else:
             out = {prefix + k: v for k, v in item.items()}
-        out[prefix + '__columns__'] = True
+        out[prefix + '__columns__'] = 'named' if isinstance(item, _NamedColumnsRow) else True
     else:
         out = {prefix + k: v for k, v in item.items()}
     # every level has its table key, '' for a row of none, so a reader
@@ -12593,8 +12636,11 @@ class DAXEngine:
                         f"found or may not be used in this expression")
                 return (table_name, col_name)
             if kind == _P_BRACKET1:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
+                # the current row's own column wins over a measure of its
+                # name, in any case (issue #358; Desktop 2.152, build_b358.py
+                # n_measure_*: SUMX(ADDCOLUMNS(P, "kval", 1), [kval]) with a
+                # measure Kval = 100 is 2 over two rows, not 200)
+                if ctx._current_row and data in ctx._current_row:
                     _v = ctx._current_row[data]
                     # a Fixed Decimal column reads as a Currency (issue #248),
                     # a natural join's right-hand one too (_joined_typed)
@@ -12629,6 +12675,15 @@ class DAXEngine:
                     raise DAXEvaluationError(
                         f"Measure or column '[{data}]' cannot be found or "
                         f"may not be used in this expression")
+                if ctx._current_row is not None or ctx._outer_ctx is not None:
+                    # an open row context's column -- the current row's in
+                    # another case or its one column, else an enclosing
+                    # row's -- still wins over the measure (#358;
+                    # build_b358b.py a_enclosing: SUMX(ADDCOLUMNS(P, "MVAL",
+                    # 3), SUMX(T, [MVAL])) is 18, not 600)
+                    found, val = self._bare_row_value(data, ctx)
+                    if found:
+                        return val
                 return self.evaluate_measure(data, ctx)
             if kind == _P_MAYBEVAR:
                 if var_scope:
@@ -12715,8 +12770,7 @@ class DAXEngine:
             if kind == _P_VARRET:
                 return self._eval_var_return(data, ctx, var_scope)
             if kind == _P_BRACKET2:
-                if (data not in ctx.measures and ctx._current_row
-                        and data in ctx._current_row):
+                if ctx._current_row and data in ctx._current_row:    # wins (#358)
                     _v = ctx._current_row[data]
                     if type(_v) is float and ctx._cur_tcols:
                         if ((ctx._current_row.get('__table__'), data) in ctx._cur_tcols
@@ -12740,6 +12794,10 @@ class DAXEngine:
                     raise DAXEvaluationError(
                         f"Measure or column '[{data}]' cannot be found or "
                         f"may not be used in this expression")
+                if ctx._current_row is not None or ctx._outer_ctx is not None:
+                    found, val = self._bare_row_value(data, ctx)
+                    if found:       # an open row's column wins (#358)
+                        return val
                 return self.evaluate_measure(data, ctx)
             if kind == _P_NONE:
                 return None
@@ -14062,8 +14120,14 @@ class DAXEngine:
     def _measure_exists(name: str, ctx: DAXContext) -> bool:
         """Is `name` a measure in this model? Case-insensitively, like DAX.
 
-        Gates the bare-[Column] fallback: a measure ALWAYS wins over a column of
-        the same name, so a model that has both keeps its old behaviour.
+        Gates the bare-[Column] fallback: a measure wins over a model-wide
+        column of the same name (no row context has it). A column of an open
+        row context -- the current row's or an enclosing one's -- wins over
+        the measure, in any case (issue #358; Power BI Desktop 2.152,
+        build_b358.py n_measure_*: SUMX(ADDCOLUMNS(P, "mval", 1), [MVAL]) with
+        a measure MVAL = 100 is 2 over P's two rows; build_b358b.py t_sumx
+        SUMX(T, [Amount]) with a measure Amount is 6, a_enclosing 18). Inside
+        CALCULATE the measure wins (t_calc 300, a_calc 200).
         """
         if name in ctx.measures:
             return True
@@ -14143,9 +14207,12 @@ class DAXEngine:
         for part in parts or (row,):    # a CROSSJOIN row (#108)
             tbl = ctx.tables.get(part.get('__table__') or '')
             in_model = tbl is not None and ctx._find_col_idx(tbl.get('columns') or [], name) >= 0
-            if name in part and not name.startswith('__'):
-                return ('model', None) if in_model else ('own', part[name])
-            if in_model or (part.get('__column__') == name and not isinstance(part, _ColumnsRow)):
+            key = name if name in part else _key_any_case(part, name)   # any case (#355)
+            if key is not None and not key.startswith('__'):
+                return ('model', None) if in_model else ('own', part[key])
+            named_by = part.get('__column__')
+            if in_model or (not isinstance(part, _ColumnsRow) and type(named_by) is str
+                            and named_by.lower() == name.lower()):
                 return 'model', None
         if parts and name in row and not name.startswith(('__', '_2_')):
             return 'own', row[name]
@@ -14213,21 +14280,28 @@ class DAXEngine:
         # a Fixed Decimal column's value reads as a Currency (issue #248)
         typed = _cur_typed
         for part in parts or (row,):
-            if name in part and not name.startswith('__'):
-                v = part[name]
+            # the key as written, else the same name in another case: DAX
+            # names ignore case (issue #355), so ADDCOLUMNS(T, "Mo", ..)'s
+            # column is [mo] too
+            key = name if name in part else _key_any_case(part, name)
+            if key is not None and not key.startswith('__'):
+                v = part[key]
                 if type(v) is float and ctx._cur_tcols:
                     t = part.get('__table__')
-                    if (t, name) in ctx._cur_tcols and _cur_lineage(part, name):
+                    if (t, key) in ctx._cur_tcols and _cur_lineage(part, key):
                         return True, _Currency(v)
                     if '__joined__' in part:
                         # a natural join's right-hand column, its table's type
-                        return True, _joined_typed(ctx, part, name, v)
+                        return True, _joined_typed(ctx, part, key, v)
                 return True, v
             if isinstance(part, _ColumnsRow):
                 continue
             col = part.get('__column__')
-            if col == name:
-                return True, typed(ctx, part.get('__table__'), name, part.get('__value__'))
+            if col == name or (type(col) is str and col.lower() == name.lower()):
+                # a row of one column (VALUES, DISTINCT, CALENDAR) has it in
+                # any case: CALENDAR's [DATE] / [date] is its Date (#355),
+                # where the reference raised
+                return True, typed(ctx, part.get('__table__'), col, part.get('__value__'))
             tbl = ctx.tables.get(part.get('__table__') or '')
             if tbl is not None:
                 ci = ctx._find_col_idx(tbl.get('columns') or [], name)
@@ -14258,7 +14332,18 @@ class DAXEngine:
                         return True, typed(ctx, t, nm, row[p + nm])
                     if row.get(p + '__column__') == nm and (p + '__value__') in row:
                         return True, typed(ctx, t, nm, row[p + '__value__'])
-                p += '_inner_'
+                # the inner row's column in another case (#355): GENERATE(
+                # CALENDAR(..), ROW("Wk", ..)) has [wk]
+                wanted = name.lower()
+                deeper = p + '_inner_'
+                for k in row:
+                    if (k.startswith(p) and not k.startswith(deeper)
+                            and not k.startswith('__', len(p)) and k[len(p):].lower() == wanted):
+                        return True, typed(ctx, t, k[len(p):], row[k])
+                inner_one = row.get(p + '__column__')
+                if type(inner_one) is str and inner_one.lower() == wanted and (p + '__value__') in row:
+                    return True, typed(ctx, t, inner_one, row[p + '__value__'])
+                p = deeper
         return False, None
 
     def _bare_row_value(self, name: str, ctx: DAXContext) -> tuple:
@@ -20929,6 +21014,12 @@ class DAXEngine:
                     tables.update(self._bare_owners(name, ctx))
                 else:
                     row = True
+            elif not body and self._bare_owners(name, ctx):
+                # a measure that shares its name with a column: a row that
+                # has the column reads it instead (#358; build_b358b.py
+                # t_filter: COUNTROWS(FILTER(T, [Amount] > 1)) with a
+                # measure Amount is 2)
+                row = True
         for t, c in in_qual:
             mt = column_table(t, c)
             if mt is not None:
@@ -21152,7 +21243,31 @@ class DAXEngine:
         cache[('filter-free', cond, source)] = frozenset(
             c for c, rr in zip(rest, reads_row)
             if not rr and not self._volatile_text(c, ctx, set()))
+        cache[('filter-hoisted', cond, source)] = tuple(c for c, rr in zip(rest, reads_row) if not rr)
         return out
+
+    def _row_shadowed_phases(self, cond: str, source: Optional[tuple], ctx: DAXContext,
+                             phases: tuple, row0: Any) -> tuple:
+        """``(phases, moved)``: FILTER's phases over a table that is no model
+        table, with the row-free conjuncts that name a measure the scanned row
+        has a column of (``row0``, its first row) moved back among the
+        conjuncts that read the row, in the order written. _filter_phases
+        reads such a bare name as the measure, but the row's column wins
+        (issue #358; Power BI Desktop 2.152, build_b358.py n_measure_*), so it
+        reads the row and is no longer evaluated once for the scan. A measure
+        the row has no column of stays hoisted (build_b255d.py f2:
+        GENERATESERIES's rows and [m_zero])."""
+        hoisted = ctx._shield_cache.get(('filter-hoisted', cond, source)) or ()
+        if source is not None or not hoisted or not isinstance(row0, dict):
+            return phases, ()
+        moved = tuple(c for c in hoisted
+                      if any(self._measure_exists(n, ctx) and self._row_context_cell(row0, n, ctx)[0]
+                             for n in _local_deps(c)[1]))
+        if not moved:
+            return phases, ()
+        later = set(phases[1]) - (set(hoisted) - set(moved))
+        reading = [c for c in self._top_conjuncts(cond) if c in later]
+        return (phases[0], tuple([c for c in hoisted if c not in moved] + reading)), moved
 
     def _filter_free_memo(self, cond: str, source: Optional[tuple], ctx: DAXContext,
                           rest: tuple) -> Optional[dict]:
@@ -21507,8 +21622,12 @@ class DAXEngine:
         if not table_ref:
             self._win_empty_scan(cond_expr, ctx)        # #247
             return filtered
+        # a virtual row's column named like a measure reads the row (#358)
+        phases, moved = self._row_shadowed_phases(cond_expr, source, ctx, phases, table_ref[0])
         # the row-free conjuncts, evaluated once for the scan (_filter_free_memo)
         free = self._filter_free_memo(cond_expr, source, ctx, phases[1])
+        if free is not None and moved:
+            free = {c: v for c, v in free.items() if c not in moved} or None
         # A condition that reads only columns of the row and constants has one
         # value per combination of those columns: it is evaluated once per
         # combination, the usual way, and reused for the other rows (issue
@@ -22565,7 +22684,7 @@ class DAXEngine:
                 row_ctx = self._make_row_context(row_item, ctx, shadow=table_ref)
             else:
                 row_ctx = ctx
-            new_row = _ColumnsRow()
+            new_row = _NamedColumnsRow()
             i = 1
             first_name = None
             first_val = None
@@ -23446,7 +23565,7 @@ class DAXEngine:
             if data[0] == 'ROW':
                 return _blank_like({'__table__': '__row__', **{c: None for c in got},
                                     '__column__': got[0], '__value__': None})
-            return _blank_like(_ColumnsRow({c: None for c in got}))
+            return _blank_like(_NamedColumnsRow({c: None for c in got}))
         return None
 
     def _fn_generateall(self, args_str: str, ctx: DAXContext) -> Any:
@@ -26698,6 +26817,69 @@ class DAXEngine:
             order.sort(key=ks.__getitem__, reverse=pairs[k][1])
         return order
 
+    @classmethod
+    def _headed_cells(cls, row, ctx: DAXContext, named: bool = False) -> list:
+        """One row of a table expression as ``(heading, value)`` per column, in
+        column order, headed as TOCSV / TOJSON head them: a column of a model
+        table as 'Table'[Column], any other column -- one a table function
+        made (ADDCOLUMNS, ROW, SELECTCOLUMNS), CALENDAR's Date -- as [Name].
+
+        Walked as _row_cells walks a row's cells (issue #359): a row of one
+        column (VALUES, CALENDAR) holds it as ``__value__``, a GENERATE row
+        is its outer row and then its inner row (keys prefixed ``_inner_``),
+        a CROSSJOIN row its parts then the joined row's own columns. TOCSV
+        read the first row's keys as written, so GENERATE's headers were its
+        ``_inner_`` keys and ADDCOLUMNS(VALUES(T[C]), ..) lost C. Power BI
+        Desktop 2.152 (build_b358.py *_csv): TOCSV(GENERATE(T, ROW("Twice",
+        ..))) heads 'T'[Region],'T'[Amount],[Twice]; GENERATE(T, U) keeps both
+        Region columns, 'T'[Region] and 'U'[Region]; GENERATE(CALENDAR(..),
+        ROW("Y", ..)) is [Date],[Y]; ADDCOLUMNS(VALUES(T[Region]), "N", 1)
+        'T'[Region],[N]; GENERATEALL's inner SELECTCOLUMNS(U, "X", U[X]) is
+        [X], empty on an unmatched row. ``named``: the row is a SELECTCOLUMNS
+        row (_NamedColumnsRow), whose columns are headed by name alone."""
+        if not isinstance(row, dict):
+            return [('[Value]', row)]
+        named = named or isinstance(row, _NamedColumnsRow) or row.get('__columns__') == 'named'
+        parts = row.get('__parts__')
+        cells: list = []
+        seen: Any = ()
+        if parts:
+            seen = set()
+            for part in parts:
+                cells += cls._headed_cells(part, ctx)
+                seen.update(part)
+        t = row.get('__table__')
+        tbl = ctx.tables.get(t) if isinstance(t, str) and not named else None
+        cell_of: Any = row.get('__column__')
+        lone = (cell_of is not None and not parts and cell_of not in row and '__value__' in row
+                and not isinstance(row, _ColumnsRow) and not row.get('__columns__'))
+        # a row of one column has that model column only: a column ADDCOLUMNS
+        # added beside it is its own, whatever its name
+        model_cols: Any = (({cell_of} if lone else set(tbl.get('columns') or ()))
+                           if tbl is not None else ())
+
+        def heading(name):
+            return f"'{t}'[{name}]" if name in model_cols else f"[{name}]"
+
+        generate = '_inner___table__' in row     # every GENERATE level has it
+        inner: Optional[dict] = None
+        inner_at = -1
+        for key, val in row.items():
+            if key.startswith('__'):
+                if lone and key == '__value__':
+                    cells.append((heading(cell_of), val))
+            elif key in seen or (parts and key.startswith('_2_')):
+                continue
+            elif generate and key.startswith('_inner_'):
+                if inner is None:
+                    inner = {}
+                    inner_at = len(cells)
+                inner[key[7:]] = val
+            else:
+                cells.append((heading(key), val))
+        if inner is not None:
+            cells[inner_at:inner_at] = cls._headed_cells(inner, ctx)
+        return cells
     def _fn_tocsv(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)
         rows = self._table_rows(parts[0], ctx)
@@ -26710,17 +26892,11 @@ class DAXEngine:
                 max_rows = int(mr)
         if not rows:
             return ""
-        t = rows[0]["__table__"]
-        cols = [c for c in rows[0] if not c.startswith("__")]
-        # keep the model's column order when available
-        tbl = ctx.tables.get(t)
-        if tbl:
-            cols = [c for c in tbl["columns"] if c in cols]
-        header = ",".join(f"'{t}'[{c}]" for c in cols)
-        out = [header]
         body = rows if max_rows is None else rows[:max_rows]
-        for r in body:
-            out.append(",".join(_concat_str(r.get(c)) for c in cols))
+        headed = [self._headed_cells(r, ctx) for r in (body or rows[:1])]
+        out = [",".join(h for h, _ in headed[0])]
+        for cells in headed[:len(body)]:
+            out.append(",".join(_concat_str(v) for _, v in cells))
         return "\n".join(out)
 
     def _fn_tojson(self, args_str: str, ctx: DAXContext):
@@ -26735,18 +26911,14 @@ class DAXEngine:
                 max_rows = int(mr)
         if not rows:
             return '{}'
-        t = rows[0]["__table__"]
-        cols = [c for c in rows[0] if not c.startswith("__")]
-        tbl = ctx.tables.get(t)
-        if tbl:
-            cols = [c for c in tbl["columns"] if c in cols]
-        header = ", ".join(f'"\'{t}\'[{c}]"' for c in cols)
         body = rows if max_rows is None else rows[:max_rows]
+        headed = [self._headed_cells(r, ctx) for r in (body or rows[:1])]
+        # headed as TOCSV heads them (#359; TOJSON itself is not measured)
+        header = ", ".join(f'"{h}"' for h, _ in headed[0])
         data_lines = []
-        for r in body:
+        for row_cells in headed[:len(body)]:
             cells = []
-            for c in cols:
-                v = r.get(c)
+            for _h, v in row_cells:
                 if isinstance(v, str):
                     cells.append(f'"{v}"')
                 elif v is None:
@@ -30898,16 +31070,7 @@ class DAXEngine:
         end_date = self._parse_date(end_val)
         if not start_date or not end_date:
             return []
-        result = []
-        current = start_date
-        while current <= end_date:
-            result.append({
-                '__table__': '__calendar__',
-                '__column__': 'Date',
-                '__value__': current.strftime('%Y-%m-%d')
-            })
-            current += timedelta(days=1)
-        return result
+        return _calendar_days(start_date, end_date)
 
     def _fn_calendarauto(self, args_str: str, ctx: DAXContext) -> Any:
         """CALENDARAUTO() — generate a date table spanning all dates in the model.
@@ -30927,18 +31090,7 @@ class DAXEngine:
         if not min_date or not max_date:
             return []
         # Extend to full calendar years
-        start = datetime(min_date.year, 1, 1)
-        end = datetime(max_date.year, 12, 31)
-        result = []
-        current = start
-        while current <= end:
-            result.append({
-                '__table__': '__calendar__',
-                '__column__': 'Date',
-                '__value__': current.strftime('%Y-%m-%d')
-            })
-            current += timedelta(days=1)
-        return result
+        return _calendar_days(datetime(min_date.year, 1, 1), datetime(max_date.year, 12, 31))
 
 
 # =========================================================================
