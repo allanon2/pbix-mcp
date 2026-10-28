@@ -12567,6 +12567,7 @@ def _materialize_table_calc_columns(
     calc_specs: list[dict],
     relationships: list,
     lookup_provider=None,
+    culture: str | None = None,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     """Evaluate a table's calculated columns in dependency order.
 
@@ -12645,7 +12646,7 @@ def _materialize_table_calc_columns(
                 raise ValueError(f"'{table_name}'[{spec['column']}]: {why}")
             vals, err = evaluate_row_context_column(
                 col_names, rows, qualified,
-                table_name, snapshot, relationships)
+                table_name, snapshot, relationships, culture)
             if err:
                 raise ValueError(
                     f"'{table_name}'[{spec['column']}]: {err}")
@@ -13911,6 +13912,19 @@ def _get_dax_context(alias: str) -> dict:
     except Exception:
         pass  # If calculated table loading fails, continue without them
     mark_currency_columns(tables, currency_columns)
+
+    # A refresh (pbix_mcp.refresh) replaced some tables in memory. Its tables
+    # stand for as long as the model's DataModel is the one it refreshed: a
+    # cache drop (another model's edit, a save) keeps them; an edit of this
+    # model drops them, as its refresh no longer describes the model.
+    overlay = info.get("refresh_overlay")
+    if overlay is not None:
+        from pbix_mcp.refresh import datamodel_fingerprint
+        if overlay["datamodel"] == datamodel_fingerprint(info):
+            tables = {**tables, **overlay["tables"]}
+        else:
+            info.pop("refresh_overlay", None)
+            logger.warning("model '%s' changed since its refresh; serving its saved data", alias)
 
     # Performance warning for large tables
     _LARGE_TABLE_THRESHOLD = 100_000

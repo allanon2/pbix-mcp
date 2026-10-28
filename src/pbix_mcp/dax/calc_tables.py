@@ -1696,8 +1696,12 @@ def evaluate_row_context_column(
     target_table: str,
     all_tables: Dict[str, dict],
     relationships: Optional[List[dict]] = None,
+    culture: Optional[str] = None,
 ):
     """Evaluate a row-context calc-column expression against a table's rows.
+
+    ``culture`` is the model's (FORMAT's separators and names); None leaves the
+    engine's default.
 
     Returns ``(values, error)``. ``error`` is None on success; otherwise a
     string and ``values`` is None. The caller MUST have already cleared
@@ -1782,6 +1786,7 @@ def evaluate_row_context_column(
         try:
             actx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            actx.culture = culture
             base_scope[_AGG_MASK.format(n)] = engine._eval_expr(call, actx)
         except Exception as e:  # noqa: BLE001 - refuse, don't store garbage
             return None, f"row evaluation failed: {e}"
@@ -1865,6 +1870,7 @@ def evaluate_row_context_column(
         try:
             ctx = dax_engine.DAXContext(
                 all_tables, {}, None, None, None, relationships or [])
+            ctx.culture = culture
             # Column refs resolve through the engine's own row context, so the
             # SAME text evaluates on every row and its plan is parsed once.
             ctx._current_row = {'__table__': target_table, **row_data}
@@ -2082,8 +2088,16 @@ def evaluate_calc_table_expression(
     tables: Dict[str, dict],
     measures: Optional[Dict[str, str]] = None,
     relationships: Optional[List[dict]] = None,
+    *,
+    culture: Optional[str] = None,
+    measure_tables: Optional[Dict[str, str]] = None,
+    model_columns: Optional[dict] = None,
 ):
     """Evaluate a calculated-table DAX expression to ``{columns, rows}``.
+
+    ``culture``, ``measure_tables`` and ``model_columns`` are the model's, as
+    a measure evaluation gets them (FORMAT's culture; a measure's home table
+    for its bare column references; the model's own column list).
 
     Returns ``(result, error)``; ``error`` is None on success. Refuses (rather
     than returning a partial/blank table) when the engine reports an
@@ -2097,6 +2111,11 @@ def evaluate_calc_table_expression(
     engine = dax_engine.DAXEngine()
     ctx = dax_engine.DAXContext(
         tables, measures or {}, None, None, None, relationships or [])
+    ctx.culture = culture
+    if measure_tables is not None:
+        ctx.measure_tables = measure_tables
+    if model_columns is not None:
+        ctx.model_columns = model_columns
     try:
         result = engine._eval_expr(clean, ctx)
     except Exception as e:  # noqa: BLE001 — refuse, never persist garbage
