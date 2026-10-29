@@ -277,3 +277,32 @@ class TestTypedValues:
         from pbix_mcp.refresh import _typed
         with pytest.raises(RefreshError, match="Int64"):
             _typed(dt.datetime(1900, 1, 2, 6), 6, "T", "C")
+
+
+PY_STEP = ('let Source = Python.Execute("out = dataset", [dataset = #table({"Region", "Amount"}, '
+           '{{"North", 7}})]), out = Source{[Name="out"]}[Value], '
+           'Typed = Table.TransformColumnTypes(out, {{"Amount", Int64.Type}}) in Typed')
+
+
+def test_a_python_step_not_run_keeps_the_saved_rows(model):
+    out = json.loads(server.pbix_set_partition_m(model, "Sales", PY_STEP))
+    assert out["success"], out
+    before = snapshot(model)
+    result = refresh_tables(model, ["Sales"])
+    assert result.tables == {} and list(result.not_run) == ["Sales"]
+    assert result.not_run["Sales"].parameters == ["dataset"]
+    assert all(unchanged(model, before).values()) and value(model) == 16
+
+
+def test_a_python_step_loads_what_the_runner_returns(model):
+    out = json.loads(server.pbix_set_partition_m(model, "Sales", PY_STEP))
+    assert out["success"], out
+    seen = []
+
+    def run(script, inputs):
+        seen.append(inputs["dataset"])
+        return {"out": b"Region,Amount\nNorth,7\nSouth,8\n"}
+    result = refresh_tables(model, ["Sales"], python=run)
+    assert result.tables == {"Sales": 2} and not result.not_run
+    assert seen == [b"Region,Amount\r\nNorth,7\r\n"]
+    assert value(model) == 15
