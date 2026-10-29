@@ -34,7 +34,7 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
-from pbix_mcp.m import MError, MSyntaxError, Table, UnmappedSource, evaluate
+from pbix_mcp.m import MError, MSyntaxError, ScriptNotRun, Table, UnmappedSource, evaluate
 from pbix_mcp.m.load import load_rows
 
 # AMO Column data type -> pbix_mcp.m.load's names, and the calc-column materializer's.
@@ -56,6 +56,7 @@ class RefreshResult:
     calculated_columns: list[str] = field(default_factory=list)    # tables whose calculated columns were recomputed
     calculated_tables: list[str] = field(default_factory=list)     # recomputed, in order
     unmapped: dict[str, str] = field(default_factory=dict)         # table -> a file the mapping doesn't cover
+    not_run: dict[str, ScriptNotRun] = field(default_factory=dict)  # table -> a Python step the runner didn't run
 
 
 def datamodel_fingerprint(info: dict) -> str:
@@ -65,19 +66,23 @@ def datamodel_fingerprint(info: dict) -> str:
 
 
 def refresh_tables(alias: str, names: Sequence[str], *,
-                   files: Optional[Callable[[str], bytes]] = None) -> RefreshResult:
+                   files: Optional[Callable[[str], bytes]] = None,
+                   python: Optional[Callable[[str, dict[str, bytes]], dict[str, bytes]]] = None) -> RefreshResult:
     """Refresh ``names`` (tables whose partitions are M) of the model open as ``alias``. ``files`` reads the files
     the M names (the caller's path mapping, raising UnmappedSource for one it doesn't map): a table whose M needs an
-    unmapped file keeps its saved data and is listed in ``unmapped`` (ADR-0013), not failed."""
+    unmapped file keeps its saved data and is listed in ``unmapped`` (ADR-0013), not failed. ``python`` runs its
+    Python.Execute steps (pbix_mcp.m.python): a table whose step it doesn't run (ScriptNotRun) keeps its saved data
+    and is listed in ``not_run``."""
     try:
-        return _refresh(alias, list(names), files)
+        return _refresh(alias, list(names), files, python)
     except RefreshError:
         raise
     except Exception as e:  # noqa: BLE001 - whatever failed, the model is untouched; say so as a refresh error
         raise RefreshError(", ".join(names) or "(none)", f"{type(e).__name__}: {e}") from e
 
 
-def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes]]) -> RefreshResult:
+def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes]],
+             python: Optional[Callable[[str, dict[str, bytes]], dict[str, bytes]]] = None) -> RefreshResult:
     from pbix_mcp import server
 
     info = server._ensure_open(alias)
@@ -95,7 +100,7 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
             texts = meta.m.get(name)
             if not texts:
                 raise MError("Expression.Error", f"The name '{name}' wasn't recognized.")
-            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files)
+            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files, python=python)
                                    for t in texts], name)
         return cache[name]
 
@@ -114,13 +119,16 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
         except UnmappedSource as e:
             result.unmapped[name] = e.path
             continue
+        except ScriptNotRun as e:
+            result.not_run[name] = e
+            continue
         except (MError, MSyntaxError) as e:
             raise RefreshError(name, str(e)) from None
         rows = [[_stored(v) for v in r] for r in rows]
         work[name] = {"columns": [n for n, _, _ in data], "rows": rows}
         result.tables[name] = len(rows)
 
-    names = [n for n in names if n not in result.unmapped]
+    names = [n for n in names if n not in result.unmapped and n not in result.not_run]
 
     # 2. What's calculated over them, in dependency order.
     nodes = _stale_nodes(meta, ctx, set(names))

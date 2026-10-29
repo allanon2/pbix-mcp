@@ -571,11 +571,15 @@ LIBRARY: dict[str, Any] = {
     "Percentage.Type": PERCENTAGE_TYPE,
 }
 
-# Tier 1 above; tier 2, the table functions a query's steps use; tier 3, local files.
+# Tier 1 above; tier 2, the table functions a query's steps use; tier 3, local files; tier 5, Python scripts
+# (pivot-studio ADR-0020; 4 is the web, not built).
+from .python import PYTHON  # noqa: E402
 from .sources import SOURCES  # noqa: E402  (they import this module's conversions lazily)
 from .tables import TABLES  # noqa: E402
 
-TIERS: dict[str, int] = {**{k: 1 for k in LIBRARY}, **{k: 2 for k in TABLES}, **{k: 3 for k in SOURCES}}
+TIERS: dict[str, int] = {**{k: 1 for k in LIBRARY}, **{k: 2 for k in TABLES}, **{k: 3 for k in SOURCES},
+                         **{k: 5 for k in PYTHON}}
 LIBRARY.update(TABLES)
 LIBRARY.update(SOURCES)
+LIBRARY.update(PYTHON)
 LIBRARY_NAMES = frozenset(LIBRARY)
