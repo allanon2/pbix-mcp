@@ -40,8 +40,12 @@ From 0.9.107 on, every fix has its own GitHub issue, and the CHANGELOG entry
 and release notes cite it — so a change can be followed from the CHANGELOG
 alone.
 
-**Updated 2026-10-28 (0.9.151): docs 1-66 and GitHub issues/PRs #1-#360 are
-closed.** 0.9.151 publishes 0.9.150 (whose release gate failed under pytest
+**Updated 2026-10-28 (0.9.152): docs 1-66 and GitHub issues/PRs #1-#361 are
+closed.** 0.9.152 closes #361 (@allanon2: a measure reference in a model
+table's rows looked its name up per row since #358).
+
+As of 0.9.151 (2026-10-28): docs 1-66 and GitHub issues/PRs #1-#360 were
+closed. 0.9.151 publishes 0.9.150 (whose release gate failed under pytest
 9.2) with #360, the engine proxy's delete. 0.9.150 closes PRs #352 and #353 (@allanon2), solved as #354-#357
 (CALENDAR rows hold dates, a bare column over one-column rows and in any case,
 GENERATE and ADDCOLUMNS calculated tables named as DAX does), and #358-#359
@@ -583,6 +587,10 @@ Kept so the same items are not re-litigated:
   - implemented at: Refusal branch (explicitly permitted by the item): D:\dependency_tracker\pbix-mcp\src\pbix_mcp\server.py:10840-10845 + docstring 10815-10820; test loc
 
 ## Recently closed
+
+- **GH #361** (@allanon2) -- CLOSED (0.9.152). A measure reference in a model
+  table's rows looks its name up once per table and name, not per row.
+  Regression: tests/test_issue361_*.py.
 
 - **GH #352, #353, #354-#359** (PRs #352 / #353 by @allanon2, solved on our
   side; #358-#359 found by their Desktop battery) -- CLOSED (0.9.150, published as 0.9.151; #360 the CI fix). CALENDAR

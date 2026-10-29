@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.152] - 2026-10-28
+
+Reported by @allanon2 in issue #361: a measure reference in an iteration over a model table had become slower in 0.9.150.
+
+Verified before release: `SUMX(Fact, [S])` over the #150 model takes 0.306-0.311 s against 0.9.149's 0.307-0.309 s and 0.9.151's 0.329-0.331 s (interleaved medians of seven); every answer unchanged (Desktop batteries b358 38 of 38, b358b 13 of 13, b253 78 of 78, b247 47 of 47, b210 56 of 56, b200 756 of 756); full suite 10,936 passed, 7 xfailed; ruff clean, mypy 131.
+
+### Fixed — a measure reference in a model table's rows looks its name up among the table's columns once (issue #361; reported by @allanon2)
+
+Since #358 a bare `[name]` reads an open row's column before a measure of that name, so `SUMX(Fact, [S])` asked every Fact row whether it has a column S: 0.9.151 lowered every key of the row and then ran `_find_col_idx`'s three passes over the table's columns, per row and in vain, about 7% of that iteration (`tests/test_issue150_memo_key_speed.py`'s ratio went from 1.44 to 1.55 on the reporter's machine and failed its 1.45 bound). A model table's own row is now answered by one lookup per table and name, kept on the model's cache (kind 'col-name'); rows ADDCOLUMNS, SELECTCOLUMNS and the other table functions made are read as before. The timing test's bound is 1.6 (between the 2x defect it guards and the noise a loaded machine adds: 0.9.149 measured up to 1.48 there), and the cost is now pinned by count. Tests: `tests/test_issue361_measure_reference_row_lookup.py` (3; the count test fails on 0.9.151).
+
 ## [0.9.151] - 2026-10-28
 
 0.9.150's changes, published: the 0.9.150 tag's release did not publish (its CI gate failed under pytest 9.2.0, which the local runs, on 9.0.2, did not use), and nothing of 0.9.150 reached PyPI. This release carries every 0.9.150 change below and the fix for that failure.

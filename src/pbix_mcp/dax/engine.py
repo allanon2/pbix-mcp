@@ -5710,6 +5710,9 @@ _STRUCTURAL_FILTER_KINDS = frozenset({
     # 0.9.148: a column's number type (Int64 / Double) for IF's result type
     # (#248) -- one per column
     'col-numtype',
+    # 0.9.152: where a name falls among a table's columns, for a bare [name]
+    # read in that table's rows (_row_context_cell, #361) -- one per name read
+    'col-name',
 })
 # Containers the engine keeps filling after storing them, each bounded on its
 # own: the union memo bounds what it holds (_index_union), and so do the
@@ -14259,6 +14262,23 @@ class DAXEngine:
         return False, None
 
     @staticmethod
+    def _table_col_index(ctx: DAXContext, tname: str, cols: list, name: str) -> int:
+        """``name``'s index among table ``tname``'s columns ``cols``, as
+        _find_col_idx finds it (any case, the #132 spellings), -1 when it is
+        none of them; kept per table and name on the model's cache (kind
+        'col-name', structural). Every row of an iteration asks it again, and
+        a measure reference (SUMX(Fact, [S])) asks it in vain, through
+        _find_col_idx's three passes: once #358 read the row before the
+        measure, that was 7% of the iteration (#361)."""
+        ckey = ('col-name', tname, name, len(cols))
+        cache = ctx._filter_idx_cache
+        ci = cache.get(ckey)
+        if ci is None:
+            ci = ctx._find_col_idx(cols, name)
+            cache[ckey] = ci
+        return ci
+
+    @staticmethod
     def _row_context_cell(row, name: str, ctx: DAXContext) -> tuple:
         """``(True, value)`` when the iterated row ``row`` has a column
         ``name``, ``(False, None)`` otherwise. A row has the columns it holds
@@ -14280,10 +14300,24 @@ class DAXEngine:
         # a Fixed Decimal column's value reads as a Currency (issue #248)
         typed = _cur_typed
         for part in parts or (row,):
-            # the key as written, else the same name in another case: DAX
-            # names ignore case (issue #355), so ADDCOLUMNS(T, "Mo", ..)'s
-            # column is [mo] too
-            key = name if name in part else _key_any_case(part, name)
+            if name in part:
+                key: Optional[str] = name
+            elif '__row__' in part and type(part) is dict:
+                # a model table's own row (__table__, __row__ and the table's
+                # columns, nothing added): the name is one of its columns, in
+                # any case, exactly when the table's column lookup finds it --
+                # asked once per table and name (_table_col_index), not by
+                # lowering every key of every row (#361: a measure reference
+                # in SUMX(Fact, [S]) asked it per row in vain)
+                tcols = (ctx.tables.get(part.get('__table__') or '') or {}).get('columns')
+                if tcols is not None and len(part) == len(tcols) + 2:
+                    if DAXEngine._table_col_index(ctx, part.get('__table__') or '', tcols, name) < 0:
+                        continue
+                key = _key_any_case(part, name)
+            else:
+                # the same name in another case: DAX names ignore case (issue
+                # #355), so ADDCOLUMNS(T, "Mo", ..)'s column is [mo] too
+                key = _key_any_case(part, name)
             if key is not None and not key.startswith('__'):
                 v = part[key]
                 if type(v) is float and ctx._cur_tcols:
@@ -14302,9 +14336,10 @@ class DAXEngine:
                 # any case: CALENDAR's [DATE] / [date] is its Date (#355),
                 # where the reference raised
                 return True, typed(ctx, part.get('__table__'), col, part.get('__value__'))
-            tbl = ctx.tables.get(part.get('__table__') or '')
+            tname = part.get('__table__') or ''
+            tbl = ctx.tables.get(tname)
             if tbl is not None:
-                ci = ctx._find_col_idx(tbl.get('columns') or [], name)
+                ci = DAXEngine._table_col_index(ctx, tname, tbl.get('columns') or [], name)
                 if ci >= 0:
                     spelled = tbl['columns'][ci]
                     if spelled in part:
