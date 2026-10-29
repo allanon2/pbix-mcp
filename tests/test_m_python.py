@@ -2,11 +2,12 @@
 probes). The expected values are Desktop's: the CSV a refresh handed the script for each input, and each pandas
 output as the refresh read it back. Running the script is the caller's runner; here a fake one stands in."""
 import datetime as dt
+import re
 
 import pytest
 
 from pbix_mcp.m import MError, ScriptNotRun, evaluate, script_key
-from pbix_mcp.m.python import from_csv, to_csv, wrap_script
+from pbix_mcp.m.python import from_csv, outputs, to_csv, wrap_script
 
 # The input tables of the probes, and the CSV Desktop wrote for each.
 IN_TYPES = ('#table(type table [i = Int64.Type, n = number, c = Currency.Type, p = Percentage.Type, t = text, '
@@ -136,16 +137,31 @@ class TestPythonExecute:
 
 
 class TestWrapper:
-    def test_inputs_read_then_script_then_every_dataframe_written(self):
-        text = wrap_script("from __future__ import annotations\nout = dataset", "/tmp/run", {"dataset": "in.csv"})
-        lines = text.splitlines()
+    def test_inputs_read_then_the_script_verbatim_then_every_dataframe_written(self):
+        script = "from __future__ import annotations\nout = dataset\ns = 'a\u2028b'\ncwd = os.getcwd(); v = sys.version"
+        text, files = wrap_script(script, "/tmp/run", ["dataset"])
+        (file,) = files.values()
+        assert list(files) == ["dataset"] and re.fullmatch(r"input_df_[0-9a-f-]{36}\.csv", file)
+        lines = text.split("\n")
         assert lines[0] == "from __future__ import annotations"
-        assert "dataset = pandas.read_csv('in.csv')" in lines
-        assert lines.index("dataset = pandas.read_csv('in.csv')") < lines.index("out = dataset")
-        assert "matplotlib.use('Agg')" in lines
-        assert text.count("chdir('/tmp/run')") == 2
-        assert "to_csv(_pbix_name + '.csv', index=False)" in text
+        read = f"dataset = pandas.read_csv({file!r})"
+        assert lines.index(read) < lines.index("out = dataset")
+        assert "s = 'a\u2028b'" in lines                      # the script's text as given, not split on U+2028
+        assert {"import os, pandas, matplotlib", "import sys", "sys.tracebacklimit = 0"} <= set(lines)
+        assert lines.index("import os, pandas, matplotlib") < lines.index("cwd = os.getcwd(); v = sys.version")
+        assert text.count("os.chdir('/tmp/run')") == 2
+        assert "for key in _pbix_globals():" in lines
         compile(text, "<wrapped>", "exec")
+
+    def test_outputs_are_every_csv_but_the_inputs(self):
+        names = ["out.csv", "INPUT_DF_1.CSV", "notes.txt", "Upper.CSV", "_pbix_script.py"]
+        assert outputs(names, {"dataset": "input_df_1.csv"}) == ["out.csv", "Upper.CSV"]
+
+
+def test_ntfs_order():
+    from pbix_mcp.m.python import _ntfs_order
+    names = ["a", "a-b", "_o_private", "written_by_script", "ßa", "SSb", "o_basic"]
+    assert sorted(names, key=_ntfs_order) == ["a-b", "a", "o_basic", "SSb", "written_by_script", "_o_private", "ßa"]
 
 
 def test_dotnet_round_trip_numbers():

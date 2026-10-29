@@ -25,6 +25,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import math
+import uuid
 from typing import Any, Callable, Optional
 
 from .values import ANY, MError, MType, Record, Table, force, kind_of
@@ -63,31 +64,42 @@ def script_failed(stderr: str) -> MError:
 
 # --- the wrapper -----------------------------------------------------------------------------------------------
 
-def wrap_script(script: str, folder: str, inputs: dict[str, str]) -> str:
-    """The script as a Desktop refresh runs it, for a runner to execute with ``folder`` as its working folder:
+def wrap_script(script: str, folder: str, parameters: list[str]) -> tuple[str, dict[str, str]]:
+    """The script as a Desktop refresh runs it, for a runner to execute with ``folder`` as its working folder; and
+    the file each parameter's CSV must be written to there (``input_df_<guid>.csv``, as Desktop names them: a
+    script can see them, and a name like ``dataset.csv`` would be overwritten by the outputs).
 
-    - pandas and matplotlib imported (Microsoft's documentation requires both; matplotlib on its non-interactive
-      backend, so a ``show()`` draws nothing);
-    - each input read with a plain ``pandas.read_csv`` into a global named as its argument (``inputs`` maps the
-      argument's name to its file's name in ``folder``), so pandas' own inference and missing-value strings apply,
-      as the probes show ("", "NA", "null" and "nan" read as NaN; an Int64 column with a null as float64);
-    - the script, then, back in ``folder`` (the script may have changed directory), every global that is exactly a
-      DataFrame written to ``<name>.csv`` without its index: underscore names and the inputs too, a Series not;
+    - ``os``, ``sys`` (with ``sys.tracebacklimit = 0``), ``pandas`` and ``matplotlib`` are already imported, so a
+      script may use them without importing them, as in Desktop (Microsoft's documentation requires pandas and
+      matplotlib); matplotlib draws nothing (its non-interactive backend, ``show`` a no-op);
+    - each input is read with a plain ``pandas.read_csv`` into a global named as its parameter, so pandas' own
+      inference and missing-value strings apply, as the probes show ("", "NA", "null" and "nan" read as NaN; an
+      Int64 column with a null as float64);
+    - the script, verbatim; then, back in ``folder``, every global that is exactly a DataFrame written to
+      ``<name>.csv`` without its index (underscore names and the inputs too, a Series not), the loop's variable
+      being the global ``key`` (so a DataFrame of that name isn't written);
     - a ``from __future__`` import moved to the top, where Python requires it.
 
-    Every .csv the run leaves in ``folder`` is then an output, a file the script wrote there itself included."""
+    Every .csv the run leaves in ``folder``, except the inputs, is then an output (``outputs``)."""
+    files = {p: f"input_df_{uuid.uuid4()}.csv" for p in parameters}
     here = repr(folder)
-    lines = ["import os as _pbix_os, pandas, matplotlib", "matplotlib.use('Agg')", "import matplotlib.pyplot",
-             f"_pbix_os.chdir({here})", "_pbix_globals = dir"]
-    lines += [f"{name} = pandas.read_csv({file!r})" for name, file in inputs.items()]
-    body = [line for line in script.splitlines() if not line.startswith("from __future__")]
-    future = [line for line in script.splitlines() if line.startswith("from __future__")]
-    lines += body
-    lines += ["", f"_pbix_os.chdir({here})",
-              "for _pbix_name in _pbix_globals():",
-              "    if type(globals()[_pbix_name]) is pandas.DataFrame:",
-              "        globals()[_pbix_name].to_csv(_pbix_name + '.csv', index=False)"]
-    return "\n".join(future + lines) + "\n"
+    lines = script.split("\n")
+    future = [line for line in lines if line.startswith("from __future__")]
+    body = "\n".join(line for line in lines if not line.startswith("from __future__"))
+    head = ["import os, pandas, matplotlib", "matplotlib.use('Agg')", "import matplotlib.pyplot", "import sys",
+            "sys.tracebacklimit = 0", f"os.chdir({here})"]
+    head += [f"{name} = pandas.read_csv({file!r})" for name, file in files.items()]
+    head += ["matplotlib.pyplot.show = lambda *args, **kw: None", "_pbix_globals = dir"]
+    tail = ["", f"os.chdir({here})", "for key in _pbix_globals():",
+            "    if type(globals()[key]) is pandas.DataFrame:", "        globals()[key].to_csv(key + '.csv', index=False)"]
+    text = "\n".join(future + head) + "\n" + body + "\n" + "\n".join(tail) + "\n"
+    return text, files
+
+
+def outputs(names: list[str], inputs: dict[str, str]) -> list[str]:
+    """Which of the files a run left in its folder are outputs: every .csv but the inputs (by name, without case)."""
+    taken = {f.casefold() for f in inputs.values()}
+    return [n for n in names if n.lower().endswith(".csv") and n.casefold() not in taken]
 
 
 # --- writing a table argument ----------------------------------------------------------------------------------
@@ -195,10 +207,13 @@ def from_csv(data: bytes) -> Table:
     return _promote_headers(raw)
 
 
-def _ntfs_order(name: str) -> str:
-    """The order Desktop lists the output files in: NTFS's, by upper-cased name ("written_by_script" before
-    "_o_private")."""
-    return name.upper()
+def _ntfs_order(name: str) -> list[int]:
+    """The order Desktop lists the output files in, NTFS's: the whole file name, each character upper-cased on its
+    own (no "ß" to "SS"), compared by UTF-16 code unit ("written_by_script" before "_o_private", "a-b" before
+    "a")."""
+    up = "".join(c.upper() if len(c.upper()) == 1 else c for c in name + ".csv")
+    data = up.encode("utf-16-le")
+    return [int.from_bytes(data[i:i + 2], "little") for i in range(0, len(data), 2)]
 
 
 # --- the function ----------------------------------------------------------------------------------------------
