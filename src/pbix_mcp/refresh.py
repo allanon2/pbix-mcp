@@ -19,6 +19,10 @@ DAX engine the new rows, as Desktop's refresh reloads a table.
    cache drop, carries the refreshed tables for as long as the model's
    DataModel is the one refreshed (an edit of the model drops them).
 
+``recompute_volatile(alias)`` runs steps 2 and 3 alone, from the calculated
+tables and columns whose DAX calls TODAY, NOW, UTCTODAY or UTCNOW (directly or
+through a measure), as Desktop recomputes them on opening a file.
+
 Nothing is written to the file: tools that read the file itself
 (pbix_get_table_data, a save) see its saved rows. A failure raises
 ``RefreshError`` naming the table, and the model keeps what it had.
@@ -129,9 +133,43 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
         result.tables[name] = len(rows)
 
     names = [n for n in names if n not in result.unmapped and n not in result.not_run]
+    _recalculate(server, alias, info, ctx, meta, work, names, [], result, fingerprint)
+    return result
 
+
+def recompute_volatile(alias: str) -> RefreshResult:
+    """Recompute the calculated tables and columns of the model open as ``alias`` whose DAX calls TODAY, NOW,
+    UTCTODAY or UTCNOW (directly or through a measure it names), and everything calculated over them, as of now.
+
+    Desktop recomputes such a table on opening the file: a calculated table built from TODAY() and saved on one
+    day answers, opened on a later day, as of that day (measured on Desktop 2.157, pivot-studio #316); its
+    file holds the rows of the day it was saved. Whether Desktop does the same for a calculated column calling
+    TODAY() isn't measured; it is recomputed here by the same rule. Nothing is read from M. A failure raises
+    ``RefreshError`` naming the table, and the model keeps its saved rows."""
+    try:
+        from pbix_mcp import server
+
+        info = server._ensure_open(alias)
+        ctx = server._get_dax_context(alias)
+        fingerprint = datamodel_fingerprint(info)
+        meta = _Metadata(info)
+        result = RefreshResult()
+        seeds = _volatile_nodes(meta, ctx)
+        if seeds:
+            _recalculate(server, alias, info, ctx, meta, dict(ctx["tables"]), [], seeds, result, fingerprint)
+        return result
+    except RefreshError:
+        raise
+    except Exception as e:  # noqa: BLE001 - whatever failed, the model is untouched; say so as a refresh error
+        raise RefreshError("(volatile calculations)", f"{type(e).__name__}: {e}") from e
+
+
+def _recalculate(server: Any, alias: str, info: dict, ctx: dict, meta: "_Metadata", work: dict[str, dict], names: list[str],
+                 seeds: list[tuple[str, str]], result: RefreshResult, fingerprint: str) -> None:
+    """Steps 2 and 3 of a refresh: recompute what's calculated over the refreshed ``names`` and the ``seeds``
+    (calculated nodes stale in themselves), in dependency order, and install the result."""
     # 2. What's calculated over them, in dependency order.
-    nodes = _stale_nodes(meta, ctx, set(names))
+    nodes = _stale_nodes(meta, ctx, set(names), seeds)
     for kind, name in _ordered(nodes, meta, ctx):
         snapshot = dict(work)       # each step evaluates over its own mapping: engine caches key on its identity
         if kind == "columns":
@@ -155,7 +193,6 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
     new_ctx = dict(ctx)
     new_ctx["tables"] = dict(work)
     server._dax_cache[alias] = new_ctx      # one assignment: readers see the old context or the new one
-    return result
 
 
 def _append(tables: list[Any], name: str) -> Any:
@@ -184,12 +221,14 @@ def _stored(value: Any) -> Any:
 
 # --- what depends on what -------------------------------------------------------
 
-def _stale_nodes(meta: "_Metadata", ctx: dict, refreshed: set[str]) -> list[tuple[str, str]]:
+def _stale_nodes(meta: "_Metadata", ctx: dict, refreshed: set[str],
+                 seeds: Sequence[tuple[str, str]] = ()) -> list[tuple[str, str]]:
     """The calculated things a refresh must recompute: ("columns", table) for a table's calculated columns and
-    ("table", name) for a calculated table, whenever what they read changed."""
+    ("table", name) for a calculated table, whenever what they read changed; and the ``seeds``, stale in
+    themselves (a volatile function's answer changed)."""
     reads = _reads(meta, ctx)
-    changed = set(refreshed)
-    stale: list[tuple[str, str]] = []
+    stale: list[tuple[str, str]] = list(dict.fromkeys(seeds))
+    changed = set(refreshed) | {name for _, name in stale}
     grew = True
     while grew:
         grew = False
@@ -211,6 +250,41 @@ def _reads(meta: "_Metadata", ctx: dict) -> dict[tuple[str, str], set[str]]:
     for table, expr in meta.calculated_tables.items():
         exprs = [expr] + [e for _, e, _ in meta.calculated_columns(table)]
         out[("table", table)] = _closure(exprs, meta, measures, related) - {table}
+    return out
+
+
+# DAX's functions whose answer changes with the clock: a calculation calling one is stale whenever it's read.
+_VOLATILE = frozenset({"TODAY", "NOW", "UTCTODAY", "UTCNOW"})
+
+
+def _volatile_nodes(meta: "_Metadata", ctx: dict) -> list[tuple[str, str]]:
+    """The calculated nodes (as ``_reads`` keys them) whose own DAX, or a measure it names (and so on), calls a
+    volatile function."""
+    measures = ctx.get("measure_defs") or {}
+    by_lower = {k.lower(): k for k in measures}
+    memo: dict[str, bool] = {}
+
+    def volatile(expr: str, seen: frozenset[str]) -> bool:
+        _, brackets, calls = _scan(expr, meta.table_names)
+        if calls & _VOLATILE:
+            return True
+        for b in brackets:
+            m = by_lower.get(b.lower())
+            if m is None or m in seen:
+                continue
+            if m not in memo:
+                memo[m] = volatile(measures[m] or "", seen | {m})
+            if memo[m]:
+                return True
+        return False
+
+    out: list[tuple[str, str]] = []
+    for table in meta.tables_with_calculated_columns():
+        if any(volatile(e, frozenset()) for _, e, _ in meta.calculated_columns(table)):
+            out.append(("columns", table))
+    for table, expr in meta.calculated_tables.items():
+        if volatile(expr, frozenset()) or any(volatile(e, frozenset()) for _, e, _ in meta.calculated_columns(table)):
+            out.append(("table", table))
     return out
 
 
@@ -270,9 +344,16 @@ def _ordered(nodes: list[tuple[str, str]], meta: "_Metadata", ctx: dict) -> list
 def _dax_names(expression: str, known: set[str]) -> tuple[set[str], list[str]]:
     """The model tables a DAX expression names ('quoted', or a bare word not followed by "(") and the
     [bracketed] names in it, outside strings and comments. Table names compare without case, as DAX does."""
+    found, brackets, _ = _scan(expression, known)
+    return found, brackets
+
+
+def _scan(expression: str, known: set[str]) -> tuple[set[str], list[str], set[str]]:
+    """``_dax_names``'s two, and the functions the expression calls (a bare word followed by "("), upper-cased."""
     by_lower = {k.lower(): k for k in known}
     found: set[str] = set()
     brackets: list[str] = []
+    calls: set[str] = set()
     i, n = 0, len(expression)
     while i < n:
         ch = expression[i]
@@ -320,13 +401,16 @@ def _dax_names(expression: str, known: set[str]) -> tuple[set[str], list[str]]:
             k = j
             while k < n and expression[k] in " \t\r\n":
                 k += 1
+            called = k < n and expression[k] == "("
             hit = by_lower.get(expression[i:j].lower())
-            if hit and not (k < n and expression[k] == "("):
+            if hit and not called:
                 found.add(hit)
+            if called:
+                calls.add(expression[i:j].upper())
             i = j
         else:
             i += 1
-    return found, brackets
+    return found, brackets, calls
 
 
 def _dax_table_names(expression: str, known: set[str]) -> set[str]:
