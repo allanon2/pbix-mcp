@@ -10821,10 +10821,15 @@ class DAXEngine:
         }
 
     def evaluate_measure(self, measure_name: str, ctx: DAXContext,
-                         propagate: bool = False) -> Any:
+                         propagate: bool = False, as_table: bool = False) -> Any:
         """Evaluate a named measure in the given context. An error inside a
         nested measure is its caller's error (#266); the
-        outermost measure records it in eval_errors and returns BLANK."""
+        outermost measure records it in eval_errors and returns BLANK.
+
+        ``as_table``: the expression is a query's table expression
+        (pbix_mcp.dax.query): its value is returned as the engine's rows,
+        not made a scalar (_scalarize), and is not memoized. Every check
+        and record of a measure evaluation applies to it as to a measure."""
         # DAX identifiers are CASE-INSENSITIVE. Canonicalize to the model's own
         # spelling before anything else, so the cache key, the circular-reference
         # stack and the definition lookup all agree.
@@ -10959,6 +10964,8 @@ class DAXEngine:
                 cache_key = cache_key + (_IF_BRANCH_KEY,)
         except Exception:
             cache_key = None
+        if as_table:
+            cache_key = None
         if cache_key and cache_key in ctx._measure_cache:
             # The value is reused, and so is what it depended on: a measure
             # reaching this one through the cache still reports the
@@ -11086,7 +11093,9 @@ class DAXEngine:
                 _refusal = DAXEvaluationError(_refused)
                 setattr(_refusal, "_dax_uncatchable", True)
                 raise _refusal
-            result = _scalarize(self._eval_expr(expr.strip(), ctx))
+            result = self._eval_expr(expr.strip(), ctx)
+            if not as_table:
+                result = _scalarize(result)
             if cache_key:
                 ctx._measure_cache[cache_key] = result
                 if _nested:
@@ -22635,7 +22644,7 @@ class DAXEngine:
             else:
                 break  # Rest are name/expression pairs
         if not group_refs:
-            return []
+            return self._summarizecolumns_no_group(args, ctx)
         # Use first table as base. Forward the trailing "Name", <expression>
         # extension columns too — they were dropped, so the aggregated value
         # silently disappeared from the result.
@@ -22669,6 +22678,30 @@ class DAXEngine:
                 sub[_c] = None
             result = result + [sub]
         return result
+
+    def _summarizecolumns_no_group(self, args: list, ctx: DAXContext) -> Any:
+        """SUMMARIZECOLUMNS with no column to group by: its filter tables,
+        then "name", expression pairs. The result is one row of the
+        expressions evaluated under the filter tables, or no row when every
+        expression is BLANK (Microsoft Learn, SUMMARIZECOLUMNS: rows whose
+        expressions are all BLANK are left out). The engine answered no row
+        whatever the expressions gave."""
+        rest = [a.strip() for a in args]
+        filters = []
+        while rest and not rest[0].startswith('"'):
+            filters.append(rest.pop(0))
+        names = self._summarizecolumns_names(rest)
+        if not names:
+            raise _DAXEvaluationError(
+                "SUMMARIZECOLUMNS: no column to group by and no name and expression to evaluate.")
+        expr = "ROW(" + ", ".join(rest) + ")"
+        if filters:
+            expr = "CALCULATETABLE(" + expr + ", " + ", ".join(filters) + ")"
+        rows = self._eval_expr(expr, ctx)
+        if not isinstance(rows, list):
+            return rows
+        return [r for r in rows
+                if not isinstance(r, dict) or any(r.get(n) is not None for n in names)]
 
     @staticmethod
     def _summarizecolumns_names(tail: list) -> list:
@@ -22712,13 +22745,21 @@ class DAXEngine:
         return result + [row]
 
     def _fn_selectcolumns(self, args_str: str, ctx: DAXContext) -> Any:
-        """SELECTCOLUMNS(table, name, expression, ...) — select/rename columns."""
+        """SELECTCOLUMNS(table, [name,] expression, ...) -- select/rename columns.
+
+        A column of the result is a "name", expression pair, or a column
+        reference alone: the column keeps its own name and lineage (the
+        result's 'T'[C], not a column [C] of its own, _lineage_cells). Any
+        other expression without a name is refused, and so are two columns
+        of one name, rather than one silently taking the other's place."""
         args = self._split_args(args_str)
-        if len(args) < 3:
+        specs = self._selectcolumns_specs(args[1:], ctx)
+        if not specs:
             return []
         table_ref = self._eval_expr(args[0].strip(), ctx)
         if not isinstance(table_ref, list):
             return []
+        lineage = {key: t for key, _e, t in specs if t is not None}
         result = []
         for row_item in table_ref:
             if isinstance(row_item, dict) and '__table__' in row_item:
@@ -22726,18 +22767,8 @@ class DAXEngine:
             else:
                 row_ctx = ctx
             new_row = _NamedColumnsRow()
-            i = 1
-            first_name = None
-            first_val = None
-            while i + 1 < len(args):
-                col_name = self._eval_expr(args[i].strip(), ctx)
-                col_val = self._eval_expr(args[i + 1].strip(), row_ctx)
-                col_name_str = str(col_name) if col_name else f"col_{i}"
-                new_row[col_name_str] = col_val
-                if first_name is None:
-                    first_name = col_name_str
-                    first_val = col_val
-                i += 2
+            for col_name_str, expr, _t in specs:
+                new_row[col_name_str] = self._eval_expr(expr, row_ctx)
             if isinstance(row_item, dict) and '__table__' in row_item:
                 # A multi-column row (bare table ref / ALL(Table)) carries
                 # __row__ and has NO __column__/__value__; indexing them
@@ -22747,10 +22778,49 @@ class DAXEngine:
                 for meta in ('__column__', '__value__', '__row__'):
                     if meta in row_item:
                         new_row[meta] = row_item[meta]
+            if lineage:
+                new_row['__lineage__'] = lineage
             result.append(new_row)
         if not result:
-            return self._static_columns(args[2::2], ctx)
+            return self._static_columns([e for _k, e, _t in specs], ctx)
         return result
+
+    def _selectcolumns_specs(self, args: list, ctx: DAXContext) -> list:
+        """SELECTCOLUMNS' columns after its table argument, as (name,
+        expression, lineage table or None) per column, in order. A string
+        literal names the expression after it; a column reference with no
+        name keeps its own name, and its model table as lineage."""
+        specs: list = []
+        seen: set = set()
+        i = 0
+        while i < len(args):
+            a = args[i].strip()
+            if a.startswith('"'):
+                if i + 1 >= len(args):
+                    break               # a trailing name with no expression, as before
+                col_name = self._eval_expr(a, ctx)
+                name = str(col_name) if col_name else f"col_{i + 1}"
+                specs.append((name, args[i + 1].strip(), None))
+                i += 2
+            else:
+                ref = self._parse_column_ref(a)
+                tname = ctx.model_table(ref[0]) if ref is not None else None
+                tbl = ctx.tables.get(tname) if tname is not None else None
+                idx = (ctx._find_col_idx(tbl.get('columns') or [], ref[1])
+                       if isinstance(tbl, dict) and ref is not None else -1)
+                if idx < 0:
+                    raise _DAXEvaluationError(
+                        f"SELECTCOLUMNS: the column expression {a} has no name; only a "
+                        "reference to a model column may be given without one.")
+                name = tbl['columns'][idx]
+                specs.append((name, a, tname))
+                i += 1
+            low = specs[-1][0].lower()
+            if low in seen:
+                raise _DAXEvaluationError(
+                    f"SELECTCOLUMNS: the column name '{specs[-1][0]}' is given more than once.")
+            seen.add(low)
+        return specs
 
     _STATIC_KIND_OF = {'I': int, 'D': float, 'C': _Currency}
 
@@ -26860,10 +26930,21 @@ class DAXEngine:
 
     @classmethod
     def _headed_cells(cls, row, ctx: DAXContext, named: bool = False) -> list:
-        """One row of a table expression as ``(heading, value)`` per column, in
-        column order, headed as TOCSV / TOJSON head them: a column of a model
-        table as 'Table'[Column], any other column -- one a table function
-        made (ADDCOLUMNS, ROW, SELECTCOLUMNS), CALENDAR's Date -- as [Name].
+        """One row of a table expression as ``(heading, value)`` per column,
+        headed as TOCSV / TOJSON head them: 'Table'[Column] for a column of a
+        model table, [Name] for any other (_lineage_cells)."""
+        return [((f"'{t}'[{c}]" if t is not None else f"[{c}]"), v)
+                for (t, c), v in cls._lineage_cells(row, ctx, named)]
+
+    @classmethod
+    def _lineage_cells(cls, row, ctx: DAXContext, named: bool = False) -> list:
+        """One row of a table expression as ``((table, name), value)`` per
+        column, in column order: ``table`` is the model table of a column of
+        one, None for any other column -- one a table function made
+        (ADDCOLUMNS, ROW, SELECTCOLUMNS), CALENDAR's Date. TOCSV / TOJSON head
+        the first as 'Table'[Column], the other as [Name] (_headed_cells); a
+        query's result names them so too (pbix_mcp.dax.query). A column
+        SELECTCOLUMNS keeps without a name keeps its table (``__lineage__``).
 
         Walked as _row_cells walks a row's cells (issue #359): a row of one
         column (VALUES, CALENDAR) holds it as ``__value__``, a GENERATE row
@@ -26879,7 +26960,7 @@ class DAXEngine:
         [X], empty on an unmatched row. ``named``: the row is a SELECTCOLUMNS
         row (_NamedColumnsRow), whose columns are headed by name alone."""
         if not isinstance(row, dict):
-            return [('[Value]', row)]
+            return [((None, 'Value'), row)]
         named = named or isinstance(row, _NamedColumnsRow) or row.get('__columns__') == 'named'
         parts = row.get('__parts__')
         cells: list = []
@@ -26887,7 +26968,7 @@ class DAXEngine:
         if parts:
             seen = set()
             for part in parts:
-                cells += cls._headed_cells(part, ctx)
+                cells += cls._lineage_cells(part, ctx)
                 seen.update(part)
         t = row.get('__table__')
         tbl = ctx.tables.get(t) if isinstance(t, str) and not named else None
@@ -26899,8 +26980,13 @@ class DAXEngine:
         model_cols: Any = (({cell_of} if lone else set(tbl.get('columns') or ()))
                            if tbl is not None else ())
 
+        lineage = row.get('__lineage__') if named else None
+
         def heading(name):
-            return f"'{t}'[{name}]" if name in model_cols else f"[{name}]"
+            if lineage and name in lineage:
+                # a column SELECTCOLUMNS kept without a name of its own
+                return (lineage[name], name)
+            return (t, name) if name in model_cols else (None, name)
 
         generate = '_inner___table__' in row     # every GENERATE level has it
         inner: Optional[dict] = None
@@ -26919,7 +27005,7 @@ class DAXEngine:
             else:
                 cells.append((heading(key), val))
         if inner is not None:
-            cells[inner_at:inner_at] = cls._headed_cells(inner, ctx)
+            cells[inner_at:inner_at] = cls._lineage_cells(inner, ctx)
         return cells
     def _fn_tocsv(self, args_str: str, ctx: DAXContext):
         parts = self._split_args(args_str)

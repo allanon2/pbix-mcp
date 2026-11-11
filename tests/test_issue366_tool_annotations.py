@@ -97,6 +97,7 @@ def _read_only_calls(tmp_path, paths) -> dict:
         "pbix_datamodel_list_abf_files": a,
         "pbix_evaluate_dax": {**a, "measures": "Total"},
         "pbix_evaluate_dax_batch": {**a, "measures": "Total", "contexts": json.dumps([{}])},
+        "pbix_execute_query": {**a, "query": "EVALUATE ROW(\"x\", [Total])"},
         "pbix_evaluate_dax_per_dimension": {**a, "measures": "Total", "dimension": "T.K"},
         "pbix_evaluate_dax_grouped": {**a, "measures": "Total", "group_by": "T.K"},
         "pbix_get_default_filters": {**a, "page_index": 0},

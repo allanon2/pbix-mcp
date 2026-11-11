@@ -69,7 +69,7 @@ from pbix_mcp.errors import (
 from pbix_mcp.logging_config import logger
 from pbix_mcp.models import responses as _responses
 from pbix_mcp.models.requests import DimensionRef, FilterContext
-from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse
+from pbix_mcp.models.responses import DAXEvalResponse, DAXResult, ToolResponse, json_safe_number
 
 # ---------------------------------------------------------------------------
 # MCP Server
@@ -14013,6 +14013,10 @@ def _get_dax_context(alias: str) -> dict:
         # The MODEL's own column list. `tables` above is a materialized subset,
         # so it cannot be used to decide that a reference is unresolvable.
         'model_columns': model.all_column_names,
+        # (table, column) -> the model's DataType name: what a DAX query's
+        # result column of a model column is typed as (pbix_execute_query)
+        'column_types': {(r['TableName'], r['ColumnName']): r.get('DataType')
+                         for r in schema_list if r.get('ColumnName')},
         'date_table': date_table,
         'date_column': date_column,
         # Tables MARKED as date tables ({table: date column}): a filter on that
@@ -14538,6 +14542,63 @@ def pbix_evaluate_dax(
                                      apply_default_filters, page_index, group_by,
                                      selected_filter_context)
 
+
+
+@mcp.tool(annotations=_reads("Run a DAX query"))
+def pbix_execute_query(alias: str, query: str) -> str:
+    """Run a DAX query -- [DEFINE MEASURE ...] EVALUATE <table> [ORDER BY ...],
+    one or more EVALUATEs -- against the data model, with no filter.
+
+    Returns one table per EVALUATE in data.tables, each
+    {"columns": [{"name", "type", "type_source"}], "rows": [[...]],
+    "columns_known"}: rows are positional lists in the engine's order (or
+    ORDER BY's); a column of a model table is named Table[Column], any other
+    [Name]; a type is Boolean, DateTime, Text, Decimal, Double, Integer or
+    Variant, from the model for a model column ("model") and otherwise from
+    the column's values ("values"). An empty result has no row to name its
+    columns from: columns_known is false.
+
+    DEFINE MEASURE defines a measure for this query only (one of a model
+    measure's name replaces it here); the model is not changed. DEFINE VAR,
+    TABLE, COLUMN and FUNCTION and START AT are refused
+    (DAX_UNSUPPORTED_FUNCTION), as is an expression that reaches an
+    unsupported function; an error fails the whole query (DAX_EVAL_FAILED,
+    DAX_PARSE_FAILED). A failure is never an empty table.
+
+    Args:
+        alias: The alias of the open file
+        query: The DAX query text
+    """
+    try:
+        info = _ensure_open(alias)
+        if info.get("is_directquery"):
+            return ToolResponse.error(
+                "This file uses DirectQuery — DAX evaluation requires local data. "
+                "Use layout, measure, and metadata tools instead.",
+                UnsupportedFormatError.code,
+            ).to_text()
+        ctx = _get_dax_context(alias)
+        from pbix_mcp.dax.query import execute_query
+        tables = execute_query(
+            query, ctx['tables'], ctx['measure_defs'],
+            date_table=ctx['date_table'], date_column=ctx['date_column'],
+            relationships=ctx.get('relationships'),
+            measure_tables=ctx.get('measure_tables'),
+            model_columns=ctx.get('model_columns'),
+            culture=ctx.get('culture'), date_tables=ctx.get('date_tables'),
+            column_types=ctx.get('column_types'))
+        for t in tables:
+            t['rows'] = [[json_safe_number(v) for v in row] for row in t['rows']]
+        return ToolResponse(
+            success=True,
+            message=f"{len(tables)} table(s): " + ", ".join(
+                f"{len(t['rows'])} row(s)" for t in tables),
+            data={'tables': tables},
+        ).to_text()
+    except PBIXMCPError as e:
+        return ToolResponse.error(e.message, e.code).to_text()
+    except Exception as e:
+        return _unexpected_error_text(e)
 
 _BATCH_CONTEXT_KEYS = ("filter_context", "group_by", "selected_filter_context")
 _BATCH_CONTEXT_SHAPE = ('{"filter_context": {"Table.Column": [values]}, '
