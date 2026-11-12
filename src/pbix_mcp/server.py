@@ -13024,9 +13024,11 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
     what actually removes them: a calculated column exists because the plan
     re-creates it, so omitting it from the plan is the removal.
     """
-    from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason
+    from pbix_mcp.dax.calc_tables import calc_column_unsupported_reason, model_culture
     from pbix_mcp.formats.vertipaq_decoder import read_table_from_abf
 
+    # the model's culture, for FORMAT in the columns and tables re-evaluated
+    culture = model_culture(conn)
     _AMO_TO_NAME = {2: "String", 6: "Int64", 8: "Double", 9: "DateTime",
                     10: "Decimal", 11: "Boolean"}
     table_updates: dict[str, dict] = {}
@@ -13072,7 +13074,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
             # at load. Its generating DAX is declared right here in the
             # partition, so evaluate THAT rather than refusing outright.
             generated = True
-            cols, rows, why = _evaluate_calc_table_partition(qd, abf, meta)
+            cols, rows, why = _evaluate_calc_table_partition(qd, abf, meta, culture)
             if not cols:
                 hint = ""
                 if _is_auto_date_table(tname):
@@ -13247,7 +13249,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
 
         cols_out, rows_out, restamp = _materialize_table_calc_columns(
             tname, data_cols, data_rows, specs, relationships,
-            lookup_provider=_lookup_table)
+            lookup_provider=_lookup_table, culture=culture)
         # The calc columns' values go into VertiPaq, but must NOT be embedded in
         # the partition's Enter-data M — Power BI recomputes them from DAX.
         table_updates[tname] = {"columns": cols_out, "rows": rows_out,
@@ -13263,7 +13265,7 @@ def _plan_calc_preservation(conn, abf, meta, relationships, extra_columns=None,
 _DAX_TABLE_REF_RE = re.compile(r"'([^']+)'\s*\[|(?<![\w'])([A-Za-z_]\w*)\s*\[")
 
 
-def _evaluate_calc_table_partition(query_definition: str, abf, meta) -> tuple:
+def _evaluate_calc_table_partition(query_definition: str, abf, meta, culture=None) -> tuple:
     """Evaluate a calculated table's own declared DAX to regenerate its rows.
 
     Returns ``(columns, rows, reason)``; ``columns`` is empty when it could not
@@ -13296,7 +13298,7 @@ def _evaluate_calc_table_partition(query_definition: str, abf, meta) -> tuple:
                             "rows": td.get("rows") or []}
 
     try:
-        result, err = evaluate_calc_table_expression(expr, tables, {}, [])
+        result, err = evaluate_calc_table_expression(expr, tables, {}, [], culture=culture)
     except Exception as exc:
         return [], [], f"{type(exc).__name__}: {exc}"
     if err or not result:
@@ -13480,7 +13482,7 @@ def pbix_datamodel_add_calculated_table(
         ctx = _get_dax_context(alias)
         result, err = evaluate_calc_table_expression(
             dax, ctx["tables"], ctx.get("measure_defs"),
-            ctx.get("relationships"))
+            ctx.get("relationships"), culture=ctx.get("culture"))
         if err:
             return ToolResponse.error(
                 f"Calculated table '{table_name}' cannot be materialized: "
@@ -13906,9 +13908,14 @@ def _get_dax_context(alias: str) -> dict:
     # Uses calc_tables.py as the single source of truth for evaluating
     # DATATABLE, GENERATESERIES, CALENDAR, and other calculated table expressions
     # that exist only as DAX in metadata, not in VertiPaq column stores.
+    # The MODEL's own culture: FORMAT() renders a STRING the canvas prints
+    # verbatim, so its separators and named date formats come from here, not
+    # the reader's host (issue #60), in measures and calculated columns alike.
+    model_culture = _read_model_culture(alias)
     try:
         from pbix_mcp.dax.calc_tables import load_calculated_tables
-        tables = load_calculated_tables(info["path"], tables, relationships)
+        tables = load_calculated_tables(info["path"], tables, relationships,
+                                        culture=model_culture)
     except Exception:
         pass  # If calculated table loading fails, continue without them
     mark_currency_columns(tables, currency_columns)
@@ -14005,10 +14012,7 @@ def _get_dax_context(alias: str) -> dict:
         'relationships': relationships,
         'default_filters': default_filters,
         'work_dir': info["work_dir"],
-        # The MODEL's own culture. FORMAT() renders a STRING the canvas prints
-        # verbatim, so its separators come from here, not the reader's host
-        # (issue #60).
-        'culture': _read_model_culture(alias),
+        'culture': model_culture,
     }
     _dax_cache[alias] = ctx
     return ctx
