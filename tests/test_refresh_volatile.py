@@ -142,3 +142,40 @@ def test_a_failure_keeps_the_saved_rows(model, clock, monkeypatch):
     assert e.value.table == "Stamp"
     assert server._get_dax_context(model) is before
     assert days(column(model, "Stamp", "Day")) == ["2023-11-29"]
+
+
+# The model's culture: a calculated table or column recomputed as of now formats in it, as a measure's FORMAT does
+# (presumed for calculated columns and tables; not measured on Desktop). The en-AU patterns are the ones measured for
+# FORMAT(..., "en-AU") on Power BI Desktop 2.157 (tests/test_format_named_dates_by_culture.py). A culture with no
+# date data here is refused, not printed in en-US's.
+
+def set_culture(alias: str, culture: str) -> None:
+    assert json.loads(server.pbix_set_model_culture(alias, culture))["success"]
+
+
+def test_a_table_recomputes_in_the_models_culture(model, clock):
+    set_culture(model, "en-AU")
+    add_table(model, "Stamp", 'ROW("Day", FORMAT(TODAY(), "Short Date"))')
+    assert column(model, "Stamp", "Day") == ["29/11/2023"]
+    clock.now = OPENED
+    assert recompute_volatile(model).calculated_tables == ["Stamp"]
+    assert column(model, "Stamp", "Day") == ["4/11/2026"]
+
+
+def test_a_column_recomputes_in_the_models_culture(model, clock):
+    set_culture(model, "en-AU")
+    add_column(model, "Sales", "Day", 'FORMAT(TODAY(), "Long Date")', "String")
+    assert column(model, "Sales", "Day") == ["Wednesday, 29 November 2023"] * 2
+    clock.now = OPENED
+    assert recompute_volatile(model).calculated_columns == ["Sales"]
+    assert column(model, "Sales", "Day") == ["Wednesday, 4 November 2026"] * 2
+
+
+def test_a_culture_without_date_data_is_refused(model, clock):
+    add_table(model, "Stamp", 'ROW("Day", FORMAT(TODAY(), "Short Date"))')
+    set_culture(model, "de-DE")
+    clock.now = OPENED
+    with pytest.raises(RefreshError) as e:
+        recompute_volatile(model)
+    assert e.value.table == "Stamp"
+    assert "FORMAT" in str(e.value)
