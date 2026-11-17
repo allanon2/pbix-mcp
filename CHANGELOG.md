@@ -5,6 +5,69 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Reported by @allanon2 in #362 and #363, measured on Microsoft's MIT sample `2026 Power BI Samples Revamp/AdventureWorks Sales.pbix`.
+
+### Fixed — a date table filter reaches a table two hops away (issue #369; reported by @allanon2 in #362)
+
+A filter on the date table did not reach a table with no direct relationship to it, even with a relationship path, so the measure answered its grand total without a warning. On that sample, `Orders = DISTINCTCOUNT('Sales Order'[Sales Order])` (`Date -> Sales -> Sales Order`, the last relationship filtering both ways) answered 31455 for 2018. It now answers 3748, the count from the table rows. The date table's route by date-column name had run before the path search and found nothing on `Sales Order`. The path now comes first, in `_source_cross_filters_uncached` and `_se_join_column`, and the by-name route remains for a table no path reaches. Tests: `tests/test_issue369_date_two_hops.py`.
+
+### Fixed — calculation groups whose item column has no SourceColumn (issue #370; reported by @allanon2 in #363)
+
+`ModelReader.calculation_groups` found a group's item column only by `SourceColumn = "Name"`. Both groups in that sample leave it empty, so they were skipped and `Sales by Due Date` / `Sales by Ship Date` answered the order-date figure. With no column sourced from `Name`, the item column is now the one data column that isn't the `Ordinal`, and two such columns leave the group undecided as before. For 2018 they now answer 29892677.7569 and 29998861.1604, the sums from the table rows by each date key. Tests: `tests/test_issue370_calc_group_item_column.py`.
+
+### Fixed — answers that were silently wrong, measured on Power BI Desktop 2.157
+
+Every case was run in Power BI Desktop 2.157 (2026-11-12 and 2026-11-17) against its own engine over its loopback connection: on Microsoft's MIT sample `2026 Power BI Samples Revamp/Revenue Opportunities.pbix`, and on a synthetic model with a table holding no rows. On the second batch's 42 queries the engine matched Desktop on 9 before this change and on all 42 after it. Black-box observation only.
+
+Where Desktop errors, the engine answered a value (BLANK unless said):
+
+- `ROW("x", )` is `Argument '2' in ROW function is required.`; `ROW("x")` is `Too few arguments were passed to the ROW function. The minimum argument count for the function is 2.`
+- Two ROW names that differ only in case: `ROW("a", 1, "A", 2)` is `Function 'ROW' cannot add column [A], as it has the same name with an existing column.` One column took the other's place.
+- ADDCOLUMNS over a column its table has (names compare without case): `Function 'ADDCOLUMNS' cannot add column [Probability] since it already exists.` It replaced the column's values. Two new columns of one name: `Function 'ADDCOLUMNS' cannot add column [X], as it has the same name with an existing column.`
+- MEDIAN over a text, TRUE / FALSE or date column: `MEDIAN does not support expressions of type string/Boolean/date.`; MEDIANX over text alike, `MEDIANX does not support ...`.
+- A measure qualified by a table that isn't its home, `'Opp'[Total]` with Total on `_M`: `Column 'Total' in table 'Opp' cannot be found or may not be used in this expression.` It answered Total. A measure whose home isn't known is taken under any table, as before.
+- A row constructor before IN, compared as CONTAINSROW: text against a number, `("1", "a") IN {(1, "a")}`, is `Function 'CONTAINSROW' does not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.`; a tuple of another width than the table, `(1, 2) IN {1, 2}`, is `The number of arguments is invalid. Function CONTAINSROW must have a value for each column in the table expression.` CONTAINSROW itself reads the same way (not measured apart: Desktop's texts for IN name CONTAINSROW).
+
+Where Desktop answers, the engine answered otherwise:
+
+- A row constructor before IN: `FILTER('Opp', ('Opp'[Rank], 'Opp'[Name]) IN {(1, "a"), (3, "a")})` keeps the two rows that match; it kept none. Text compares without case; a BLANK matches only a BLANK. CONTAINSROW and the tuple read every column of a row, as DISTINCT does: over `ADDCOLUMNS(VALUES(T[a]), "x", 1)` or a CROSSJOIN (reasoned, not measured).
+- A VAR block as a VAR's value: `VAR a = VAR b = 1 RETURN b + 1 RETURN a` is 2; it was 1 (the inner RETURN ended the outer block). `VAR a = 1 VAR b = VAR c = 2 RETURN c RETURN a + b` is 3; it was BLANK. City Sustainability's public measure `Alt Text - Page 2 Card Baseline` is written so: it answered FALSE, and now Desktop's text, to the character.
+- A model table with no rows is a table with none: `EVALUATE '_M'` is its column and no row. The model loader left such a table out, so a reference to it was BLANK and `'_M'[Total]`, a measure homed on it, BLANK where Desktop answers 6. A table whose data fails to load is still left out.
+- The columns ADDCOLUMNS and SUMMARIZE add are their own, whatever their names: `TOCSV(ADDCOLUMNS(SUMMARIZE('Opp', 'Opp'[Name]), "Rank", 1))` heads `'Opp'[Name],[Rank]`; it headed `'Opp'[Rank]` because Opp has a column Rank. Over GROUPBY and SUMMARIZECOLUMNS alike, and SUMMARIZE's own extension.
+- A table constructor's column with text beside other values is a Text column: `{1, "a"}` is `"1"` and `"a"`, `{2.5, "a"}` `"2.5"`, `{DATE(2026, 1, 6), "a"}` `"1/6/2026"`, `{TRUE(), "a"}` `"TRUE"`; a BLANK stays BLANK. The numbers stayed numbers. A row constructor's column alike.
+
+Every measure of 50 public sample files (426) answers as before but the City Sustainability measure above.
+
+Tests: `tests/test_silent_wrong_answers_desktop_2157.py`, 56 cases, 48 of which fail before this change (the other 8 guard answers that must not change). `test_issue357`'s refusal now expects Desktop's text.
+
+## [0.9.153] - 2026-11-04
+
+For Anthropic's plugin directory: its policy's tool annotations, a privacy link, and names of our own. No answer of the DAX engine and no file the package writes changes.
+
+Verified before release: full suite 10964 passed, 157 skipped, 7 xfailed; ruff clean on `src` and `tests`, mypy 131.
+
+### Added — every tool declares a title and what it does (issue #366)
+
+None of the 134 tools declared MCP annotations, which Anthropic's Software Directory Policy requires (5.E: "in particular readOnlyHint, destructiveHint, and title"). Each now has a title and the four hints, classified from what its code does; `openWorldHint` is false on all of them, as the package makes no network call. Marked destructive are also the ones that do not look it: `pbix_close` (`force=True` discards unsaved edits), `pbix_create`, `pbix_import_tmdl` and the exports (they replace a file already at the path, and `pbix_export_pbip` a folder). A client may act on `readOnlyHint` without asking anyone, so `tests/test_issue366_tool_annotations.py` calls every read-only tool against an open file and checks by digest that the file and its working copy do not change, nor its unsaved-changes flag; a read-only tool it does not call fails it. The minimum `mcp` is now 1.7.1, the lowest checked with annotations.
+
+### Changed — the server's names are pbix-mcp (issue #368)
+
+The server called itself `PowerBI-PBIX-Editor`, and the plugin and the README's examples used the key `powerbi-editor`. Both are `pbix-mcp`. An existing configuration keeps working under the key it chose; a plugin user's tool prefix changes when the plugin updates (`/mcp` shows `plugin:pbix-mcp:pbix-mcp`).
+
+### Added — a privacy section that says what is read, where it goes and how long it stays (issue #367)
+
+The plugin's README now states all three, and `plugin.json` links to it as `privacyPolicyUrl`.
+
+### Added — a Claude Code plugin, with this repository as its marketplace (issue #364)
+
+`/plugin marketplace add d0nk3yhm/pbix-mcp`, then `/plugin install pbix-mcp@pbix-mcp`, adds the server to Claude Code without installing the package or writing configuration; it needs [uv](https://docs.astral.sh/uv/). The plugin runs `uvx --python 3.13 --from pbix-mcp==<version> pbix-mcp-server`. The exact version is what Anthropic's plugin directory requires of a launcher, and the server changes only when the plugin is updated. The Python is named because `uvx` otherwise takes what it finds: 3.14 on a machine with no Python, which CI does not test, and on a machine with a damaged uv-managed 3.12 the server failed at startup (`No module named '_sqlite3'`). Measured through that exact command, on this machine and with only freshly downloaded Pythons: the server starts in about 6 seconds and lists its 134 tools; through it, a model was created and reopened and a measure evaluated (7 = 1 + 2 + 4). `claude plugin validate` passes on the plugin and the marketplace (`--strict` fails only on `icon`, `documentationUrl` and `supportUrl`, which Claude Code ignores and the directory reads), and an isolated install reports it connected. Tests: `tests/test_issue364_claude_code_plugin.py`.
+
+### Added — the Claude Code plugin ships a lock file for its dependencies (issue #365)
+
+The plugin pinned pbix-mcp but none of the packages pbix-mcp depends on, so one plugin version could install different dependencies on different days. `plugins/pbix-mcp` now ships `pyproject.toml` and `uv.lock` (34 packages with registry sources and hashes, for Python 3.13). The launcher stays `uvx --python 3.13 --from pbix-mcp==<version> pbix-mcp-server`, because that is the only form Anthropic's plugin directory can lock: tried on a branch, `uv run --project ... --frozen` gave "Launcher lock invalid" and two more policy holds, and `--with-requirements` gave "Launcher lock invalid"; this form gives "Launcher locked", with the directory's note that "Claude Code's locked launch installs exactly this set". Installing that set is Claude Code's work and was not observed here: `uvx` itself does not read `uv.lock`, so a Claude Code without the locked launch resolves dependencies as before. Tests: `tests/test_issue364_claude_code_plugin.py`.
+
 ## [0.9.152] - 2026-10-28
 
 Reported by @allanon2 in issue #361: a measure reference in an iteration over a model table had become slower in 0.9.150.
