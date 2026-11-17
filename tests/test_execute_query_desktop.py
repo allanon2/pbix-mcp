@@ -17,7 +17,7 @@ Desktop returned, nothing read from it.
   {1, "a"} a String column of "1" and "a".
 - DEFINE VAR, TABLE and COLUMN; a VAR and a MEASURE see each other in any
   order.
-- Silent wrong answers made errors (issue #338): ROW("x", ), a stray
+- Silent wrong answers made errors: ROW("x", ), a stray
   operator, MEDIAN over text, ADDCOLUMNS over an existing column.
 """
 from __future__ import annotations
@@ -140,7 +140,7 @@ def test_runtime_error_is_the_engines_text():
 
 
 # ---------------------------------------------------------------------------
-# Silent wrong answers made errors (#338)
+# Silent wrong answers made errors
 # ---------------------------------------------------------------------------
 
 def test_row_missing_argument():
@@ -150,6 +150,8 @@ def test_row_missing_argument():
 def test_row_names_compare_without_case():
     assert error('EVALUATE ROW("AMPM", 1, "ampm", 2)') == \
         "Function 'ROW' cannot add column [ampm], as it has the same name with an existing column."
+    assert error('EVALUATE ROW("a", 1, "A", 2)') == \
+        "Function 'ROW' cannot add column [A], as it has the same name with an existing column."
 
 
 def test_addcolumns_over_an_existing_column():
@@ -311,3 +313,71 @@ def test_query_vars_do_not_leak_into_the_next_query():
     run('DEFINE VAR leak = 1 EVALUATE ROW("x", leak)')
     from pbix_mcp.dax import engine as de
     assert not de._engine._query_vars
+
+
+# ---------------------------------------------------------------------------
+# A fresh review's findings: valid DAX the checks must not refuse
+# ---------------------------------------------------------------------------
+
+MODEL_COLUMNS = {STAGE: set(TABLES[STAGE]["columns"]), "Opp": {"Rank"},
+                 "Targets": {"Goal"}, "_Measures": {"Column1"}}
+
+
+def run_model(text: str, measures: dict | None = None, homes: dict | None = None) -> list:
+    return execute_query(text, TABLES, dict(measures or MEASURES),
+                         measure_tables=dict(homes or {"Revenue": "Opp"}),
+                         model_columns=MODEL_COLUMNS, column_types=TYPES)
+
+
+def test_a_table_with_no_rows_is_a_table():
+    # model_columns names it; the materialised tables hold only tables with rows
+    (t,) = run_model("EVALUATE ROW(\"x\", COUNTROWS('Targets'), \"g\", SUM('Targets'[Goal]))")
+    assert t["rows"] == [[None, None]]
+
+
+def test_a_measures_home_table_is_a_table():
+    with pytest.raises(DAXEvaluationError) as e:
+        run_model("EVALUATE ROW(\"x\", 'Nowhere'[Revenue])")
+    assert e.value.message.startswith("Query (1, 19) Cannot find table 'Nowhere'.")
+    # a home table known only as a measure's home: never "Cannot find table"
+    try:
+        run_model("EVALUATE ROW(\"x\", 'Calc'[Revenue])", homes={"Revenue": "Calc"})
+    except DAXEvaluationError as err:
+        assert "Cannot find table" not in err.message
+
+
+@pytest.mark.parametrize("text", [
+    "EVALUATE FILTER(COLUMNSTATISTICS(), [Cardinality] > 1)",
+    "EVALUATE SELECTCOLUMNS(INFO.VIEW.MEASURES(), \"n\", [Name], \"e\", [Expression])",
+])
+def test_columns_a_function_names_itself_are_not_refused(text):
+    run_model(text)
+
+
+def test_an_unknown_name_is_still_refused_beside_ordinary_functions():
+    with pytest.raises(DAXEvaluationError) as e:
+        run_model("EVALUATE ROW(\"x\", SUMX('Opp', [Nope]))")
+    assert "The value for 'Nope' cannot be determined." in e.value.message
+
+
+@pytest.mark.parametrize("text", [
+    "EVALUATE FILTER('Opp', ('Opp'[Rank], 'Opp'[Rank]) IN {(1, 1)})",
+    'EVALUATE ROW("x", VAR a = VAR b = 1 RETURN b + 1 RETURN a)',
+    'EVALUATE ROW("x", VAR a = 1 VAR b = VAR c = 2 RETURN c RETURN a + b)',
+])
+def test_valid_syntax_the_review_found(text):
+    run_model(text)
+
+
+def test_a_model_measure_does_not_see_a_query_var():
+    # query VARs are the query's own expressions'; a model measure's bare
+    # name is no query variable
+    (t,) = run_model('DEFINE VAR v = 7 EVALUATE ROW("m", [UsesV])',
+                     measures={**MEASURES, "UsesV": "v + 1"}, homes={"Revenue": "Opp", "UsesV": "Opp"})
+    assert t["rows"] != [[8]]
+
+
+def test_info_measures_list_no_query_slot():
+    (t,) = run_model("DEFINE TABLE T2 = {1} EVALUATE SELECTCOLUMNS(INFO.VIEW.MEASURES(), \"n\", [Name])")
+    assert all(not str(r[0]).startswith("\x00") for r in t["rows"])
+    assert ["Revenue"] in t["rows"]

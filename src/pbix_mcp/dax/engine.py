@@ -4936,7 +4936,7 @@ def _to_column_type(v, target):
 def _ctor_text_columns(rows: list) -> list:
     """A table constructor's column that holds text beside numbers is a
     Text column: its numbers become their text, as `&` writes them
-    (_concat_str). Power BI Desktop 2.157 (NUC 2026-11-12, issue #338):
+    (_concat_str). Power BI Desktop 2.157 (2026-11-12):
     EVALUATE {1, "a"} is one String column, "1" and "a"; we kept the number
     1 beside the text. Measured for an Int64 beside text; a Double, a
     Currency, a date or TRUE / FALSE beside text are converted alike (not
@@ -10339,6 +10339,9 @@ class DAXEngine:
         # -> _LazyVar: query-level constants every expression of the query
         # sees, its measures' too, after its own VARs. None outside a query.
         self._query_vars: Optional[dict] = None
+        # the measures of that query whose bodies see them (its own, and its
+        # EVALUATEs'); a model measure never does
+        self._query_measures: frozenset = frozenset()
         self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
         # The same, per MEASURE (PR #96): a function hit while evaluating M is
         # recorded for M and for every measure whose evaluation reached M, so
@@ -12761,7 +12764,8 @@ class DAXEngine:
                     for k, v in var_scope.items():
                         if k.lower() == data.lower():
                             return v.force(self) if isinstance(v, _LazyVar) else v
-                if self._query_vars:
+                if self._query_vars and (not self._measure_path
+                                         or self._measure_path[-1][0] in self._query_measures):
                     v = self._query_vars.get(data.lower())
                     if v is not None:
                         return v.force(self)
@@ -14985,10 +14989,9 @@ class DAXEngine:
                     t = self._ctor_column_static_type(args[0], args[1], ctx, env, depth, stack)
                 if fname.startswith('MEDIAN') and t == 'I':
                     # a Variant: each value its own type, a Double for a half
-                    # and an Int64 on a value (Power BI Desktop 2.157, NUC
+                    # and an Int64 on a value (Power BI Desktop 2.157,
                     # 2026-11-12: MEDIAN of an Int64 column, MEDIANX({1, 2},
-                    # ..) 1.5 and MEDIANX({1, 2, 3}, ..) 2, all System.Object;
-                    # issue #302)
+                    # ..) 1.5 and MEDIANX({1, 2, 3}, ..) 2, all System.Object)
                     return 'V'
                 return 'C' if t == 'C' else ('D' if fname.startswith('AVERAGE') and t in ('I', 'D') else None)
             if fname == 'DIVIDE' and len(args) >= 2:
@@ -20639,7 +20642,7 @@ class DAXEngine:
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
             data = ctx.get_column_data(ref[0], ref[1])
-            # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): over a text
+            # Power BI Desktop 2.157 (2026-11-12): over a text
             # column MEDIAN is an error, "MEDIAN does not support expressions
             # of type string/Boolean/date." (it was a BLANK); a model column
             # holds one type, so its first value tells it
@@ -22155,7 +22158,7 @@ class DAXEngine:
         # build_b243c.py f_sc_two; alone 0.541100263595581; #339)
         row_scope = (self._se_extensions_scope([(None, args[k + 1]) for k in range(1, len(args) - 1, 2)], ctx)
                      if len(args) >= 5 and ctx._se_fuse is not None else None)
-        # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): a new column
+        # Power BI Desktop 2.157 (2026-11-12): a new column
         # of a name the table has (names compare case-insensitively) is an
         # error, "Function 'ADDCOLUMNS' cannot add column [Probability] since
         # it already exists." -- ADDCOLUMNS('Sales stage', "Probability", 1)
@@ -22943,7 +22946,7 @@ class DAXEngine:
             low = name.lower()
             if low in seen:
                 if seen[low] != (lin.lower() if lin else None):
-                    # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338):
+                    # Power BI Desktop 2.157 (2026-11-12):
                     # SELECTCOLUMNS('Sales stage', 'Sales stage'[Sales Stage],
                     # "Sales Stage", 1) is two columns, Sales stage[Sales
                     # Stage] and [Sales Stage]. A row here holds a column by
@@ -23538,7 +23541,7 @@ class DAXEngine:
         if len(args) >= 4 and prev is not None and ctx._current_row is None:
             ctx._se_fuse = (ctx, self._se_joined_scope(
                 [(None, args[k + 1]) for k in range(0, len(args) - 1, 2)], ctx))
-        # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): ROW("x", ) is
+        # Power BI Desktop 2.157 (2026-11-12): ROW("x", ) is
         # "Argument '2' in ROW function is required." (it was a BLANK), and
         # two names that differ only in case are an error (one silently
         # replaced the other): ROW("AMPM", 1, "ampm", 2) is "Function 'ROW'
@@ -29008,11 +29011,12 @@ class DAXEngine:
         if kind == 'measures':
             # names wrapped in double underscores are engine-internal (the
             # conformance harness evaluates each probe AS such a measure);
-            # they are not model objects.
+            # they are not model objects, nor are a DAX query's own slots
+            # (\x00EVALUATE n, \x00TABLE name: pbix_mcp.dax.query).
             return [dict(T, Name=m, Expression=str(e),
                          TableName=ctx.measure_tables.get(m, ''))
                     for m, e in ctx.measures.items()
-                    if not (m.startswith('__') and m.endswith('__'))]
+                    if not (m.startswith('__') and m.endswith('__')) and not m.startswith('\x00')]
         if kind == 'relationships':
             return [dict(T, ID=i + 1, FromTable=r.get('FromTable'),
                          FromColumn=r.get('FromColumn'),

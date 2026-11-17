@@ -133,7 +133,7 @@ def _scan(text: str) -> list:
 # Syntax: Desktop's messages, and where
 # ---------------------------------------------------------------------------
 #
-# Power BI Desktop 2.157 (NUC, 2026-11-12, over its loopback ADOMD; the DAX
+# Power BI Desktop 2.157 (2026-11-12, over its loopback ADOMD; the DAX
 # query view shows the same text): a token out of place is
 #   Query (1, 22) The syntax for '*' is incorrect. (EVALUATE ROW("x", 1 +* 2)).
 # -- (line, column), 1-based, of the token, and the whole query in the
@@ -190,8 +190,11 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
     open an operand; VAR name = expression ... RETURN expression. An empty
     argument of a call (ROW("x", ) or a skipped optional one) is not a
     syntax error: the function decides whether it needs the argument."""
-    # frames: [kind, var_open]; kind 'top', 'call', 'group', 'brace', 'tuple'
-    frames: list = [['top', False]]
+    # frames: [kind, open VAR blocks]; kind 'top', 'call', 'group', 'brace',
+    # 'tuple'. A VAR block can be a VAR's value (VAR a = VAR b = 1 RETURN b
+    # RETURN a), so the blocks open in a frame are counted.
+    frames: list = [['top', 0]]
+    continuing = False           # the VAR read next continues an open block
     want_operand = True
     just_opened = False          # the last token opened a call or followed a call's comma
     k = i
@@ -215,7 +218,9 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
                         if bad is None:
                             raise DAXParseError(_END_OF_INPUT)
                         raise _syntax_error(text, bad)
-                    frame[1] = True
+                    if not continuing:
+                        frame[1] += 1
+                    continuing = False
                     k += 3
                     just_opened = False
                     continue
@@ -223,7 +228,7 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
                     raise _syntax_error(text, t)
                 # a name, number or function: Table[Column] is one operand
                 if k + 1 < j and toks[k + 1].kind == 'open' and toks[k + 1].text == '(':
-                    frames.append(['call', False])
+                    frames.append(['call', 0])
                     k += 2
                     just_opened = True
                     continue
@@ -246,7 +251,7 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
             if t.kind == 'open':
                 # a ( inside { } is a row of a table constructor: {(1, "a")}
                 kind = 'brace' if t.text == '{' else ('tuple' if frame[0] == 'brace' else 'group')
-                frames.append([kind, False])
+                frames.append([kind, 0])
                 k += 1
                 just_opened = False
                 continue
@@ -268,7 +273,8 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
         # an operand has been read: an operator, a separator or a close
         if t.kind == 'punct':
             if t.text == ',':
-                if frame[0] in ('call', 'brace', 'tuple') and not frame[1]:
+                # a 'group' too: a row constructor, ('T'[a], 'T'[b]) IN {(1, "x")}
+                if frame[0] in ('call', 'brace', 'tuple', 'group') and not frame[1]:
                     k += 1
                     want_operand = True
                     just_opened = frame[0] == 'call'
@@ -288,12 +294,13 @@ def _check_syntax(text: str, toks: list, i: int, j: int) -> None:
                 want_operand = True
                 continue
             if w == 'RETURN' and frame[1]:
-                frame[1] = False
+                frame[1] -= 1
                 k += 1
                 want_operand = True
                 continue
             if w == 'VAR' and frame[1]:
                 want_operand = True       # the next declaration of the block
+                continuing = True
                 continue
             raise _syntax_error(text, t)
         if t.kind == 'close':
@@ -590,11 +597,13 @@ def _cell(v):
 _CONSTRUCTOR_NAME = frozenset(['value', 'date'])   # {..}'s [Value], CALENDAR's [Date]
 
 
-def _resolve_names(q: DaxQuery, tables: dict, measures: dict) -> None:
+def _resolve_names(q: DaxQuery, tables: dict, measures: dict,
+                   model_columns: Optional[dict] = None,
+                   measure_tables: Optional[dict] = None) -> None:
     """Desktop's name errors, at their tokens, before any EVALUATE runs.
 
     Power BI Desktop 2.157 resolves a query's names first: a name error in
-    the second of three EVALUATEs returns no result at all (NUC 2026-11-12,
+    the second of three EVALUATEs returns no result at all (2026-11-12,
     "multi middle semantic error"). Measured texts:
       EVALUATE NoSuchTable -> Query (1, 10) Failed to resolve name
         'NoSuchTable'. It is not a valid table, variable, or function name.
@@ -611,9 +620,25 @@ def _resolve_names(q: DaxQuery, tables: dict, measures: dict) -> None:
     [Date]. Anything subtler (a column outside a row context) is left to the
     engine. A bare word is checked only as a whole EVALUATE (the case
     measured): inside an expression it may be a keyword argument (ASC, SKIP,
-    REL, INTEGER ...)."""
+    REL, INTEGER ...).
+
+    Names are the model's: ``model_columns`` (every table and column, rows or
+    none), the materialised ``tables`` and the tables measures live on --
+    ``tables`` alone holds only tables with rows. A bare [Name] is checked
+    only when the query calls no function that makes columns of names of its
+    own (COLUMNSTATISTICS and the other SYSTEM functions, INFO.*) and none
+    the engine's catalog doesn't know."""
+    from pbix_mcp.dax.function_catalog import FUNCTION_CATALOG
     text, toks = q.text, q.toks
-    tlow = {t.lower(): t for t in tables}
+    mcols = {str(t): {str(c) for c in (cs or ())} for t, cs in (model_columns or {}).items()}
+    for t, tb in tables.items():
+        if isinstance(tb, dict):
+            mcols.setdefault(str(t), set()).update(str(c) for c in (tb.get('columns') or ()))
+    for t in (measure_tables or {}).values():
+        if isinstance(t, str):
+            mcols.setdefault(t, set())
+    tlow = {t.lower(): t for t in mcols}
+    col_low = {t.lower(): {c.lower() for c in cs} for t, cs in mcols.items()}
     def_tables = {d.name.lower() for d in q.definitions if d.kind == 'TABLE'}
     var_names = {d.name.lower() for d in q.definitions if d.kind == 'VAR'}
     var_names |= {toks[k + 1].text.lower() for k in range(len(toks) - 1)
@@ -621,9 +646,13 @@ def _resolve_names(q: DaxQuery, tables: dict, measures: dict) -> None:
     m_low = {m.lower() for m in measures}
     m_low |= {d.name.lower() for d in q.definitions if d.kind == 'MEASURE'}
     def_cols = {(d.table.lower(), d.name.lower()) for d in q.definitions if d.kind == 'COLUMN'}
-    all_cols = {str(c).lower() for t in tables.values() if isinstance(t, dict)
-                for c in (t.get('columns') or ())}
+    all_cols = {c for cs in col_low.values() for c in cs}
     all_cols |= {n for _t, n in def_cols}
+    known_fns = {n: i for n, i in FUNCTION_CATALOG}
+    called = {toks[k].text.upper() for k in range(len(toks) - 1)
+              if toks[k].kind == 'word' and toks[k + 1].kind == 'open' and toks[k + 1].text == '('}
+    bare_checked = not any(f not in known_fns or known_fns[f] == 'SYSTEM' or f.startswith('INFO.')
+                           for f in called)
     literals = {t.text[1:-1].replace('""', '"').lower() for t in toks if t.kind == 'str'}
 
     for ev in q.evaluates:
@@ -642,7 +671,7 @@ def _resolve_names(q: DaxQuery, tables: dict, measures: dict) -> None:
         if nxt is None or nxt.kind != 'bname' or (k + 1) in q.heads:
             return
         col = _unquote_name(nxt).lower()
-        cols = {str(c).lower() for c in (tables[tlow[tname.lower()]].get('columns') or ())}
+        cols = col_low[tname.lower()]
         if col not in cols and col not in m_low and (tname.lower(), col) not in def_cols:
             raise DAXEvaluationError(_query_error(
                 text, toks[k].start, f"Column '{_unquote_name(nxt)}' in table '{tname}' cannot "
@@ -665,6 +694,8 @@ def _resolve_names(q: DaxQuery, tables: dict, measures: dict) -> None:
             prev = toks[k - 1] if k else None
             if prev is not None and prev.kind in ('qname', 'word'):
                 continue                      # Table[Column], a variable's t[Value]
+            if not bare_checked:
+                continue
             n = _unquote_name(t).lower()
             if (n in m_low or n in all_cols or n in literals or n in _CONSTRUCTOR_NAME
                     or (n.startswith('value') and n[5:].isdigit())):
@@ -724,7 +755,7 @@ def execute_query(text: str, tables: dict, measures: dict, *,
                 "START AT", "START AT is not supported by this engine's query route yet.")
     if not query.evaluates:
         raise DAXParseError("The query has no EVALUATE statement, so it returns no table.")
-    _resolve_names(query, tables, measures)
+    _resolve_names(query, tables, measures, model_columns, measure_tables)
 
     # The query's measures: the model's, each DEFINE MEASURE replacing the
     # model's measure of its name (names compare case-insensitively).
@@ -763,15 +794,20 @@ def execute_query(text: str, tables: dict, measures: dict, *,
 
     eng = de._engine
     variables = [d for d in query.definitions if d.kind == 'VAR']
+    # the expressions that see the DEFINE VARs: the query's own, never a
+    # model measure (a model measure's bare name is no query variable)
+    own = frozenset(slots) | {d.name for d in query.definitions if d.kind == 'MEASURE'} | {
+        f"\x00TABLE {d.name}" for d in query.definitions if d.kind == 'TABLE'}
 
     def context(tbls: dict):
         """A context of the query over ``tbls``, its DEFINE VARs bound to it:
         query-level constants, evaluated where first used in the query's
         own (unfiltered) context, in any order of definition (Power BI
-        Desktop 2.157, NUC 2026-11-12: a MEASURE sees a VAR defined after
+        Desktop 2.157, 2026-11-12: a MEASURE sees a VAR defined after
         it, and a VAR sees a MEASURE; _LazyVar refuses one that refers to
         itself)."""
         ctx = de.DAXContext(tbls, qm, date_table, date_column, {}, relationships or [])
+        eng._query_measures = own
         ctx.date_tables = date_tables or {}
         ctx.culture = culture
         ctx.measure_tables = qt
@@ -807,6 +843,7 @@ def execute_query(text: str, tables: dict, measures: dict, *,
                 for slot, ev in zip(slots, query.evaluates)]
     finally:
         eng._query_vars = prev_vars
+        eng._query_measures = frozenset()
         if groups or formats:
             de.set_calculation_groups(qm, None, None)
 
@@ -964,7 +1001,7 @@ def _query_var_exprs(eng) -> dict:
 
 def _ext_code(eng, de, ctx, expr: str):
     """A new column's static type code (DAXEngine._static_type), None when
-    unknown. BLANK() alone is an Int64 column (Power BI Desktop 2.157, NUC
+    unknown. BLANK() alone is an Int64 column (Power BI Desktop 2.157,
     2026-11-12: ROW("x", BLANK()) and SUMMARIZECOLUMNS' extension)."""
     code = eng._static_type(expr, ctx)
     if code in _STATIC_TYPE_NAMES:
@@ -985,8 +1022,8 @@ def _literal_name(a: str) -> Optional[str]:
 def _schema(eng, de, ctx, expr: str, qvars: dict, depth: int = 0) -> Optional[list]:
     """The columns table expression ``expr`` declares, read from the
     engine's plan of it -- [(model table or None, name, static type code or
-    None)] -- or None for a shape not read here. Power BI Desktop 2.157 (NUC
-    2026-11-12): an empty result keeps its columns and their types
+    None)] -- or None for a shape not read here. Power BI Desktop 2.157
+    (2026-11-12): an empty result keeps its columns and their types
     (FILTER('Sales stage', FALSE()) is 3 columns, 0 rows; FILTER(ROW("x", 1,
     "t", "a"), FALSE()) [x] Int64 and [t] String; FILTER({1, 2}, FALSE())
     [Value] Int64; SUMMARIZECOLUMNS('Sales stage'[Sales Stage], "m",
@@ -1123,7 +1160,7 @@ def _order(eng, de, ctx, slot, ev, rows, cells, heads, what):
     reference must name a column of the result.
 
     BLANK sorts as its column's zero, just below it (_blank_keys): Power BI
-    Desktop 2.157 (NUC 2026-11-12) orders {3, BLANK(), 1, 0, -1} ASC as -1,
+    Desktop 2.157 (2026-11-12) orders {3, BLANK(), 1, 0, -1} ASC as -1,
     BLANK, 0, 1, 3 and DESC as the exact reverse; a date's BLANK sits between
     1899-12-29 and day zero, text's below "", a Boolean's below FALSE. Not
     first, as the engine's TOPN keys put it (de._order_key)."""

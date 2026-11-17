@@ -61,7 +61,7 @@ def test_addcolumns_over_calendar_keeps_date():
 
 def test_a_name_the_column_already_has_is_refused():
     got, err = build_table('ADDCOLUMNS(VALUES(Sales[Region]), "REGION", 0)', SALES)
-    # Power BI Desktop 2.157's text (issue #338), the engine's own refusal now
+    # Power BI Desktop 2.157's text, the engine's own refusal now
     assert got is None and "Function 'ADDCOLUMNS' cannot add column [REGION] since it already exists." in err
 
 
