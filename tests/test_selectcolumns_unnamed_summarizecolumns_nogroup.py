@@ -58,7 +58,9 @@ def test_unnamed_expression_is_refused():
 
 
 def test_a_name_given_twice_is_refused():
-    got, err = ev("COUNTROWS(SELECTCOLUMNS('Item', \"Name\", 1, 'Item'[Name]))")
+    # two new columns of one name (a name beside a model column of that name
+    # is Desktop's Item[Name] and [Name]: unsupported here, #338)
+    got, err = ev("COUNTROWS(SELECTCOLUMNS('Item', \"Name\", 1, \"NAME\", 2))")
     assert got is None and "more than once" in err.get("q", "")
 
 

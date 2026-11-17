@@ -193,9 +193,13 @@ def test_model_types_win_over_values():
         ("Text", "model"), ("Double", "model"), ("DateTime", "values")]
 
 
-def test_empty_result_says_its_columns_are_unknown():
+def test_empty_result_keeps_its_columns():
+    # Power BI Desktop 2.157: an empty result keeps its columns and types
+    # (test_execute_query_desktop.py); typed here from the table's cells
     (t,) = run("EVALUATE FILTER('Item', FALSE())")
-    assert t == {"columns": [], "rows": [], "columns_known": False}
+    assert t["rows"] == [] and t["columns_known"] is True
+    assert [(c["name"], c["type"]) for c in t["columns"]] == [
+        ("Item[Name]", "Text"), ("Item[Qty]", "Integer"), ("Item[When]", "DateTime")]
 
 
 def test_selectcolumns_named_and_unnamed_mixed():
@@ -225,14 +229,14 @@ def test_calculation_groups_reach_the_query_measures():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("text,needle", [
-    ("EVALUATE NOSUCHTABLE", "gave no table"),
-    ("EVALUATE 1 + 1", "not a table expression"),
+    ("EVALUATE NOSUCHTABLE", "Failed to resolve name 'NOSUCHTABLE'"),
+    ("EVALUATE 1 + 1", "not a valid table expression"),
     ('EVALUATE SUMMARIZECOLUMNS("x", [nosuch])', "nosuch"),
     ("EVALUATE 'Item'[Nope]", "Nope"),
-    ('EVALUATE ROW("a", \'Nope\'[x])', "no value"),
-    ("EVALUATE 'Item' ORDER BY 'Item'[Nope]", "names no column"),
+    ('EVALUATE ROW("a", \'Nope\'[x])', "Cannot find table 'Nope'"),
+    ("EVALUATE 'Item' ORDER BY 'Item'[Nope]", "Column 'Nope' in table 'Item' cannot be found"),
     ("EVALUATE SELECTCOLUMNS('Item', [Total])", "has no name"),
-    ("EVALUATE SELECTCOLUMNS('Item', \"Name\", 1, 'Item'[Name])", "more than once"),
+    ("EVALUATE SELECTCOLUMNS('Item', \"a\", 1, \"A\", 2)", "more than once"),
     ("DEFINE MEASURE 'Nope'[m] = 1 EVALUATE ROW(\"a\", 1)", "no table 'Nope'"),
     ("DEFINE MEASURE 'Item'[m] = 1 MEASURE 'Item'[M] = 2 EVALUATE ROW(\"a\", 1)", "more than once"),
 ])
@@ -243,10 +247,9 @@ def test_errors(text, needle):
 
 
 @pytest.mark.parametrize("text,construct", [
-    ("DEFINE VAR x = 1 EVALUATE ROW(\"a\", x)", "DEFINE VAR"),
-    ("DEFINE TABLE t = 'Item' EVALUATE t", "DEFINE TABLE"),
-    ("DEFINE COLUMN 'Item'[c] = 1 EVALUATE 'Item'", "DEFINE COLUMN"),
     ("DEFINE FUNCTION f = () => 1 EVALUATE { f() }", "DEFINE FUNCTION"),
+    # Desktop answers Item[Name] and [Name]; a row here can't hold both
+    ("EVALUATE SELECTCOLUMNS('Item', \"Name\", 1, 'Item'[Name])", "SELECTCOLUMNS"),
     ("EVALUATE 'Item' ORDER BY 'Item'[Qty] START AT 1", "START AT"),
     ('EVALUATE ROW("x", NOSUCHFUNCTION(1))', "NOSUCHFUNCTION"),
 ])
@@ -347,7 +350,7 @@ def test_tool_answers_tables(model):
 
 
 def test_tool_refusals_are_errors(model):
-    out = json.loads(server.pbix_execute_query(model, "DEFINE TABLE t = 'Item' EVALUATE t"))
+    out = json.loads(server.pbix_execute_query(model, "DEFINE FUNCTION f = () => 1 EVALUATE {f()}"))
     assert not out["success"] and out["error_code"] == "DAX_UNSUPPORTED_FUNCTION", out
     out = json.loads(server.pbix_execute_query(model, "EVALUATE"))
     assert not out["success"] and out["error_code"] == "DAX_PARSE_FAILED", out

@@ -14546,24 +14546,27 @@ def pbix_evaluate_dax(
 
 @mcp.tool(annotations=_reads("Run a DAX query"))
 def pbix_execute_query(alias: str, query: str) -> str:
-    """Run a DAX query -- [DEFINE MEASURE ...] EVALUATE <table> [ORDER BY ...],
-    one or more EVALUATEs -- against the data model, with no filter.
+    """Run a DAX query -- [DEFINE MEASURE / VAR / TABLE / COLUMN ...]
+    EVALUATE <table> [ORDER BY ...], one or more EVALUATEs -- against the
+    data model, with no filter, answered as Power BI Desktop answers it.
 
     Returns one table per EVALUATE in data.tables, each
     {"columns": [{"name", "type", "type_source"}], "rows": [[...]],
     "columns_known"}: rows are positional lists in the engine's order (or
-    ORDER BY's); a column of a model table is named Table[Column], any other
-    [Name]; a type is Boolean, DateTime, Text, Decimal, Double, Integer or
-    Variant, from the model for a model column ("model") and otherwise from
-    the column's values ("values"). An empty result has no row to name its
-    columns from: columns_known is false.
+    ORDER BY's, BLANK just below its type's zero); a column of a model table
+    is named Table[Column], any other [Name]; a type is Boolean, DateTime,
+    Text, Decimal, Double, Integer or Variant: from the model ("model"), the
+    column's expression ("static") or its values ("values"). An empty result
+    keeps its columns; columns_known is false only for a shape whose columns
+    aren't read.
 
-    DEFINE MEASURE defines a measure for this query only (one of a model
-    measure's name replaces it here); the model is not changed. DEFINE VAR,
-    TABLE, COLUMN and FUNCTION and START AT are refused
-    (DAX_UNSUPPORTED_FUNCTION), as is an expression that reaches an
-    unsupported function; an error fails the whole query (DAX_EVAL_FAILED,
-    DAX_PARSE_FAILED). A failure is never an empty table.
+    Definitions live for this query only (a DEFINE MEASURE of a model
+    measure's name replaces it here); the model is not changed. Syntax and
+    name errors carry Desktop's text and "Query (line, column)" and fail the
+    query before anything runs (DAX_PARSE_FAILED, DAX_EVAL_FAILED). DEFINE
+    FUNCTION and START AT are refused (DAX_UNSUPPORTED_FUNCTION), as is an
+    expression that reaches an unsupported function; an error fails the
+    whole query. A failure is never an empty table.
 
     Args:
         alias: The alias of the open file

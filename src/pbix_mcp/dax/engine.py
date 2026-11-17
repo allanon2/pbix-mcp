@@ -4933,6 +4933,52 @@ def _to_column_type(v, target):
     return v
 
 
+def _ctor_text_columns(rows: list) -> list:
+    """A table constructor's column that holds text beside numbers is a
+    Text column: its numbers become their text, as `&` writes them
+    (_concat_str). Power BI Desktop 2.157 (NUC 2026-11-12, issue #338):
+    EVALUATE {1, "a"} is one String column, "1" and "a"; we kept the number
+    1 beside the text. Measured for an Int64 beside text; a Double, a
+    Currency, a date or TRUE / FALSE beside text are converted alike (not
+    measured). Rows are rebuilt only when a value changes."""
+    if len(rows) < 2:
+        return rows
+    width = max(len(r.get('__tuple__') or ()) or 1 for r in rows)
+
+    def cell(r, i):
+        t = r.get('__tuple__')
+        return t[i] if t is not None and i < len(t) else (r.get('__value__') if t is None and i == 0 else None)
+
+    text_cols = []
+    for i in range(width):
+        vals = [cell(r, i) for r in rows]
+        if any(isinstance(v, str) for v in vals) and any(
+                v is not None and not isinstance(v, str) and not isinstance(v, list) for v in vals):
+            text_cols.append(i)
+    if not text_cols:
+        return rows
+    out = []
+    for r in rows:
+        t = r.get('__tuple__')
+        if t is None:
+            v = r.get('__value__')
+            if v is None or isinstance(v, str):
+                out.append(r)
+                continue
+            nv = _concat_str(v)
+            out.append({**r, '__value__': nv, 'Value': nv})
+            continue
+        tv = tuple(_concat_str(v) if i in text_cols and v is not None and not isinstance(v, str) else v
+                   for i, v in enumerate(t))
+        if tv == t:
+            out.append(r)
+            continue
+        nr = {**r, '__tuple__': tv}
+        nr.update({f'Value{i}': v for i, v in enumerate(tv, 1)})
+        out.append(nr)
+    return out
+
+
 def _unify_number_columns(rows: list, static: Optional[tuple] = None) -> list:
     """A table whose column holds both Int64 and Double values is a Double
     column: its Int64 values become Doubles (_int_as_double). Power BI
@@ -10289,6 +10335,10 @@ class DAXEngine:
 
     def __init__(self):
         self._current_var_scope = None  # Active variable scope during VAR/RETURN eval
+        # A DAX query's DEFINE VARs (pbix_mcp.dax.query), name in lower case
+        # -> _LazyVar: query-level constants every expression of the query
+        # sees, its measures' too, after its own VARs. None outside a query.
+        self._query_vars: Optional[dict] = None
         self.unsupported_functions: set[str] = set()  # Track unsupported DAX functions hit
         # The same, per MEASURE (PR #96): a function hit while evaluating M is
         # recorded for M and for every measure whose evaluation reached M, so
@@ -12536,7 +12586,7 @@ class DAXEngine:
                 # a column of Int64 and Double values is a Double column
                 # (#326: MAXX({9007199254740993,
                 # 9007199254740992.0}, [Value]) is the Double 2**53)
-                return _unify_number_columns(rows)
+                return _unify_number_columns(_ctor_text_columns(rows))
             if kind == _P_IN:
                 result = self._eval_in(data[0], data[1], ctx, var_scope)
                 if result is not None:
@@ -12711,6 +12761,10 @@ class DAXEngine:
                     for k, v in var_scope.items():
                         if k.lower() == data.lower():
                             return v.force(self) if isinstance(v, _LazyVar) else v
+                if self._query_vars:
+                    v = self._query_vars.get(data.lower())
+                    if v is not None:
+                        return v.force(self)
                 continue  # not a var in this scope: fall through to the tail
             if kind == _P_PAREN:
                 return self._eval_expr(data, ctx, var_scope)
@@ -14926,6 +14980,16 @@ class DAXEngine:
             if fname in ('AVERAGE', 'AVERAGEA', 'AVERAGEX', 'MEDIAN', 'MEDIANX'):
                 i = 1 if fname.endswith('X') else 0
                 t = rec(args[i], ctx, env, depth + 1, stack) if len(args) > i else None
+                if t is None and i == 1 and len(args) > 1:
+                    # the iterated table's own column: {1, 2}'s [Value]
+                    t = self._ctor_column_static_type(args[0], args[1], ctx, env, depth, stack)
+                if fname.startswith('MEDIAN') and t == 'I':
+                    # a Variant: each value its own type, a Double for a half
+                    # and an Int64 on a value (Power BI Desktop 2.157, NUC
+                    # 2026-11-12: MEDIAN of an Int64 column, MEDIANX({1, 2},
+                    # ..) 1.5 and MEDIANX({1, 2, 3}, ..) 2, all System.Object;
+                    # issue #302)
+                    return 'V'
                 return 'C' if t == 'C' else ('D' if fname.startswith('AVERAGE') and t in ('I', 'D') else None)
             if fname == 'DIVIDE' and len(args) >= 2:
                 return _arith_type('/', rec(args[0], ctx, env, depth + 1, stack),
@@ -14960,6 +15024,42 @@ class DAXEngine:
                 return _branch_static_type([rec(a, ctx, env, depth + 1, stack) for a in args])
             return None
         return None
+
+    def _ctor_column_static_type(self, table_expr: str, col_expr: str, ctx: DAXContext,
+                                 env: Optional[dict], depth: int, stack: frozenset):
+        """_static_type of ``col_expr`` when it names a column of the table
+        constructor ``table_expr`` ([Value], or [ValueN] of a row
+        constructor's): its elements' types unified as the constructor
+        unifies its values (Int64 beside Double a Double; text beside
+        anything else Text, _ctor_text_columns); None otherwise."""
+        plan = _PLAN_CACHE.get(table_expr.strip()) or _analyze_expr(table_expr.strip())
+        name = col_expr.strip()
+        if plan[0][0] != _P_TABLECTOR or not (name.startswith('[') and name.endswith(']')):
+            return None
+        name = name[1:-1].strip().lower()
+        if name == 'value':
+            pos = 0
+        elif name.startswith('value') and name[5:].isdigit():
+            pos = int(name[5:]) - 1
+        else:
+            return None
+        types = set()
+        for elem in self._split_top_level(plan[0][1], ','):
+            elem = elem.strip()
+            if not elem:
+                continue
+            parts = (self._split_top_level(elem[1:-1], ',')
+                     if elem.startswith('(') and elem.endswith(')') and self._wraps_whole(elem)
+                     else [elem])
+            if pos >= len(parts):
+                return None
+            types.add(self._static_type(parts[pos], ctx, env, depth + 1, stack))
+        types.discard(None)
+        if 'S' in types and len(types) > 1:
+            return 'S'
+        if types == {'I', 'D'}:
+            return 'D'
+        return types.pop() if len(types) == 1 else None
 
     @staticmethod
     def _col_num_type(ctx: DAXContext, table, column):
@@ -20538,7 +20638,16 @@ class DAXEngine:
         """MEDIAN(column) — return median value."""
         ref = self._column_arg(args_str, ctx)
         if isinstance(ref, tuple) and len(ref) == 2:
-            values = sorted(v for v in ctx.get_column_data(ref[0], ref[1]) if isinstance(v, (int, float)))
+            data = ctx.get_column_data(ref[0], ref[1])
+            # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): over a text
+            # column MEDIAN is an error, "MEDIAN does not support expressions
+            # of type string/Boolean/date." (it was a BLANK); a model column
+            # holds one type, so its first value tells it
+            first = next((v for v in data if v is not None), None)
+            if isinstance(first, (str, bool, date, datetime)):
+                raise _DAXEvaluationError(
+                    "MEDIAN does not support expressions of type string/Boolean/date.")
+            values = sorted(v for v in data if isinstance(v, (int, float)))
             if not values:
                 return None
             if self._currency_column(ref, ctx):
@@ -22046,6 +22155,21 @@ class DAXEngine:
         # build_b243c.py f_sc_two; alone 0.541100263595581; #339)
         row_scope = (self._se_extensions_scope([(None, args[k + 1]) for k in range(1, len(args) - 1, 2)], ctx)
                      if len(args) >= 5 and ctx._se_fuse is not None else None)
+        # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): a new column
+        # of a name the table has (names compare case-insensitively) is an
+        # error, "Function 'ADDCOLUMNS' cannot add column [Probability] since
+        # it already exists." -- ADDCOLUMNS('Sales stage', "Probability", 1)
+        # replaced the model column's values with 1. Two new columns of one
+        # name: the same error (not measured).
+        if table_ref and isinstance(table_ref[0], dict):
+            taken = {n.lower() for (_t, n), _v in DAXEngine._lineage_cells(table_ref[0], ctx)}
+            for k in range(1, len(args) - 1, 2):
+                nm = self._eval_expr(args[k].strip(), ctx)
+                nm = str(nm) if nm else ''
+                if nm.lower() in taken:
+                    raise _DAXEvaluationError(
+                        f"Function 'ADDCOLUMNS' cannot add column [{nm}] since it already exists.")
+                taken.add(nm.lower())
         for row_item in table_ref:
             # a copy of the same kind: ADDCOLUMNS keeps SUMMARIZE's rows rows of columns
             new_item = type(row_item)(row_item) if isinstance(row_item, dict) else row_item
@@ -22791,7 +22915,7 @@ class DAXEngine:
         literal names the expression after it; a column reference with no
         name keeps its own name, and its model table as lineage."""
         specs: list = []
-        seen: set = set()
+        seen: dict = {}              # name, lower case -> its lineage table, lower case, or None
         i = 0
         while i < len(args):
             a = args[i].strip()
@@ -22815,11 +22939,21 @@ class DAXEngine:
                 name = tbl['columns'][idx]
                 specs.append((name, a, tname))
                 i += 1
-            low = specs[-1][0].lower()
+            name, _e, lin = specs[-1]
+            low = name.lower()
             if low in seen:
+                if seen[low] != (lin.lower() if lin else None):
+                    # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338):
+                    # SELECTCOLUMNS('Sales stage', 'Sales stage'[Sales Stage],
+                    # "Sales Stage", 1) is two columns, Sales stage[Sales
+                    # Stage] and [Sales Stage]. A row here holds a column by
+                    # its name alone, so it can't hold both: unsupported,
+                    # never an error Desktop doesn't give.
+                    self._note_unsupported('SELECTCOLUMNS')
+                    return []
                 raise _DAXEvaluationError(
-                    f"SELECTCOLUMNS: the column name '{specs[-1][0]}' is given more than once.")
-            seen.add(low)
+                    f"SELECTCOLUMNS: the column name '{name}' is given more than once.")
+            seen[low] = lin.lower() if lin else None
         return specs
 
     _STATIC_KIND_OF = {'I': int, 'D': float, 'C': _Currency}
@@ -23404,11 +23538,28 @@ class DAXEngine:
         if len(args) >= 4 and prev is not None and ctx._current_row is None:
             ctx._se_fuse = (ctx, self._se_joined_scope(
                 [(None, args[k + 1]) for k in range(0, len(args) - 1, 2)], ctx))
+        # Power BI Desktop 2.157 (NUC 2026-11-12, issue #338): ROW("x", ) is
+        # "Argument '2' in ROW function is required." (it was a BLANK), and
+        # two names that differ only in case are an error (one silently
+        # replaced the other): ROW("AMPM", 1, "ampm", 2) is "Function 'ROW'
+        # cannot add column [ampm], as it has the same name with an existing
+        # column."
+        if len(args) % 2:
+            args = args + ['']
+        for k, a in enumerate(args):
+            if not a.strip():
+                raise _DAXEvaluationError(f"Argument '{k + 1}' in ROW function is required.")
+        seen: set = set()
         try:
             while i + 1 < len(args):
                 col_name = self._eval_expr(args[i].strip(), ctx)
                 col_val = self._eval_expr(args[i + 1].strip(), ctx)
                 col_name_str = str(col_name) if col_name else f"col_{i}"
+                if col_name_str.lower() in seen:
+                    raise _DAXEvaluationError(
+                        f"Function 'ROW' cannot add column [{col_name_str}], as it has the same "
+                        "name with an existing column.")
+                seen.add(col_name_str.lower())
                 row[col_name_str] = col_val
                 if first_name is None:
                     first_name = col_name_str
