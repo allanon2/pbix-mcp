@@ -807,6 +807,7 @@ def execute_query(text: str, tables: dict, measures: dict, *,
         it, and a VAR sees a MEASURE; _LazyVar refuses one that refers to
         itself)."""
         ctx = de.DAXContext(tbls, qm, date_table, date_column, {}, relationships or [])
+        ctx.column_types = dict(column_types or {})
         eng._query_measures = own
         ctx.date_tables = date_tables or {}
         ctx.culture = culture
