@@ -87,9 +87,12 @@ def test_iferror_around_a_reference_to_the_measure_catches_it():
 
 
 def test_the_space_form_is_a_syntax_error():
-    # g_space: Desktop cannot parse ORDERBY(S[V] DESC)
+    # g_space: Desktop cannot parse ORDERBY(S[V] DESC). A model measure that is not DAX is compiled as
+    # SYNTAXERROR (Power BI Desktop 2.157, 2026-11-18, measured on other texts: 1 +* 2, 1 2, 1 +), so its
+    # error is that one; this probe's own text was not recorded
     err = refused(ordarg("S[V] DESC"))
-    assert "DESC" in err and "syntax" in err
+    assert err.endswith("MdxScript(Model) (1, 1) Failed to resolve name 'SYNTAXERROR'. It is not a valid "
+                        "table, variable, or function name.")
 
 
 def test_iferror_around_a_reference_catches_the_space_form():

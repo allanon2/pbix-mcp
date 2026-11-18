@@ -60,6 +60,7 @@ from typing import AbstractSet, Any, Optional
 from pbix_mcp.dax import collation as _collation
 from pbix_mcp.dax import se_scan as _se_scan
 from pbix_mcp.errors import DAXEvaluationError as _DAXEvaluationError
+from pbix_mcp.errors import DAXParseError
 
 
 def _uncatchable(exc: Exception) -> Exception:
@@ -2448,20 +2449,51 @@ def _bool_number_clash(a, b, fn: Optional[str] = None) -> None:
         + ". Consider using the VALUE or FORMAT function to convert one of the values.")
 
 
+def _in_kind(v) -> str:
+    """The kind of value a table column holds, for IN's type check:
+    numbers of any kind are one kind (_containsrow_clash)."""
+    if isinstance(v, bool):
+        return 'bool'
+    if isinstance(v, (int, float, _Currency)):
+        return 'number'
+    if isinstance(v, (datetime, date)):
+        return 'date'
+    return type(v).__name__
+
+
+_CONTAINSROW_TYPE_NAMES = {**_CMP_TYPE_NAMES, str: 'Text', datetime: 'Date', date: 'Date'}
+
+
 def _containsrow_clash(hay, needle) -> None:
-    """Raise for CONTAINSROW comparing a table's value with a needle of
-    another kind: text against a number (Power BI Desktop 2.157,
-    2026-11-17: "Function 'CONTAINSROW' does not support comparing values of
-    type Integer with values of type Text. ..."), TRUE / FALSE against a
-    number (_bool_number_clash, as IN's)."""
-    _bool_number_clash(hay, needle, 'CONTAINSROW')
+    """Raise for CONTAINSROW (and IN, which is CONTAINSROW) comparing a
+    table's value with a needle of another kind, the table's type named
+    first. Power BI Desktop 2.157 (2026-11-17, 2026-11-18): text against a
+    number, "Function 'CONTAINSROW' does not support comparing values of
+    type Integer with values of type Text. ..." ("1" IN {1}); TRUE / FALSE
+    against a number, "... values of type Integer with values of type
+    True/False. ..." (TRUE() IN {1}); a date against text, "... values of
+    type Text with values of type Date. ..." (DATE(2026,1,5) IN
+    {"1/5/2026"}). Numbers of any kind compare; a date against a number,
+    and TRUE / FALSE against text, are not measured and compare as
+    before."""
     th, tn = type(hay), type(needle)
-    if (th is str) is (tn is str):
+    if th is tn:
         return
-    other = tn if th is str else th
-    if other not in _CMP_TYPE_NAMES or other is bool:
+    kinds = []
+    for t in (th, tn):
+        if t is str:
+            kinds.append('text')
+        elif t is bool:
+            kinds.append('bool')
+        elif t in (int, float, _Currency):
+            kinds.append('number')
+        elif t is datetime or t is date:
+            kinds.append('date')
+        else:
+            return
+    if kinds[0] == kinds[1] or set(kinds) in ({'date', 'number'}, {'bool', 'text'}):
         return
-    names = [('Text' if t is str else _CMP_TYPE_NAMES[t]) for t in (th, tn)]
+    names = [_CONTAINSROW_TYPE_NAMES[t] for t in (th, tn)]
     raise _DAXEvaluationError(
         f"Function 'CONTAINSROW' does not support comparing values of type {names[0]} with values of "
         f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values.")
@@ -5150,6 +5182,37 @@ _DESC_ORDER_WORDS = frozenset({'DESC', '0', 'FALSE', 'FALSE()'})
 # in their arguments the orderBy / order pairs start
 _ORDER_PAIR_FNS = {'TOPN': 2, 'TOPNSKIP': 3, 'SAMPLE': 2, 'CONCATENATEX': 3}
 _ORDER_PAIR_CALL_RE = re.compile(r"(?i)\b(?:TOPN|TOPNSKIP|SAMPLE|CONCATENATEX)\s*\(")
+
+
+_SYNTAXERROR = ("MdxScript(Model) (1, 1) Failed to resolve name 'SYNTAXERROR'. It is not a valid table, "
+                "variable, or function name.")
+
+
+@lru_cache(maxsize=4096)
+def _measure_not_dax(expr: str) -> bool:
+    """Is a measure's text not DAX: the query route's recogniser
+    (pbix_mcp.dax.query._check_syntax) refuses it as one expression. Power
+    BI Desktop 2.157 (2026-11-18) keeps such a measure (1 +* 2, 1 2, 1 +)
+    and compiles it as SYNTAXERROR: any query touching it, or a measure
+    using it, fails with _SYNTAXERROR; IFERROR catches it, ISERROR is TRUE.
+    The engine answered 1, BLANK and 1. An empty text is not checked (a
+    measure never given one; not measured), nor one holding a dt"..."
+    literal. Only a refusal flags: a text the recogniser passes is
+    evaluated as before."""
+    if not expr or not expr.strip():
+        return False
+    if re.search(r'(?i)\bdt"', expr):
+        # a dt"..." date literal, which the recogniser doesn't know: not
+        # checked, so never called a compile failure Desktop may not have
+        return False
+    from pbix_mcp.dax import query as _q
+    try:
+        toks = _q._scan(expr)
+        if toks:
+            _q._check_syntax(expr, toks, 0, len(toks))
+    except DAXParseError:
+        return True
+    return False
 
 
 @lru_cache(maxsize=4096)
@@ -11185,6 +11248,9 @@ class DAXEngine:
         elif _se_in is not None:
             ctx._se_fuse = _se_in[0]
         try:
+            if _cg is None and _measure_not_dax(ctx.measures.get(measure_name) or ''):
+                # compiled as SYNTAXERROR (_measure_not_dax): before any of it runs
+                raise _DAXEvaluationError(_SYNTAXERROR)
             _bind = self._static_refusal(expr, ctx)
             if _bind is not None:
                 # Desktop refuses the measure before evaluating any of it
@@ -12760,6 +12826,29 @@ class DAXEngine:
                         # only its known home: a table in no ``tables`` and
                         # home of no measure may be no table at all
                         return self.evaluate_measure(_mn, ctx)
+                    _known = ctx.model_columns or {}
+                    _kcols = next((c for k, c in _known.items() if str(k).lower() == table_name.lower()), None)
+                    if _kcols and any(str(c).lower() == col_name.lower() for c in _kcols):
+                        # a column of a table with no rows: the column, as
+                        # before, whatever measure shares its name
+                        return (table_name, col_name)
+                    if _mn is not None and (not _known or any(
+                            str(k).lower() == table_name.lower() for k in _known)):
+                        # a measure whose home the context doesn't know is
+                        # taken under any table (_qualified_measure), here one
+                        # the model names or with no list to say otherwise:
+                        # it leaked the (table, name) marker, a BLANK (#339)
+                        return self.evaluate_measure(_mn, ctx)
+                    if next((m for m in ctx.measures if m.lower() == col_name.lower()), None) is not None:
+                        # a measure of that name, under a table that is not
+                        # its home (Power BI Desktop 2.157, 2026-11-17:
+                        # 'Opp'[Total] of a measure homed on _M) or that the
+                        # model doesn't name (not measured): an error, never
+                        # the marker's BLANK (#339)
+                        from pbix_mcp.errors import DAXEvaluationError
+                        raise DAXEvaluationError(
+                            f"Column '{col_name}' in table '{table_name}' cannot be "
+                            f"found or may not be used in this expression")
                 if _t is not None and ctx._find_col_idx(_t['columns'], col_name) < 0:
                     # `Table[Name]` where Name is not a column is DAX's
                     # fully-qualified MEASURE reference. Agents_Performance reads
@@ -13823,9 +13912,10 @@ class DAXEngine:
                  var_scope: dict | None = None) -> Any:
         """``<scalar> IN <set>`` -- TRUE when the left value is in the set.
 
-        Membership uses the engine's usual value comparison (numeric when both
-        sides are numbers, date-aware when both parse as dates, else text), so
-        ``1 IN {1}`` and ``"1" IN {1}`` both hold, matching Desktop.
+        IN is CONTAINSROW: a value of another type than the table's is
+        CONTAINSROW's error (_containsrow_clash), so ``"1" IN {1}`` fails as
+        Power BI Desktop 2.157 does; values of one kind compare as the
+        engine's ``=`` does (numbers of any kind, text without case).
         """
         lt = left.strip()
         if lt.startswith('(') and lt.endswith(')') and self._wraps_whole(lt):
@@ -13846,12 +13936,32 @@ class DAXEngine:
         lval = _scalarize(lval)
         if lval is None:
             return any(_scalarize(v) is None for v in values)
-        lbool = type(lval) is bool
+        # IN is CONTAINSROW: a value of another type than the table's is an
+        # error, whether or not a row would have matched. Power BI Desktop
+        # 2.157 (2026-11-18): 1 IN {1, "a"} (a Text table, #338) and 2 IN
+        # {1, "a"} are "Function 'CONTAINSROW' does not support comparing
+        # values of type Text with values of type Integer. ...", "1" IN {1}
+        # "... Integer with values of type Text ..."; both answered TRUE or
+        # FALSE. TRUE / FALSE against a number as before (#279), in 2.157's
+        # words.
+        rt = right.strip()
+        if rt.startswith('{') and any(isinstance(v, str) for v in values):
+            # a constructor's text beside other values is a Text column
+            # (_ctor_text_columns): "a" IN {1, "a"} is TRUE, 1 IN {1, "a"}
+            # compares Text with Integer (Desktop 2.157, 2026-11-18). Here,
+            # not in _in_set_values: CALCULATE's filter route reads that too,
+            # and keeps its own comparison (not measured)
+            values = [v if v is None or isinstance(v, str) else _concat_str(v) for v in values]
+        # the check runs on a table of one kind of value (a constructor's is,
+        # unified above); a table of mixed kinds (UNION({1}, {"a"}), a
+        # Variant) compares as before: its column's type is not measured.
+        # One value of each type stands for the rest.
+        kinds = {}
         for v in values:
-            if v is not None and (type(v) is bool) is not lbool:
-                # TRUE / FALSE against a number (#279;
-                # build_b255d.py d11)
-                _bool_number_clash(v, lval, 'CONTAINSROW')
+            if v is not None:
+                kinds.setdefault(_in_kind(v), v)
+        if len(kinds) == 1:
+            _containsrow_clash(next(iter(kinds.values())), lval)
         return any(v is not None and _compare(lval, '=', v) for v in values)
 
     @staticmethod
@@ -25818,6 +25928,28 @@ class DAXEngine:
             else:
                 break
         ext = parts[i:]
+        # GROUPBY's own columns are its own, whatever their names: headed
+        # [Name] (__added__, _lineage_cells), not as a column of the grouped
+        # table. Power BI Desktop 2.157 (2026-11-18): GROUPBY('Opp',
+        # 'Opp'[Name], "Rank", ...) heads Opp[Name], [Rank], though Opp has a
+        # column Rank; two of one name (case-insensitively) are "Function
+        # 'GROUPBY' cannot add column [X], as it has the same name with an
+        # existing column."; one named exactly as a group column is a column
+        # beside it ("Name" gives Opp[Name] and [Name]), which a row here
+        # can't hold by its name alone: unsupported, never one overwriting
+        # the other.
+        names = [str(self._eval_expr(ext[j].strip(), ctx)) for j in range(0, len(ext) - 1, 2)]
+        seen: set = set()
+        for nm in names:
+            if nm.lower() in seen:
+                raise _DAXEvaluationError(
+                    f"Function 'GROUPBY' cannot add column [{nm}], as it has the same name with an "
+                    "existing column.")
+            seen.add(nm.lower())
+        if set(names) & {str(c) for c in group_cols}:
+            # a row's keys are case-sensitive: "name" beside Name fits
+            self._note_unsupported('GROUPBY')
+            return []
         groups: dict = {}
         for r in rows:
             key = tuple(r.get(c) for c in group_cols)
@@ -25827,17 +25959,16 @@ class DAXEngine:
             new_row = _ColumnsRow({'__table__': rows[0]['__table__'], '__row__': True})
             for c, v in zip(group_cols, key):
                 new_row[c] = v
-            j = 0
-            while j + 1 < len(ext):
-                cname = self._eval_expr(ext[j].strip(), ctx)
+            for k, cname in enumerate(names):
                 prev_grp = getattr(ctx, '_current_group', None)
                 ctx._current_group = grp_rows
                 try:
-                    val = self._eval_expr(ext[j + 1].strip(), ctx)
+                    val = self._eval_expr(ext[2 * k + 1].strip(), ctx)
                 finally:
                     ctx._current_group = prev_grp
-                new_row[str(cname)] = val
-                j += 2
+                new_row[cname] = val
+            if names:
+                new_row['__added__'] = frozenset(names)
             out.append(new_row)
         return out
 
