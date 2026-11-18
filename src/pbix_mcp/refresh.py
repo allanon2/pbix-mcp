@@ -63,6 +63,118 @@ class RefreshResult:
     not_run: dict[str, ScriptNotRun] = field(default_factory=dict)  # table -> a Python step the runner didn't run
 
 
+@dataclass
+class StepPreview:
+    """A query's value at one step, as Power Query's editor previews it.
+
+    ``kind``: "table" (``columns`` and the first ``rows``, ``more`` when the table has more), "value" (a value that
+    isn't a table, in ``value``), "error" (the step's value is an error: ``reason`` and ``message``), "unsupported"
+    (it uses library functions this evaluator doesn't implement, by name in ``names``, through the queries it reads
+    too), "unmapped" (it reads a file the caller doesn't map: ``path``), or "notRun" (a Python step not approved to
+    run: ``message``).
+    A table's cells are values, or ``CellError`` for a cell whose value is an error."""
+    kind: str
+    columns: list = field(default_factory=list)     # (name, MType)
+    rows: list = field(default_factory=list)
+    more: bool = False
+    value: Any = None
+    reason: Optional[str] = None
+    message: Optional[str] = None
+    path: Optional[str] = None
+    names: list = field(default_factory=list)
+
+
+def _unimplemented(tree: Any, meta: "_Metadata") -> list[str]:
+    """The names ``tree`` uses, directly or through the model's queries it reads, that are neither a query nor a
+    function this evaluator implements, in order of first use."""
+    from pbix_mcp.m import free_names, parse_document
+    from pbix_mcp.m.evaluate import LIBRARY
+
+    from pbix_mcp.m import ast
+
+    out: dict[str, None] = {}
+    seen: set[str] = set()
+    # Of a let, only what its body reads, variable by variable: evaluation is lazy, so a variable the step doesn't
+    # depend on is never evaluated
+    todo = [tree]
+    if isinstance(tree, ast.Let):
+        local = {b.name: b.value for b in tree.bindings}
+        used: set[str] = set()
+        queue = [tree.body.name] if isinstance(tree.body, ast.Identifier) else list(free_names(tree.body))
+        while queue:
+            name = queue.pop(0)
+            if name in local and name not in used:
+                used.add(name)
+                queue.extend(n for n in free_names(local[name]) if n in local)
+        # in the query's own order
+        todo = [b.value for b in tree.bindings if b.name in used]
+        if not isinstance(tree.body, ast.Identifier):
+            todo.append(tree.body)
+    while todo:
+        node = todo.pop(0)
+        for name in free_names(node):
+            if isinstance(tree, ast.Let) and name in {b.name for b in tree.bindings}:
+                continue
+            if name in meta.m:
+                if name not in seen:
+                    seen.add(name)
+                    for t in meta.m[name]:
+                        try:
+                            todo.append(parse_document(t))
+                        except MSyntaxError:
+                            pass   # its own evaluation reports it
+            elif name not in LIBRARY:
+                out.setdefault(name, None)
+    return list(out)
+
+
+def preview_step(alias: str, text: str, step: Optional[str] = None, *, limit: int = 1000,
+                 files: Optional[Callable[[str], bytes]] = None,
+                 python: Optional[Callable[[str, dict[str, bytes]], dict[str, bytes]]] = None) -> StepPreview:
+    """``text`` (a query's M) evaluated to ``step``, one of its top-level ``let``'s variables (None: the whole query),
+    over the model's other queries, its source culture, ``files`` and ``python`` as a refresh evaluates them. The
+    ``let`` is re-rooted at the step as a tree (its variables, with the step's name as the body); its text is never
+    edited. Nothing is installed: the model's data is unchanged."""
+    from pbix_mcp import server
+    from pbix_mcp.m import ast, parse_document
+
+    info = server._ensure_open(alias)
+    meta = _Metadata(info)
+    cache: dict[str, Any] = {}
+
+    def resolve(name: str) -> Any:
+        if name not in cache:
+            texts = meta.m.get(name)
+            if not texts:
+                raise MError("Expression.Error", f"The name '{name}' wasn't recognized.")
+            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files, python=python)
+                                   for t in texts], name)
+        return cache[name]
+
+    try:
+        tree = parse_document(text)
+        if step is not None:
+            if not isinstance(tree, ast.Let) or not any(b.name == step for b in tree.bindings):
+                raise MError("Expression.Error", f"The query has no step named '{step}'.")
+            tree = ast.Let(tree.bindings, ast.Identifier(step), start=tree.start, end=tree.end)
+        missing = _unimplemented(tree, meta)
+        if missing:
+            return StepPreview("unsupported", names=missing)
+        value = evaluate(tree, resolve=resolve, culture=meta.m_culture, files=files, python=python)
+    except UnmappedSource as e:
+        return StepPreview("unmapped", path=e.path)
+    except ScriptNotRun as e:
+        return StepPreview("notRun", message=str(e))
+    except MError as e:
+        return StepPreview("error", reason=e.reason, message=e.message)
+    except MSyntaxError as e:
+        return StepPreview("error", reason="Expression.SyntaxError", message=e.message)
+    if isinstance(value, Table):
+        return StepPreview("table", columns=list(zip(value.columns, value.types)), rows=value.rows[:limit],
+                           more=len(value.rows) > limit)
+    return StepPreview("value", value=value)
+
+
 def datamodel_fingerprint(info: dict) -> str:
     """The open model's DataModel as it is now (a refresh overlay holds while this is unchanged)."""
     with open(os.path.join(info["work_dir"], "DataModel"), "rb") as f:
