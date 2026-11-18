@@ -255,26 +255,7 @@ def test_a_column_of_an_empty_table_sharing_a_measures_name_stays_the_column():
         assert e.evaluate_measure("Probe", c) == -1, e.eval_errors
 
 
-def test_calculates_in_filter_keeps_its_own_comparison():
-    # IN's Text column is IN's alone: a CALCULATE filter compares as before (not measured)
-    c = context(dict(MEASURES), dict(HOMES))
-    c.measures["Probe"] = 'CALCULATE([Total], Opp[When] IN {DATE(2026,1,5), "x"})'
-    assert DAXEngine().evaluate_measure("Probe", c) == 1
 
-
-def test_a_table_of_mixed_kinds_compares_as_before():
-    # UNION({1}, {"a"}) is a Variant here; its column's type in Desktop is not measured
-    assert one('EVALUATE ROW("x", "a" IN UNION({1}, {"a"}))')["rows"] == [[True]]
-
-
-@pytest.mark.parametrize("text, value", [
-    ('EVALUATE ROW("x", DATE(2026,1,5) IN {46027})', None),   # a date against a number: compared as before
-    ('EVALUATE ROW("x", TRUE() IN {"a"})', False),            # TRUE / FALSE against text: compared as before
-])
-def test_the_unmeasured_pairs_raise_no_type_error(text, value):
-    rows = one(text)["rows"]
-    if value is not None:
-        assert rows == [[value]]
 
 
 def test_groupby_a_column_named_as_a_group_column_in_another_case_fits():
@@ -288,3 +269,87 @@ def test_a_dt_literal_is_not_called_a_syntax_error():
     eng = DAXEngine()
     eng.evaluate_measure("Probe", context(m, dict(HOMES, Probe="_M")))
     assert "SYNTAXERROR" not in eng.eval_errors.get("Probe", "")
+
+
+# ---------------------------------------------------------------------------
+# #340: CALCULATE's filters, mixed tables, the last pairs (Desktop 2.157, 2026-11-18, leftovers340.json)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("text, first, second", [
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Rank] IN {1, \"a\"}))", "Text", "Integer"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Name] IN {1}))", "Integer", "Text"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Rank] IN {\"1\"}))", "Text", "Integer"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[When] IN {DATE(2026,1,5), \"x\"}))", "Text", "Date"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Flag] IN {1}))", "Integer", "True/False"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Flag] IN {\"a\"}))", "Text", "True/False"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], KEEPFILTERS(Opp[Rank] IN {1, \"a\"})))", "Text", "Integer"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], NOT Opp[Rank] IN {1, \"a\"}))", "Text", "Integer"),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], FILTER(ALL(Opp[Rank]), Opp[Rank] IN {1, \"a\"})))", "Text", "Integer"),
+    ("EVALUATE CALCULATETABLE(VALUES(Opp[Name]), Opp[Rank] IN {1, \"a\"})", "Text", "Integer"),
+    ("EVALUATE SUMMARIZECOLUMNS('Opp'[Name], FILTER(ALL(Opp[Rank]), Opp[Rank] IN {1, \"a\"}), \"t\", [Total])",
+     "Text", "Integer"),
+    # IFERROR around the CALCULATE does not catch it: checked before anything runs
+    ("EVALUATE ROW(\"x\", IFERROR(CALCULATE([Total], Opp[Rank] IN {1, \"a\"}), -1))", "Text", "Integer"),
+    ('EVALUATE ROW("x", 1 IN UNION({1}, {"a"}))', "Text", "Integer"),
+    ("EVALUATE ROW(\"x\", 1 IN UNION(VALUES(Opp[Rank]), VALUES(Opp[Name])))", "Text", "Integer"),
+    ('EVALUATE ROW("x", TRUE() IN {"a"})', "Text", "True/False"),
+    ('EVALUATE ROW("x", "a" IN {TRUE()})', "True/False", "Text"),
+])
+def test_340_another_type_is_containsrows_error(text, first, second):
+    assert error(text).endswith(_clash(first, second))
+
+
+def test_340_a_calculate_equality_of_text_with_a_number():
+    assert error("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Name] = 1))") == (
+        "DAX comparison operations do not support comparing values of type Text with values of type Integer. "
+        "Consider using the VALUE or FORMAT function to convert one of the values.")
+    assert error("EVALUATE ROW(\"x\", IFERROR(CALCULATE([Total], Opp[Name] = 1), -1))").startswith("DAX comparison")
+
+
+@pytest.mark.parametrize("text, rows", [
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Rank] IN {1, 3}))", [[4]]),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[Name] IN {\"A\"}))", [[4]]),
+    ("EVALUATE ROW(\"x\", CALCULATE([Total], Opp[When] IN {46027}))", [[1]]),     # a date serial
+    ('EVALUATE ROW("x", "a" IN UNION({1}, {"a"}))', [[True]]),
+    ("EVALUATE ROW(\"x\", \"a\" IN UNION(VALUES(Opp[Rank]), VALUES(Opp[Name])))", [[True]]),
+    ('EVALUATE ROW("x", DATE(2026,1,5) IN {46027})', [[True]]),
+    ('EVALUATE ROW("x", 46027 IN {DATE(2026,1,5)})', [[True]]),
+    ("EVALUATE ROW(\"n\", COUNTROWS(FILTER('Opp', 'Opp'[When] IN {46027})))", [[1]]),
+    ('EVALUATE ROW("x", CURRENCY(1) IN {1, 2})', [[True]]),
+])
+def test_340_what_compares(text, rows):
+    assert one(text)["rows"] == rows
+
+
+def _model_dates():
+    """Opp with its When column as a decoded model holds it (DAXDateTime, a datetime subclass)."""
+    from pbix_mcp.formats.vertipaq_decoder import _oa_date_to_python
+    t = {k: {"columns": list(v["columns"]), "rows": [list(r) for r in v["rows"]]} for k, v in TABLES.items()}
+    for r in t["Opp"]["rows"]:
+        r[3] = _oa_date_to_python(float((r[3] - dt.datetime(1899, 12, 30)).days))
+    assert type(t["Opp"]["rows"][0][3]) is not dt.datetime
+    return t
+
+
+@pytest.mark.parametrize("probe, first, second", [
+    ('CALCULATE([Total], Opp[When] IN {DATE(2026,1,5), "x"})', "Text", "Date"),
+    ('CALCULATE([Total], Opp[When] IN {"x"})', "Text", "Date"),
+    ('COUNTROWS(FILTER(Opp, Opp[When] IN {"x"}))', "Text", "Date"),
+])
+def test_340_a_models_own_date_type_is_checked(probe, first, second):
+    c = DAXContext(_model_dates(), dict(MEASURES, Probe=probe))
+    c.measure_tables = dict(HOMES, Probe="_M")
+    e = DAXEngine()
+    assert e.evaluate_measure("Probe", c) is None
+    assert e.eval_errors["Probe"].endswith(_clash(first, second))
+
+
+@pytest.mark.parametrize("serial", ["3000000", "-700000", "1e10"])
+def test_340_a_serial_past_any_date_matches_nothing(serial):
+    # as the FILTER route answers it (not measured on Desktop)
+    assert one(f'EVALUATE ROW("x", CALCULATE([Total], Opp[When] IN {{{serial}}}))')["rows"] == [[None]]
+
+
+def test_340_an_expressions_mixed_column_compares_as_before():
+    # Desktop's reading of a Variant expression column is not measured: only constructors and UNION are Text
+    assert one('EVALUATE ROW("x", 2 IN SELECTCOLUMNS(Opp, "v", IF(Opp[Rank] = 1, "x", Opp[Rank])))')["rows"] == [[True]]
