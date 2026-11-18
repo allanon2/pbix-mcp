@@ -1234,6 +1234,7 @@ class QuerySteps:
     has_steps: bool
     steps: list
     selected: int                 # the step a query opens on: the first with an error, else the last; -1 with none
+    error: Optional[SourceError] = None   # with no steps, the one item's error: the text's own parse error
 
 
 def _to_text(units: str) -> str:
@@ -1298,17 +1299,25 @@ def query_steps(text: str) -> QuerySteps:
     Only a ``let`` with at least one variable whose body is a plain name naming its last variable has steps; each is a
     variable, in order. From the second step, a run of navigation steps shows as its last one, under the query's
     navigation step name; the earlier ones are hidden. A step holding a verbatim literal ``#!"..."`` shows the text it
-    holds, with that text's parse error. The query opens on its first step with an error, else its last.
+    holds, with that text's parse error. The query opens on its first step with an error, else its last. A step is
+    looked up by name, so of two variables with one name the first answers for both (text, error, description).
+    With no steps, ``error`` is the one item's: the text's parse error, or a verbatim literal's text's.
+    Raises ``NoCheckResult`` where Power Query's editor gets no answer (a verbatim literal holding anything but text).
     """
     units = _utf16(text)
     found, root = _read(units)
-    if found is not None or root.kind != "let" or not root.names:
-        return QuerySteps(False, [], -1)
-    body = root.children[-1]
-    if body.kind != "identifier" or body.inclusive or body.ident != root.names[-1][0]:
+    if found is not None:   # stored as a verbatim literal: one item, with the text's error
+        return QuerySteps(False, [], -1, _source_error(units, found.message, found.start, found.end))
+    if root.kind == "verbatim":
+        return QuerySteps(False, [], -1, _verbatim_error(root))
+    if root.kind != "let" or not root.names or not _has_parts(root):
         return QuerySteps(False, [], -1)
     toks = tokenize(units)
-    values = root.children[:len(root.names)]
+    # A step is looked up by its name, the first variable of that name answering for every one of them
+    first_of: dict[str, int] = {}
+    for k, (name, _s, _e) in enumerate(root.names):
+        first_of.setdefault(name, k)
+    values = [root.children[first_of[name]] for name, _s, _e in root.names]
     nav_end = len(values) - 1
     for k in range(1, len(values)):
         if not _is_navigation(values[k]):
@@ -1317,21 +1326,37 @@ def query_steps(text: str) -> QuerySteps:
     steps = []
     for k, ((name, name_start, name_end), value) in enumerate(zip(root.names, values)):
         error = None
-        if value.kind == "verbatim" and value.verbatim is not None:
-            inner = value.verbatim
-            step_text = _to_text(inner)
-            inner_found, _ = _read(inner)
-            if inner_found is not None:
-                error = _source_error(inner, inner_found.message, inner_found.start, inner_found.end)
+        if value.kind == "verbatim":
+            step_text = _to_text(value.verbatim) if value.verbatim is not None else ""
+            error = _verbatim_error(value)
         else:
             step_text = _to_text(units[value.start:value.end])
+        named = root.names[first_of[name]]
         steps.append(Step(
             name=_to_text(name), name_start=name_start, name_end=name_end, text=step_text,
             start=value.start, end=value.end,
-            description=_to_text(_leading_comment(toks, name_start, units)),
+            description=_to_text(_leading_comment(toks, named[1], units)),
             error=error,
             navigation=k == nav_end and k != 0,
             hidden=0 < k < nav_end,
         ))
     first_error = next((k for k, s in enumerate(steps) if s.error is not None), None)
-    return QuerySteps(True, steps, first_error if first_error is not None else len(steps) - 1)
+    chosen = first_error if first_error is not None else len(steps) - 1
+    return QuerySteps(True, steps, first_of[root.names[chosen][0]])   # selected by name too
+
+
+def _has_parts(root: _Node) -> bool:
+    """A let whose body is a plain (not @) name naming its last variable."""
+    body = root.children[-1]
+    return body.kind == "identifier" and not body.inclusive and body.ident == root.names[-1][0]
+
+
+def _verbatim_error(node: _Node) -> Optional[SourceError]:
+    """A verbatim literal's text's first parse error, or None. One holding anything but text has no text at all: Power
+    Query's editor fails outright (NoCheckResult)."""
+    if node.verbatim is None:
+        raise NoCheckResult("a verbatim literal holds a value that isn't text")
+    inner_found, _ = _read(node.verbatim)
+    if inner_found is None:
+        return None
+    return _source_error(node.verbatim, inner_found.message, inner_found.start, inner_found.end)

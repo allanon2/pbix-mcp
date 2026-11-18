@@ -5,7 +5,7 @@ listed as Source, Navigation, Promoted, Typed, opened on Typed. The others are P
 """
 import pytest
 
-from pbix_mcp.m.check import query_steps
+from pbix_mcp.m.check import NoCheckResult, query_steps
 
 ORDERS = ('let\n    Source = Excel.Workbook(File.Contents("C:\\\\data\\\\sales.xlsx"), null, true),\n'
           '    Orders_Sheet = Source{[Item="Orders",Kind="Sheet"]}[Data],\n'
@@ -121,3 +121,56 @@ def test_offsets_are_utf16():
 def test_opens_on_the_first_step_with_an_error_not_the_last():
     q = query_steps('let A = 1, B = #!"1 +", C = #!"2 +", D = A in D')
     assert q.selected == 1
+
+
+# --- a review's findings (2026-11-19) and the gaps it showed ---------------------------------------------------
+
+def test_no_steps_keeps_the_items_error():
+    q = query_steps("let a = ")             # stored as #!"let a = ": the item's error is the text's
+    assert (q.has_steps, q.error.text) == (False, "Token Literal expected.")
+    q = query_steps('#!"1 +"')
+    assert (q.error.text, q.error.startPosition) == ("Token Literal expected.", 3)
+    assert query_steps("1 + 1").error is None
+
+
+def test_a_name_twice_answers_with_its_first():
+    q = query_steps('let a = 1, a = #!"1 +" in a')
+    assert [(s.text, s.error) for s in q.steps] == [("1", None), ("1", None)]
+    assert q.selected == 0
+    q = query_steps("let S = 1, N = X[a], N = F(1), Z = N in Z")
+    assert [s.navigation for s in q.steps] == [False, False, True, False]   # the second N answers as X[a]
+
+
+@pytest.mark.parametrize("text", ["let a = #!1, b = a in b", "#!1", "#!null"])
+def test_a_verbatim_holding_no_text_gets_no_answer(text):
+    with pytest.raises(NoCheckResult):
+        query_steps(text)
+
+
+def test_comments_trimmed_as_net_trims():
+    q = query_steps("let\r\n    //\x1cx\x1c  \r\n    A = 1\r\nin A")
+    assert q.steps[0].description == "\x1cx\x1c"
+
+
+def test_block_comments_split_at_crlf_only():
+    q = query_steps("let\n    /* a\n   b */\n    A = 1\nin A")
+    assert q.steps[0].description == "a\n   b"
+
+
+@pytest.mark.parametrize("expr, nav", [
+    ("[Data]", False),                 # _'s field: an implicit name, no navigation
+    ("S{(0)}", False),                 # a parenthesised key is no constant
+    ("S{0}?[Data]", True), ("S[Data]?", True), ("S{0}?", True),
+    ("@S[Data]", True),                # an inclusive name is a name
+    ("Section1!S[Data]", False), ("#shared[Data]", False),
+    ("S{true}", True), ("S{null}", True), ('S{"a"}', True), ("S{#infinity}", True),
+    ("S{#date(2020, 1, 1)}", False),   # an invocation
+])
+def test_more_navigation_expressions(expr, nav):
+    q = query_steps(f"let S = 1, N = {expr}, Z = Table.F(N) in Z")
+    assert q.steps[1].navigation is nav
+
+
+def test_one_step():
+    q = query_steps("let A = 1 in A")
+    assert [(s.hidden, s.navigation) for s in q.steps] == [(False, False)] and q.selected == 0
