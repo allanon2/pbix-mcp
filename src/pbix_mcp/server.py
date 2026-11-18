@@ -14319,7 +14319,7 @@ def _evaluate_dax_response(ctx: dict, alias: str, measure_names: list[str],
         fc, ctx['date_table'], ctx['date_column'],
         ctx.get('relationships'), simulate_row_context=False,
         measure_tables=ctx.get('measure_tables'),
-        model_columns=ctx.get('model_columns'),
+        model_columns=ctx.get('model_columns'), column_types=ctx.get('column_types'),
         culture=ctx.get('culture'),
         group_by=group_keys or None,
         selected_filters=selected,
@@ -14338,7 +14338,7 @@ def _evaluate_dax_response(ctx: dict, alias: str, measure_names: list[str],
                               {k: v for k, v in (fc or {}).items() if k not in group_keys}),
             culture=ctx.get('culture'), date_tables=ctx.get('date_tables'),
             measure_tables=ctx.get('measure_tables'),
-            model_columns=ctx.get('model_columns'))
+            model_columns=ctx.get('model_columns'), column_types=ctx.get('column_types'))
 
     # Build structured response with DAXResult objects
     unsupported = set(dax_engine._engine.unsupported_functions)
@@ -14931,7 +14931,7 @@ def pbix_evaluate_dax_per_dimension(
                     # the marked date tables, as the grouped tool (#79, #86)
                     date_tables=ctx.get('date_tables'),
                     measure_tables=ctx.get('measure_tables'),
-                    model_columns=ctx.get('model_columns'),
+                    model_columns=ctx.get('model_columns'), column_types=ctx.get('column_types'),
                     cache=query_cache,
                 )
             else:
@@ -15110,7 +15110,7 @@ def pbix_evaluate_dax_grouped(
                         group_keys={ref}, selected_filters=base_fc,
                         date_tables=ctx.get('date_tables'),
                         measure_tables=ctx.get('measure_tables'),
-                        model_columns=ctx.get('model_columns'),
+                        model_columns=ctx.get('model_columns'), column_types=ctx.get('column_types'),
                         cache=query_cache)
                 results.append({
                     "key": {dim_col: val},
@@ -15128,7 +15128,7 @@ def pbix_evaluate_dax_grouped(
                     group_keys={k[0] for k in keys}, selected_filters=base_fc,
                     date_tables=ctx.get('date_tables'),
                     measure_tables=ctx.get('measure_tables'),
-                    model_columns=ctx.get('model_columns'),
+                    model_columns=ctx.get('model_columns'), column_types=ctx.get('column_types'),
                     cache=query_cache)
                 results.append({
                     "key": {k[2]: v for k, v in zip(keys, combo)},

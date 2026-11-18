@@ -507,10 +507,10 @@ ERRORS_341 = [
      'DAX comparison operations do not support comparing values of type True/False with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
     ('343 calc date eq text', 'EVALUATE ROW("x", CALCULATE([Total], Opp[When] = "1/5/2026"))',
      'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
-    pytest.param('343 empty table col in number', 'EVALUATE ROW("x", CALCULATE([Total], \'_M\'[Column1] IN {1}))',
-     "Function 'CONTAINSROW' does not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.", marks=pytest.mark.xfail(strict=True, reason="Desktop checks types before anything runs: an IF branch never taken, an empty table's declared column type (not done)")),
-    pytest.param('343 if false branch', 'EVALUATE ROW("x", IF(FALSE(), CALCULATE([Total], Opp[Rank] IN {"a"}), 7))',
-     "Function 'CONTAINSROW' does not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.", marks=pytest.mark.xfail(strict=True, reason="Desktop checks types before anything runs: an IF branch never taken, an empty table's declared column type (not done)")),
+    ('343 empty table col in number', 'EVALUATE ROW("x", CALCULATE([Total], \'_M\'[Column1] IN {1}))',
+     "Function 'CONTAINSROW' does not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values."),
+    ('343 if false branch', 'EVALUATE ROW("x", IF(FALSE(), CALCULATE([Total], Opp[Rank] IN {"a"}), 7))',
+     "Function 'CONTAINSROW' does not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values."),
     ('343 scalar text eq number', 'EVALUATE ROW("x", "a" = 1)',
      'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
     ('343 scalar text number eq', 'EVALUATE ROW("x", "1" = 1)',
@@ -589,8 +589,8 @@ ERRORS_V = [
      'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
     ('v filter date eq text', 'EVALUATE ROW("x", COUNTROWS(FILTER(Opp, Opp[When] = "1/5/2026")))',
      'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
-    pytest.param('v blank text max eq number', 'EVALUATE ROW("x", IF(MAX(\'_M\'[Column1]) = 1, 1, 0))',
-     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.', marks=pytest.mark.xfail(strict=True, reason="an empty table's declared column type (not known to the engine)")),
+    ('v blank text max eq number', 'EVALUATE ROW("x", IF(MAX(\'_M\'[Column1]) = 1, 1, 0))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
     ('v intersect union text', 'EVALUATE ROW("n", COUNTROWS(INTERSECT(UNION({1}, {"a"}), VALUES(Opp[Rank]))))',
      "Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer."),
 ]
@@ -605,3 +605,59 @@ def test_a_variant_value_in_a_calculate_filter_is_checked_by_no_type():
     # inferred from the measured rule (a Variant is checked by no type: IF(1 = 1, "x", 1) = 1 is FALSE), not asked
     # in this form: the text column against a Variant 1 compares, keeping no row
     assert _run_341('EVALUATE ROW("x", CALCULATE([Total], Opp[Name] = IF(1 = 1, 1, "x")))')[0]["rows"] == [[None]]
+
+
+def test_344_the_measure_route_reads_declared_types():
+    # the per-filter route (report visuals) is given the model's declared types, as the query route is: a column of a
+    # table with no rows is typed by them (Desktop 2.157, 2026-11-18: MAX('_M'[Column1]) = 1 is Text with Integer)
+    from pbix_mcp.dax.engine import evaluate_measures_batch
+    tables = dict(TABLES_341)
+    measures = {"Probe": "IF(MAX('_M'[Column1]) = 1, 1, 0)", "Total": "SUM(Opp[Rank])"}
+    out = evaluate_measures_batch(["Probe"], tables, measures, measure_tables={"Probe": "_M", "Total": "_M"},
+                                  column_types={("_M", "Column1"): "String"})
+    without = evaluate_measures_batch(["Probe"], tables, measures, measure_tables={"Probe": "_M", "Total": "_M"})
+    # the batch answers values: a failed measure is no number (its error goes to the engine's record); without the
+    # declared type there is nothing to check it by, and BLANK = 1 is FALSE
+    assert out == {"Probe": None}
+    assert without == {"Probe": 0}
+
+
+# #344's review: the static pass refuses no valid DAX (not measured on Desktop: row-context and arithmetic rules)
+
+def _ev344(expr: str, extra_tables: dict | None = None, home: str = "_M"):
+    tables = dict(TABLES_341, **(extra_tables or {}))
+    c = DAXContext(tables, {"Total": "SUM(Opp[Rank])", "Probe": expr})
+    c.measure_tables = {"Total": "_M", "Probe": home}
+    c.column_types = {("_M", "Column1"): "String"}
+    e = DAXEngine()
+    return e.evaluate_measure("Probe", c), e.eval_errors.get("Probe")
+
+
+ATTR = {"Attr": {"columns": ["Value"], "rows": [["x"], ["y"]]}}
+AB = {"A": {"columns": ["Key", "W"], "rows": [[1, 5]]}, "B": {"columns": ["Key", "W"], "rows": [["x", 1], ["y", 2]]}}
+
+
+@pytest.mark.parametrize("expr, tables, home, want", [
+    ("COUNTROWS(FILTER({1, 2, 3}, [Value] >= 2))", ATTR, "_M", 2),       # a constructor's [Value], not Attr's
+    ("IF([Total] > 100, COUNTROWS(FILTER({1, 2, 3}, [Value] >= 2)), -1)", ATTR, "_M", -1),
+    ("COUNTROWS(FILTER(GENERATESERIES(1, 3), [Value] = 2))", ATTR, "_M", 1),
+    ("SUMX({1, 2, 3}, IF([Value] > 1, [Value], 0))", ATTR, "_M", 5),
+    ('IF(FALSE(), COUNTROWS(FILTER(ADDCOLUMNS(VALUES(Opp[Rank]), "Name", 1), [Name] = 1)), 5)', None, "_M", 5),
+    ('COUNTROWS(FILTER(B, [Key] = "x"))', AB, "A", 1),                   # B's [Key], whatever the home table holds
+    ('SUMX(B, IF([Key] = "x", [W], 0))', AB, "A", 1),
+    ('IF("3" + BLANK() = 3, 1, 0)', None, "_M", 1),                       # BLANK + text is a number
+    ('IF(TRUE() + BLANK() = 1, 1, 0)', None, "_M", 1),
+    ('IF(BLANK() + "3" = 3, 1, 0)', None, "_M", 1),                       # BLANK on either side
+    ('IF(BLANK() - TRUE() = -1, 1, 0)', None, "_M", 1),
+    ('IF(FALSE(), IF("3" + BLANK() = 3, 1, 0), 5)', None, "_M", 5),
+])
+def test_344_valid_dax_is_not_refused(expr, tables, home, want):
+    assert _ev344(expr, tables, home) == (want, None)
+
+
+def test_344_a_missing_name_is_its_own_error_before_any_type_error():
+    # Desktop binds names before it checks types: the type error never pre-empts the name's (what the evaluation
+    # makes of the missing name is its own, as before: here, with no column list, a BLANK)
+    for expr in ('IF(MAX(Opp[Nope]) = 1, "a" = 1, 0)', 'IF([Nope] = 1, "a" = 1, 0)'):
+        _v, err = _ev344(expr)
+        assert err is None or "comparison operations" not in err, err
