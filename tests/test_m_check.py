@@ -298,3 +298,29 @@ def test_json_shape():
                         "startRow": 0, "startColumn": 10, "endRow": 0, "endColumn": 11},
         "canCommit": True,
     }
+
+
+# --- measured on Power BI Desktop 2.157's Advanced Editor (2026-11-18): message, range, Done ------------
+
+_VERBATIM_MSG = ('Consider removing the verbatim literal brackets ( #!" ... " ) to enable evaluation of the '
+                 'bracketed expression.')
+
+
+@pytest.mark.parametrize("text, message, start, end, done", [
+    ("let a = 1, b = 2 in a +", "Token Literal expected.", 23, 23, True),
+    ("let a = 1 b = 2 in a", "Token ',' expected.", 10, 11, True),
+    ('let a = "abc in a', "Invalid literal.", 8, 17, True),
+    ("let a = 1 in a /* open", "Token Eof expected.", 15, 22, True),
+    ("let a = 1 in a // trailing", None, None, None, True),
+    ("let x = NoSuchName in x", None, None, None, True),
+    ("let a = 1, a = 2 in a", "The variable named 'a' is already defined in this scope.", 11, 12, False),
+    ("(x, x) => x", "The parameter name 'x' is a duplicate.", 4, 5, False),
+    ("[a = 1, a = 2]", "The field named 'a' is already defined in this scope.", 8, 9, False),
+    ('#!"1 + 1"', _VERBATIM_MSG, 0, 9, False),
+    ("section S; a = 1;", "Invalid expression.", 0, 17, True),
+    ("let a = 1 in a $", "Token Eof expected.", 15, 16, True),
+    (")", "Token Literal expected.", 0, 1, True),
+])
+def test_measured_on_desktop(text, message, start, end, done):
+    expected = None if message is None else (message, start, end)
+    assert _err(text) == (expected, done)
