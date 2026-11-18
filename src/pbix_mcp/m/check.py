@@ -281,7 +281,7 @@ def _escape_char(body: str) -> Optional[str]:
         v = _hex_value(body)
         if v is None or v > 0x10FFFF or v < 0xFFFF and 0xD800 <= v <= 0xDFFF:
             return None
-        return chr(v)
+        return _utf16(chr(v))   # beyond U+FFFF: its surrogate pair, as every other text here
     return None
 
 
@@ -437,7 +437,12 @@ def _utf16(text: str) -> str:
 
 
 def _source_error(units: str, message: str, start: int, end: int) -> SourceError:
-    """``start`` and ``end`` index ``units`` (UTF-16 code units), so they are the editor's offsets."""
+    """The error at ``units[start:end]`` (UTF-16 code units) as the editor gets it.
+
+    Rows and columns come from the text: a row ends after ``\\n``, or after a ``\\r`` not followed by
+    ``\\n``. The offsets are then rebuilt from them line by line, each line counting its length plus
+    one, so a ``\\r\\n`` counts once: after a CRLF they are smaller than the plain index, as Power
+    Query's are. A row past the last line adds its preceding lines only."""
     def row_col(i: int) -> tuple[int, int]:
         row, line_start = 0, 0
         for k in range(i):
@@ -446,9 +451,32 @@ def _source_error(units: str, message: str, start: int, end: int) -> SourceError
                 row, line_start = row + 1, k + 1
         return row, i - line_start
 
+    lines = _read_lines(units)
+
+    def offset(row: int, column: int) -> int:
+        return sum(len(line) + 1 for line in lines[:row]) + (column if row < len(lines) else 0)
+
     sr, sc = row_col(start)
     er, ec = row_col(end)
-    return SourceError(message, start, end, sr, sc, er, ec)
+    # A name in the message is in code units: join its surrogate pairs back into characters.
+    message = message.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return SourceError(message, offset(sr, sc), offset(er, ec), sr, sc, er, ec)
+
+
+def _read_lines(units: str) -> list[str]:
+    """The text's lines, split at ``\\r\\n``, ``\\n`` or ``\\r``; a final line break opens no line."""
+    lines, k, start, n = [], 0, 0, len(units)
+    while k < n:
+        ch = units[k]
+        if ch in "\r\n":
+            lines.append(units[start:k])
+            k += 2 if ch == "\r" and k + 1 < n and units[k + 1] == "\n" else 1
+            start = k
+        else:
+            k += 1
+    if start < n:
+        lines.append(units[start:])
+    return lines
 
 
 # --- the reader -----------------------------------------------------------------------------
@@ -570,9 +598,7 @@ class _Reader:
             value = self.expression()
             self.expect(";")
             node.names.append(name)
-            if attribute is not None:
-                node.children.append(attribute)
-            node.children.append(value)
+            node.children.append(value)   # aligned with names; a constant attribute holds nothing to check
         node.kind = "section"
         return node
 
@@ -1005,6 +1031,13 @@ class _Reader:
         return node
 
 
+class NoCheckResult(Exception):
+    """Power Query's editor gets no answer for this text: its check fails outright. A verbatim literal
+    holding anything but text (``#!1``), where it survives the duplicate check, or nesting deep enough
+    to overflow the reader's stack (``type {{{…``, which has no depth limit; the depth at which Power Query's
+    own reader overflows is unmeasured, ours past about 24,000 list or nullable levels)."""
+
+
 def _read(units: str) -> tuple[Optional[_Found], Optional[_Node]]:
     """Read ``units`` (UTF-16 code units): the first error, or the tree the later checks walk."""
     limit = sys.getrecursionlimit()
@@ -1013,38 +1046,67 @@ def _read(units: str) -> tuple[Optional[_Found], Optional[_Node]]:
         return None, _Reader(units).document()
     except _Found as found:
         return found, None
+    except RecursionError:
+        raise NoCheckResult("the text nests too deeply for Power Query's reader") from None
     finally:
         sys.setrecursionlimit(limit)
 
 
-def _walk(node: _Node):
-    yield node
-    for child in node.children:
-        yield from _walk(child)
-
-
-def _first_duplicate(root: _Node) -> Optional[tuple[str, int, int]]:
-    for node in _walk(root):
-        if node.dup:
-            seen = set()
-            for name, start, end in node.names:
-                if name in seen:
-                    return _DUPLICATE[node.dup].format(name), start, end
-                seen.add(name)
+def _first_duplicate_of(node: _Node) -> Optional[tuple[str, int, int]]:
+    seen = set()
+    for name, start, end in node.names:
+        if name in seen:
+            return _DUPLICATE[node.dup].format(name), start, end
+        seen.add(name)
     return None
 
 
-def _first_readable_verbatim(root: _Node) -> Optional[tuple[str, int, int]]:
-    for node in _walk(root):
-        if node.kind == "verbatim" and node.verbatim is not None:
-            found, inner = _read(node.verbatim)
-            if found is None and inner.kind != "section":
-                return _VERBATIM_READS, node.start, node.end
+def _compile_checks(root: _Node) -> Optional[tuple[str, int, int]]:
+    """The checks after reading, in Power Query's order: duplicates (outermost first, then in reading
+    order), then verbatim literals over what the duplicate check leaves.
+
+    A function, function type, record or record type with a duplicate becomes an error as a whole,
+    so nothing inside it is checked further; a let or section drops only the entries whose name is
+    duplicated. A verbatim literal left after that holding anything but text fails the check outright
+    (``NoCheckResult``), even after an error was found; one holding text that reads as an expression
+    is an error."""
+    first: Optional[tuple[str, int, int]] = None
+    verbatims: list[_Node] = []
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        kids = node.children
+        if node.dup:
+            dup = _first_duplicate_of(node)
+            if dup is not None:
+                if first is None:
+                    first = dup
+                if node.dup in ("parameter", "field"):
+                    kids = []
+                else:
+                    counts: dict[str, int] = {}
+                    for name, _s, _e in node.names:
+                        counts[name] = counts.get(name, 0) + 1
+                    n = len(node.names)
+                    kids = [kids[k] for k in range(n) if counts[node.names[k][0]] == 1] + kids[n:]
+        if node.kind == "verbatim":
+            verbatims.append(node)
+        stack.extend(reversed(kids))
+    for node in verbatims:
+        if node.verbatim is None:
+            raise NoCheckResult("a verbatim literal holds a value that isn't text")
+    if first is not None:
+        return first
+    for node in verbatims:
+        found, inner = _read(node.verbatim)
+        if found is None and inner.kind != "section":
+            return _VERBATIM_READS, node.start, node.end
     return None
 
 
 def check_query(text: str) -> CheckResult:
-    """What the Advanced Editor shows for ``text``: the first error and whether "Done" may save it."""
+    """What the Advanced Editor shows for ``text``: the first error and whether "Done" may save it.
+    Raises ``NoCheckResult`` where Power Query's own check gets no answer."""
     if not text:
         return CheckResult(None, True)
     units = _utf16(text)
@@ -1053,14 +1115,13 @@ def check_query(text: str) -> CheckResult:
         return CheckResult(_source_error(units, found.message, found.start, found.end), True)
     if root.kind == "section":
         return CheckResult(_source_error(units, _INVALID_EXPRESSION, 0, len(units)), True)
+    hit = _compile_checks(root)
     if root.kind == "let":
         for name, start, end in root.names:
             if not _surrogates_paired(name):
                 return CheckResult(_source_error(units, _INVALID_NAME_SEQUENCE, start, end), False)
-    for finder in (_first_duplicate, _first_readable_verbatim):
-        hit = finder(root)
-        if hit is not None:
-            return CheckResult(_source_error(units, *hit), False)
+    if hit is not None:
+        return CheckResult(_source_error(units, *hit), False)
     return CheckResult(None, True)
 
 
@@ -1087,7 +1148,7 @@ def escape_source_text(text: str) -> str:
     units = _utf16(text)
     found, root = _read(units)
     if found is not None or root.kind == "section":
-        return '#!"' + text.replace('"', '""') + '"'
+        return '#!' + _quoted(text)
     toks = tokenize(units)
     for t in reversed(toks[1:-1]):
         if t.kind != WHITESPACE:
@@ -1100,3 +1161,29 @@ def escape_source_text(text: str) -> str:
         if piece.startswith("/"):
             break
     return text
+
+
+def _quoted(text: str) -> str:
+    """``text`` as an M text literal, as Power Query writes one: ``"`` doubled; line feed, carriage
+    return and tab as ``#(lf)``, ``#(cr)``, ``#(tab)`` (a CRLF as two escapes); ``#(`` as ``#(#)(``;
+    U+0085, U+2028, U+2029, control characters and the non-characters U+FDD0-FDEF, U+FFFE and U+FFFF
+    as four-digit hex escapes."""
+    out = []
+    for k, ch in enumerate(text):
+        o = ord(ch)
+        if ch == "\n":
+            out.append("#(lf)")
+        elif ch == "\r":
+            out.append("#(cr)")
+        elif ch == "\t":
+            out.append("#(tab)")
+        elif ch == "#":
+            out.append("#(#)" if k + 1 < len(text) and text[k + 1] == "(" else "#")
+        elif ch == '"':
+            out.append('""')
+        elif ch in "\u0085  " or unicodedata.category(ch) == "Cc" \
+                or 0xFDD0 <= o <= 0xFDEF or 0xFFFE <= o <= 0xFFFF:
+            out.append(f"#({o:04X})")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'

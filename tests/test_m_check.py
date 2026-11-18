@@ -5,7 +5,7 @@ query may be saved, as Power Query's editor reports them.
 """
 import pytest
 
-from pbix_mcp.m.check import NO_SYNTAX_ERRORS, check_query, escape_source_text
+from pbix_mcp.m.check import NO_SYNTAX_ERRORS, NoCheckResult, check_query, escape_source_text
 
 
 def _err(text):
@@ -138,10 +138,12 @@ def test_bad_catch():
 
 
 def test_too_deep():
-    t = "(" * 1000 + "1" + ")" * 1000
-    (msg, start, _end), can = _err(t)
-    assert msg == "This query is too complicated to run." and can
-    assert 0 < start < 1000
+    # Each parenthesis counts twice (an expression and its operand), so the 401st stops it.
+    assert _err("(" * 1000 + "1" + ")" * 1000) == (("This query is too complicated to run.", 400, 401), True)
+
+
+def test_too_deep_unary():
+    assert _err("-" * 1000 + "1") == (("This query is too complicated to run.", 800, 801), True)
 
 
 def test_not_too_deep():
@@ -153,6 +155,16 @@ def test_rows_and_columns():
     r = check_query("let\r\n  a = 1\r\n  b = 2\r\nin a")
     e = r.sourceError
     assert (e.text, e.startRow, e.startColumn, e.endRow, e.endColumn) == ("Token ',' expected.", 2, 2, 2, 3)
+    # Offsets are rebuilt from rows and columns, each line its length plus one: a CRLF counts once.
+    assert (e.startPosition, e.endPosition) == (14, 15)
+
+
+def test_offsets_at_the_end_after_a_crlf():
+    assert _err("let a = 1 in a +\r\n") == (("Token Literal expected.", 17, 17), True)
+
+
+def test_section_with_crlfs():
+    assert _err("section S;\r\na = 1;\r\n") == (("Invalid expression.", 0, 18), True)
 
 
 def test_lone_cr_ends_a_row():
@@ -200,6 +212,60 @@ def test_verbatim_that_reads():
     assert _err('#!"1 + 1"') == ((msg, 0, 9), False)
 
 
+def test_lookahead_type_error_is_real():
+    assert _err("(x) as foo => 1") == (("The type identifier is invalid.", 7, 10), True)
+
+
+def test_section_attribute_duplicate():
+    assert _err("[a = 1, a = 2] section S;") == (("Duplicate field named 'a'.", 13, 14), True)   # at the "]" after the value
+
+
+def test_eight_digit_escape_names_the_same_character():
+    t = 'let #"#(0001F600)" = 1, #"\U0001F600" = 2 in 1'
+    second = t.index('#"\U0001F600"')
+    assert _err(t) == (("The variable named '\U0001F600' is already defined in this scope.", second, second + 5),
+                       False)
+
+
+def test_eight_digit_escape_beyond_the_bmp_is_no_letter_in_a_verbatim():
+    assert _err('#!"#(0001D4B3)"') == (None, True)
+
+
+@pytest.mark.parametrize("text", ["#!1", "#!null", "#!true", "#!#date", "let a = #!1, b = 2, b = 3 in a",
+                                  "let a = 1, a = 2, b = #!1 in b"])   # a let keeps its other variables
+def test_non_text_verbatim_gets_no_result(text):
+    with pytest.raises(NoCheckResult):
+        check_query(text)
+
+
+@pytest.mark.parametrize("text, message, can", [
+    ("[a = #!1, a = 2]", "The field named 'a' is already defined in this scope.", False),   # the record goes whole
+    ("[a = 1, a = 2, b = #!1]", "The field named 'a' is already defined in this scope.", False),  # b with it
+    ("(x, x, y as number) => #!1", "The parameter name 'x' is a duplicate.", False),   # so does a function
+    ("let a = #!1, a = 2 in a", "The variable named 'a' is already defined in this scope.", False),  # a's value goes
+])
+def test_non_text_verbatim_dropped_with_a_duplicate(text, message, can):
+    (msg, _s, _e), c = _err(text)
+    assert (msg, c) == (message, can)
+
+
+@pytest.mark.parametrize("text", [
+    "x" + "[a]" * 1100,
+    "f" + "()" * 1100,
+    "x" + " as number" * 1100,
+    "1 meta " * 2000 + "1",
+])
+def test_long_chains_read(text):
+    assert check_query(text).sourceError is None
+
+
+def test_type_nesting_past_the_stack_gets_no_result():
+    # Types have no depth limit, so deep enough nesting overflows the reader. Where Power Query's own reader
+    # overflows is unmeasured; ours answers "no result" past its stack instead of crashing.
+    with pytest.raises(NoCheckResult):
+        check_query("type " + "{" * 50000 + "number" + "}" * 50000)
+
+
 def test_verbatim_that_does_not_read_is_no_error():
     assert _err('#!"1 +"') == (None, True)
 
@@ -217,6 +283,10 @@ def test_unpaired_surrogate_in_a_variable_name():
     ("section S; a = 1;", '#!"section S; a = 1;"'),
     ("a // c", "a // c\r\n"),
     ("a /* c */", "a /* c */"),
+    ("let a =\r\n 1 +", '#!"let a =#(cr)#(lf) 1 +"'),
+    ('x = "#(lf)"; (', '#!"x = ""#(#)(lf)""; ("'),
+    ("1 +\t\x01\u0085\u2028\u2029\ufdd0\uffff #", '#!"1 +#(tab)#(0001)#(0085)#(2028)#(2029)#(FDD0)#(FFFF) #"'),
+    ("a // c\n", "a // c\n\r\n"),
 ])
 def test_escape_source_text(text, stored):
     assert escape_source_text(text) == stored
