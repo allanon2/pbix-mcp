@@ -353,3 +353,255 @@ def test_340_a_serial_past_any_date_matches_nothing(serial):
 def test_340_an_expressions_mixed_column_compares_as_before():
     # Desktop's reading of a Variant expression column is not measured: only constructors and UNION are Text
     assert one('EVALUATE ROW("x", 2 IN SELECTCOLUMNS(Opp, "v", IF(Opp[Rank] = 1, "x", Opp[Rank])))')["rows"] == [[True]]
+
+
+# ---------------------------------------------------------------------------
+# #341, #342, #343 (Desktop 2.157, 2026-11-18, leftovers341.json): SUMMARIZECOLUMNS' filter tables, UNION's column
+# types, comparisons of values of different types. Generated from Desktop's answers: columns, types and rows (in any
+# order), or the error's text after its "Query (l, c) ".
+# ---------------------------------------------------------------------------
+
+TABLES_341 = dict(TABLES, **{"Sales stage": {"columns": ["Probability", "Sales Stage", "Sales Stage ID"],
+                                              "rows": [[0.1, "Lead", 1], [0.2, "Qualify", 2], [0.4, "Solution", 3],
+                                                       [0.6, "Proposal", 4], [0.8, "Finalize", 5]]},
+                              "_M": {"columns": ["Column1"], "rows": []}})
+TYPES_341 = {**TYPES, ("_M", "Column1"): "String"}
+MEASURES_341 = {"Total": "SUM(Opp[Rank])"}
+
+
+def _run_341(text: str) -> list:
+    return execute_query(text, TABLES_341, dict(MEASURES_341), measure_tables={"Total": "_M"}, column_types=TYPES_341)
+
+
+def _norm_341(v):
+    if isinstance(v, dt.datetime):
+        return ("dt", v.isoformat()[:19])
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    return v
+
+
+ROWS_341 = [
+    ('341 filter all rank', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], FILTER(ALL(Opp[Rank]), Opp[Rank] = 1), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 1]]),
+    ('341 treatas rank', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({1}, Opp[Rank]), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 1]]),
+    ('341 keepfilters filter', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], KEEPFILTERS(FILTER(ALL(Opp[Rank]), Opp[Rank] = 1)), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 1]]),
+    ('341 filter flag', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], FILTER(ALL(Opp[Flag]), Opp[Flag] = TRUE()), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 4]]),
+    ('341 treatas group col', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({"a"}, Opp[Name]), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 4]]),
+    ('341 two filters', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({1, 2, 3}, Opp[Rank]), FILTER(ALL(Opp[Flag]), Opp[Flag] = TRUE()), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 4]]),
+    ('341 unrelated table filter', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({"Lead"}, \'Sales stage\'[Sales Stage]), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 4], ['b', 2]]),
+    ('341 no measure', "EVALUATE SUMMARIZECOLUMNS('Opp'[Name], TREATAS({1}, Opp[Rank]))",
+     [('Opp[Name]', 'Text')],
+     [['a']]),
+    ('341 no group', 'EVALUATE SUMMARIZECOLUMNS(TREATAS({1}, Opp[Rank]), "t", [Total])',
+     [('[t]', 'Integer')],
+     [[1]]),
+    ('341 filter removes all', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({99}, Opp[Rank]), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     []),
+    ('341 values filter', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], FILTER(VALUES(Opp[Rank]), Opp[Rank] >= 2), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 3], ['b', 2]]),
+    ('341 filter whole table', 'EVALUATE SUMMARIZECOLUMNS(\'Opp\'[Name], FILTER(Opp, Opp[Rank] = 3), "t", [Total])',
+     [('Opp[Name]', 'Text'), ('[t]', 'Integer')],
+     [['a', 3]]),
+    ('341 count', 'EVALUATE ROW("n", COUNTROWS(SUMMARIZECOLUMNS(\'Opp\'[Name], TREATAS({1}, Opp[Rank]), "t", [Total])))',
+     [('[n]', 'Integer')],
+     [[1]]),
+    ('342 union int double', 'EVALUATE UNION({1}, {2.5})',
+     [('[Value]', 'Double')],
+     [[1], [2.5]]),
+    ('342 union date int', 'EVALUATE UNION({DATE(2026,1,6)}, {1})',
+     [('[Value]', 'Double')],
+     [[46028], [1]]),
+    ('342 union bool int', 'EVALUATE UNION({TRUE()}, {1})',
+     [('[Value]', 'Integer')],
+     [[1], [1]]),
+    ('342 union date text', 'EVALUATE UNION({DATE(2026,1,6)}, {"a"})',
+     [('[Value]', 'Text')],
+     [['1/6/2026'], ['a']]),
+    ('342 union bool text', 'EVALUATE UNION({TRUE()}, {"a"})',
+     [('[Value]', 'Text')],
+     [['TRUE'], ['a']]),
+    ('342 union double text', 'EVALUATE UNION({2.5}, {"a"})',
+     [('[Value]', 'Text')],
+     [['2.5'], ['a']]),
+    ('342 union blank text', 'EVALUATE UNION({BLANK()}, {"a"})',
+     [('[Value]', 'Text')],
+     [[None], ['a']]),
+    ('342 union row names', 'EVALUATE UNION(ROW("x", 1), ROW("y", "a"))',
+     [('[x]', 'Text')],
+     [['1'], ['a']]),
+    ('342 union two cols mixed', 'EVALUATE UNION(SELECTCOLUMNS(Opp, "r", Opp[Rank], "n", Opp[Name]), SELECTCOLUMNS(Opp, "n", Opp[Name], "r", Opp[Rank]))',
+     [('[r]', 'Text'), ('[n]', 'Text')],
+     [['1', 'a'], ['3', 'a'], ['2', 'b'], ['a', '1'], ['a', '3'], ['b', '2']]),
+    ('342 union text first', 'EVALUATE UNION({"a"}, {1})',
+     [('[Value]', 'Text')],
+     [['a'], ['1']]),
+    ('342 union columns', 'EVALUATE UNION(VALUES(Opp[Rank]), VALUES(Opp[Name]))',
+     [('Opp[Rank]', 'Text')],
+     [['1'], ['2'], ['3'], ['a'], ['b']]),
+    ('342 union countrows', 'EVALUATE ROW("n", COUNTROWS(UNION({1}, {"a"}, {1})))',
+     [('[n]', 'Integer')],
+     [[3]]),
+    ('342 union distinct', 'EVALUATE DISTINCT(UNION({1}, {"1"}))',
+     [('[Value]', 'Text')],
+     [['1']]),
+    ('343 calc date eq serial', 'EVALUATE ROW("x", CALCULATE([Total], Opp[When] = 46027))',
+     [('[x]', 'Integer')],
+     [[1]]),
+    ('343 treatas serial', 'EVALUATE ROW("x", CALCULATE([Total], TREATAS({46027}, Opp[When])))',
+     [('[x]', 'Integer')],
+     [[1]]),
+    ('343 treatas text on number', 'EVALUATE ROW("x", CALCULATE([Total], TREATAS({"1"}, Opp[Rank])))',
+     [('[x]', 'Integer')],
+     [[1]]),
+    ('343 neg serial a', 'EVALUATE ROW("x", DATE(1899,12,29) + TIME(6,0,0) IN {-1.25})',
+     [('[x]', 'Boolean')],
+     [[False]]),
+    ('343 neg serial b', 'EVALUATE ROW("x", DATE(1899,12,28) + TIME(18,0,0) IN {-1.25})',
+     [('[x]', 'Boolean')],
+     [[True]]),
+    ('343 neg serial value', 'EVALUATE ROW("x", CONVERT(-1.25, DATETIME))',
+     [('[x]', 'DateTime')],
+     [[('dt', '1899-12-29T06:00:00')]]),
+]
+
+
+@pytest.mark.parametrize("case, text, columns, rows", ROWS_341, ids=[c[0] for c in ROWS_341])
+def test_341_342_343_desktops_rows(case, text, columns, rows):
+    (t,) = _run_341(text)
+    assert [(c["name"], c["type"]) for c in t["columns"]] == [tuple(c) for c in columns]
+    assert sorted(map(repr, ([_norm_341(v) for v in r] for r in t["rows"]))) == sorted(map(repr, rows))
+
+
+ERRORS_341 = [
+    ('343 calc or', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Name] = 1 || Opp[Rank] = 1))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 filter text eq number', 'EVALUATE ROW("x", COUNTROWS(FILTER(Opp, Opp[Name] = 1)))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc ne', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Name] <> 1))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc gt', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Name] > 1))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc literal first', 'EVALUATE ROW("x", CALCULATE([Total], 1 = Opp[Name]))',
+     'DAX comparison operations do not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc text eq true', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Name] = TRUE()))',
+     'DAX comparison operations do not support comparing values of type Text with values of type True/False. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc bool eq text', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Flag] = "a"))',
+     'DAX comparison operations do not support comparing values of type True/False with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc bool eq number', 'EVALUATE ROW("x", CALCULATE([Total], Opp[Flag] = 1))',
+     'DAX comparison operations do not support comparing values of type True/False with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 calc date eq text', 'EVALUATE ROW("x", CALCULATE([Total], Opp[When] = "1/5/2026"))',
+     'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    pytest.param('343 empty table col in number', 'EVALUATE ROW("x", CALCULATE([Total], \'_M\'[Column1] IN {1}))',
+     "Function 'CONTAINSROW' does not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.", marks=pytest.mark.xfail(strict=True, reason="Desktop checks types before anything runs: an IF branch never taken, an empty table's declared column type (not done)")),
+    pytest.param('343 if false branch', 'EVALUATE ROW("x", IF(FALSE(), CALCULATE([Total], Opp[Rank] IN {"a"}), 7))',
+     "Function 'CONTAINSROW' does not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.", marks=pytest.mark.xfail(strict=True, reason="Desktop checks types before anything runs: an IF branch never taken, an empty table's declared column type (not done)")),
+    ('343 scalar text eq number', 'EVALUATE ROW("x", "a" = 1)',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 scalar text number eq', 'EVALUATE ROW("x", "1" = 1)',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 scalar text lt number', 'EVALUATE ROW("x", "a" < 1)',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('343 iferror plain in', 'EVALUATE ROW("x", IFERROR(1 IN {"a"}, -1))',
+     "Function 'CONTAINSROW' does not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values."),
+    ('343 iferror filter eq', 'EVALUATE ROW("x", IFERROR(COUNTROWS(FILTER(Opp, Opp[Name] = 1)), -1))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.'),
+]
+
+
+@pytest.mark.parametrize("case, text, message", ERRORS_341, ids=[(c.values[0] if hasattr(c, "values") else c[0]) for c in ERRORS_341])
+def test_341_342_343_desktops_errors(case, text, message):
+    with pytest.raises(DAXEvaluationError) as e:
+        _run_341(text)
+    assert e.value.message.rstrip(".") == message.rstrip(".")
+
+
+# Variants, date-like text, TREATAS and UNION over model columns, INTERSECT (Desktop 2.157, 2026-11-18, leftoversv.json):
+# a comparison is checked by its operands' declared types, a Variant by none
+
+ROWS_V = [
+    ('v selectedvalue strict eq', 'EVALUATE ROW("x", CALCULATE(IF(SELECTEDVALUE(Opp[Name], 0) == 0, "none", "one"), Opp[Name] = "a"))',
+     [('[x]', 'Text')],
+     [['one']]),
+    ('v selectedvalue eq', 'EVALUATE ROW("x", CALCULATE(IF(SELECTEDVALUE(Opp[Name], 0) = 0, "none", "one"), Opp[Name] = "a"))',
+     [('[x]', 'Text')],
+     [['one']]),
+    ('v selectedvalue eq iferror', 'EVALUATE ROW("x", IFERROR(CALCULATE(IF(SELECTEDVALUE(Opp[Name], 0) = 0, "none", "one"), Opp[Name] = "a"), "err"))',
+     [('[x]', 'Text')],
+     [['one']]),
+    ('v selectedvalue alt text', 'EVALUATE ROW("x", IF(SELECTEDVALUE(Opp[Rank], "none") = 1, 1, 0))',
+     [('[x]', 'Integer')],
+     [[0]]),
+    ('v if variant eq', 'EVALUATE ROW("x", IF(IF(1 = 1, "x", 1) = 1, 1, 0))',
+     [('[x]', 'Integer')],
+     [[0]]),
+    ('v if variant eq iferror', 'EVALUATE ROW("x", IFERROR(IF(IF(1 = 1, "x", 1) = 1, 1, 0), -1))',
+     [('[x]', 'Integer')],
+     [[0]]),
+    ('v coalesce', 'EVALUATE ROW("x", IF(COALESCE(MAX(Opp[Name]), 0) = 0, 1, 2))',
+     [('[x]', 'Integer')],
+     [[2]]),
+    ('v sumx variant', 'EVALUATE ROW("x", SUMX(Opp, IF(IF(Opp[Rank] = 1, "x", Opp[Rank]) = 2, 1, 0)))',
+     [('[x]', 'Integer')],
+     [[1]]),
+    ('v switch variant', 'EVALUATE ROW("x", SWITCH(TRUE(), IF(1 = 1, "x", 1) = 1, 1, 0))',
+     [('[x]', 'Integer')],
+     [[0]]),
+    ('v treatas serial table', 'EVALUATE TREATAS({46027}, Opp[When])',
+     [('Opp[When]', 'DateTime')],
+     [[('dt', '2026-01-05T00:00:00')]]),
+    ('v treatas text date table', 'EVALUATE TREATAS({"2026-01-05"}, Opp[When])',
+     [('Opp[When]', 'DateTime')],
+     [[('dt', '2026-01-05T00:00:00')]]),
+    ('v union date rank', 'EVALUATE UNION(VALUES(Opp[When]), VALUES(Opp[Rank]))',
+     [('Opp[When]', 'Double')],
+     [[46027], [46028], [46031], [1], [2], [3]]),
+    ('v union flag rank', 'EVALUATE UNION(VALUES(Opp[Flag]), VALUES(Opp[Rank]))',
+     [('Opp[Flag]', 'Integer')],
+     [[0], [1], [1], [2], [3]]),
+]
+
+
+@pytest.mark.parametrize("case, text, columns, rows", ROWS_V, ids=[c[0] for c in ROWS_V])
+def test_v_desktops_rows(case, text, columns, rows):
+    test_341_342_343_desktops_rows(case, text, columns, rows)
+
+
+ERRORS_V = [
+    ('v strict text number', 'EVALUATE ROW("x", 1 == "a")',
+     'DAX comparison operations do not support comparing values of type Integer with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('v date eq iso text', 'EVALUATE ROW("x", DATE(2026,1,5) = "2026-01-05")',
+     'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    ('v filter date eq text', 'EVALUATE ROW("x", COUNTROWS(FILTER(Opp, Opp[When] = "1/5/2026")))',
+     'DAX comparison operations do not support comparing values of type Date with values of type Text. Consider using the VALUE or FORMAT function to convert one of the values.'),
+    pytest.param('v blank text max eq number', 'EVALUATE ROW("x", IF(MAX(\'_M\'[Column1]) = 1, 1, 0))',
+     'DAX comparison operations do not support comparing values of type Text with values of type Integer. Consider using the VALUE or FORMAT function to convert one of the values.', marks=pytest.mark.xfail(strict=True, reason="an empty table's declared column type (not known to the engine)")),
+    ('v intersect union text', 'EVALUATE ROW("n", COUNTROWS(INTERSECT(UNION({1}, {"a"}), VALUES(Opp[Rank]))))',
+     "Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer."),
+]
+
+
+@pytest.mark.parametrize("case, text, message", ERRORS_V, ids=[(c.values[0] if hasattr(c, "values") else c[0]) for c in ERRORS_V])
+def test_v_desktops_errors(case, text, message):
+    test_341_342_343_desktops_errors(case, text, message)
+
+
+def test_a_variant_value_in_a_calculate_filter_is_checked_by_no_type():
+    # inferred from the measured rule (a Variant is checked by no type: IF(1 = 1, "x", 1) = 1 is FALSE), not asked
+    # in this form: the text column against a Variant 1 compares, keeping no row
+    assert _run_341('EVALUATE ROW("x", CALCULATE([Total], Opp[Name] = IF(1 = 1, 1, "x")))')[0]["rows"] == [[None]]

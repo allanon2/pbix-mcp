@@ -26,6 +26,35 @@ Measured on a synthetic model over Desktop's loopback connection (EVALUATE only)
 - A measure whose text is not DAX (`1 +* 2`, `1 2`, `1 +`) answered 1, BLANK and 1. Desktop keeps it and compiles it as `SYNTAXERROR`: any query touching it, or a measure using it, fails with `MdxScript(Model) (1, 1) Failed to resolve name 'SYNTAXERROR'. It is not a valid table, variable, or function name.`; IFERROR catches it. The check is the query route's syntax recogniser; all 426 measures of 50 public samples pass it. A `dt"..."` literal is not checked.
 - `'T'[Measure]` where T is in no `tables` and the measure's home is unknown leaked a `(table, name)` marker, a silent BLANK: it is now the measure when the model names T (or there is no column list), an error otherwise; a column of T by that name stays the column.
 
+### Fixed — comparisons by declared type, SUMMARIZECOLUMNS' filter tables, UNION's column types (Power BI Desktop 2.157, 2026-11-18)
+
+Measured on Desktop 2.157 over its loopback connection (66 queries on a synthetic model); tests generated from its answers in `tests/test_leftovers_desktop_2157.py`.
+
+**Comparisons are checked by the operands' declared types,** before anything runs:
+- Text against a number, text against TRUE / FALSE, TRUE / FALSE against a number, and a date against text are `DAX comparison operations do not support comparing values of type Text with values of type Integer. ...`, the left operand's type first. That holds in any form:
+  - plain values (`"a" = 1`, `"1" = 1`, `"a" < 1`, `1 == "a"`);
+  - FILTER, and CALCULATE filters (`=`, `<>`, `>`, `||`, literal first);
+  - a BLANK of a Text column;
+  - date-like text (`DATE(2026,1,5) = "2026-01-05"`).
+
+  IFERROR doesn't catch it. They answered FALSE, BLANK or a number.
+- A Variant (IF, SWITCH or COALESCE of mixed kinds, SELECTEDVALUE with an alternate of another kind) is checked by no type and compares as before: `IF(1 = 1, "x", 1) = 1` is FALSE.
+- A date column against a number compares its date serial: `CALCULATE(.., Opp[When] = 46027)` and `TREATAS({46027}, Opp[When])` keep 2026-01-05, where they kept nothing.
+- TREATAS as a table gives the column's dates.
+- `CONVERT(-1.25, DATETIME)` is 1899-12-29 06:00 (an OLE date).
+
+**SUMMARIZECOLUMNS' filter tables** filter its groups and expressions. `SUMMARIZECOLUMNS('Opp'[Name], TREATAS({1}, Opp[Rank]), "t", [Total])` is one row (a, 1); they were ignored, every group unfiltered.
+
+**UNION unifies each column:**
+- Text beside other kinds is Text (a date `1/6/2026`, TRUE `TRUE`).
+- A date beside numbers is its serial, a Double.
+- TRUE / FALSE beside numbers is 1 / 0, an Int64.
+- Over model columns, the first's name heads the result (`UNION(VALUES(Opp[Rank]), VALUES(Opp[Name]))` is a String column `Opp[Rank]`; it was refused).
+
+**INTERSECT** of a Text column with a number column is `Function 'INTERSECT' does not support joining a column of type Text with a column of type Integer.`
+
+**Not done:** Desktop also refuses a mismatched comparison in an IF branch never taken, and one on an empty table's declared column type. The engine checks only what it evaluates, and reads a column's type from its values (strict xfails).
+
 ### Fixed — CALCULATE's filters compare types as Desktop does (Power BI Desktop 2.157, 2026-11-18)
 
 - `CALCULATE(..., T[c] IN <set>)` with a set of another type than the column is `Function 'CONTAINSROW' does not support comparing values of type <the set's> with values of type <the column's>. ...`, which IFERROR around the CALCULATE does not catch; KEEPFILTERS, NOT and CALCULATETABLE alike (`Opp[Rank] IN {1, "a"}`, `Opp[Name] IN {1}`, `Opp[Flag] IN {"a"}`). It answered as if each value compared. A date column against numbers compares them as date serials (`Opp[When] IN {46027}` keeps 2026-01-05; it kept nothing); a serial past any date matches nothing.

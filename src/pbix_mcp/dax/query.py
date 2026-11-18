@@ -935,8 +935,13 @@ def _run_one(eng, de, ctx, slot: str, ev: Evaluate, column_types: dict, text: st
 
     cells = [de.DAXEngine._lineage_cells(r, ctx) for r in rows]
     heads = [lin for lin, _v in cells[0]] if cells else []
+    names = [n for (_t, n) in heads]
     for c in cells:
-        if [lin for lin, _v in c] != heads:
+        if [lin for lin, _v in c] != heads and [n for (_t, n), _v in c] != names:
+            # rows that differ only by a column's table (a UNION's later
+            # sides lose their lineage) take the first row's headings, as
+            # Power BI Desktop 2.157 heads UNION(VALUES(Opp[Rank]),
+            # VALUES(Opp[Name])) Opp[Rank] (2026-11-18, #342)
             raise DAXEvaluationError(f"{what}: the engine gave rows of different columns.")
     if len({(t.lower() if t else None, n.lower()) for t, n in heads}) != len(heads):
         raise DAXEvaluationError(f"{what}: the result has two columns of one name.")
@@ -970,7 +975,17 @@ def _run_one(eng, de, ctx, slot: str, ev: Evaluate, column_types: dict, text: st
         col: dict = {'name': f"{t}[{n}]" if t is not None else f"[{n}]"}
         model_type = column_types.get((t, n)) if t is not None else None
         mapped = _MODEL_TYPES.get(str(model_type).lower()) if model_type is not None else None
-        if mapped is not None:
+        held = _column_type([c[j][1] for c in cells]) if mapped is not None and cells else None
+        if held is not None and _KIND_OF_TYPE.get(held) not in (None, _KIND_OF_TYPE.get(mapped)):
+            # a model column's heading over values of another kind: a UNION's
+            # unified column under its first table's name (Power BI Desktop
+            # 2.157, 2026-11-18, #342): UNION(VALUES(Opp[Rank]),
+            # VALUES(Opp[Name])) is a String column Opp[Rank],
+            # UNION(VALUES(Opp[When]), VALUES(Opp[Rank])) a Double column
+            # Opp[When], UNION(VALUES(Opp[Flag]), VALUES(Opp[Rank])) an Int64
+            # column Opp[Flag]
+            col['type'], col['type_source'] = held, 'values'
+        elif mapped is not None:
             col['type'], col['type_source'] = mapped, 'model'
         elif j in static and (t is None or not cells):
             # a model column's code is read off its table's cells: 'values'
@@ -985,6 +1000,10 @@ def _run_one(eng, de, ctx, slot: str, ev: Evaluate, column_types: dict, text: st
     out['columns_known'] = bool(cells) or schema is not None
     return out
 
+
+# a result column type's kind of value: a model type is kept unless its column holds another kind
+_KIND_OF_TYPE = {'Text': 'text', 'Integer': 'number', 'Double': 'number', 'Decimal': 'number', 'Boolean': 'bool',
+                 'DateTime': 'date'}
 
 # _static_type's codes -> the result column types
 _STATIC_TYPE_NAMES = {'I': 'Integer', 'D': 'Double', 'C': 'Decimal', 'S': 'Text', 'L': 'Boolean',
