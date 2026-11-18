@@ -483,14 +483,20 @@ def _read_lines(units: str) -> list[str]:
 
 @dataclass
 class _Node:
-    """What the duplicate and verbatim checks need: names to compare, children, verbatim text."""
-    kind: str = "expr"           # expr, record, verbatim, or a duplicate kind's scope
+    """A node of the tree: what the duplicate and verbatim checks need (names, children, verbatim text), each expression's
+    range in the text (its first token's start to its last token's end), and what Applied Steps reads of a step."""
+    kind: str = "expr"           # expr, let, record, verbatim, identifier, field, element, constant, parens, implicit, ...
     dup: Optional[str] = None    # parameter, local, field, member
     names: list = field(default_factory=list)   # (name, start, end) of each name's first token
     children: list = field(default_factory=list)
     verbatim: Optional[str] = None
     start: int = 0
     end: int = 0
+    ranged: bool = False         # start and end are set
+    target: Optional["_Node"] = None   # a field or item access's target
+    key: Optional["_Node"] = None      # an item access's key
+    ident: Optional[str] = None        # an identifier's name
+    inclusive: bool = False            # an identifier written @name
 
 
 class _Reader:
@@ -635,7 +641,17 @@ class _Reader:
         return self.literal()
 
     # expressions
+    def ranged(self, node: _Node, first: int) -> _Node:
+        """``node`` covering the tokens from ``first`` to the last one read, unless it has its range already."""
+        if not node.ranged and self.pos > first:
+            node.start, node.end, node.ranged = self.toks[first].start, self.toks[self.pos - 1].end, True
+        return node
+
     def expression(self) -> _Node:
+        first = self.pos
+        return self.ranged(self.expression_inner(), first)
+
+    def expression_inner(self) -> _Node:
         if self.depth > _MAX_DEPTH:
             self.error_at(self.pos, _TOO_DEEP)
         self.depth += 1
@@ -898,24 +914,25 @@ class _Reader:
 
     # primaries
     def primary(self) -> _Node:
+        first = self.pos
         node = self.simple()
         while True:
             if self.cur == "(":
-                node = self.invocation(node)
+                node = self.ranged(self.invocation(node), first)
             elif self.cur == "[":
-                node = self.field_access(node)
+                node = self.ranged(self.field_access(node), first)
             elif self.cur == "{":
                 self.expect("{")
                 key = self.expression()
                 self.expect("}")
                 if self.cur == "?":
                     self.read()
-                node = _Node(children=[node, key])
+                node = self.ranged(_Node(kind="element", children=[node, key], target=node, key=key), first)
             else:
                 return node
 
     def invocation(self, target: _Node) -> _Node:
-        node = _Node(children=[target])
+        node = _Node(kind="invoke", children=[target], target=target)
         self.expect("(")
         if self.cur != ")":
             while True:
@@ -931,7 +948,8 @@ class _Reader:
         return self.cur == "[" and self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == "["
 
     def field_access(self, target: _Node) -> _Node:
-        if self.is_field_projection():
+        kind = "projection" if self.is_field_projection() else "field"
+        if kind == "projection":
             self.expect("[")
             while True:
                 last = self.pos
@@ -948,7 +966,7 @@ class _Reader:
             self.expect("]")
         if self.cur == "?":
             self.read()
-        return _Node(children=[target])
+        return _Node(kind=kind, children=[target], target=target)
 
     def is_field_selection(self) -> bool:
         save = self.pos
@@ -965,43 +983,47 @@ class _Reader:
         return result
 
     def simple(self) -> _Node:
+        first = self.pos
+        return self.ranged(self.simple_inner(), first)
+
+    def simple_inner(self) -> _Node:
         kind = self.cur
         if kind == "@":
             self.read()
-            self.identifier()
-            return _Node()
+            return _Node(kind="identifier", ident=self.identifier()[0], inclusive=True)
         if kind == IDENTIFIER:
-            self.identifier()
+            name = self.identifier()[0]
             if self.try_read("!"):
                 self.identifier()
-            return _Node()
+                return _Node(kind="section_identifier")
+            return _Node(kind="identifier", ident=name)
         if kind == "(":
             self.expect("(")
             inner = self.expression()
             self.expect(")")
-            return _Node(children=[inner])
+            return _Node(kind="parens", children=[inner])
         if kind == "[":
             if self.is_field_selection():
-                return _Node()
+                return _Node(kind="implicit")   # _, read by the field access that follows
             return self.record()
         if kind == "{":
             return self.list_()
         if kind in ("...", "#shared", "#sections"):
             self.read()
-            return _Node()
+            return _Node(kind=kind)
         if kind == VERBATIM:
             start = self.toks[self.read()].start
             lit = self.pos
             self.literal()
             value = _string_value(self.tok_text(lit)) if self.tok_text(lit).startswith('"') else None
-            return _Node(kind="verbatim", verbatim=value, start=start, end=self.toks[lit].end)
+            return _Node(kind="verbatim", verbatim=value, start=start, end=self.toks[lit].end, ranged=True)
         return self.literal()
 
     def literal(self) -> _Node:
         i = self.expect(LITERAL)
         if not _literal_valid(self.tok_text(i)):
             self.error_at(i, _INVALID_LITERAL)
-        return _Node()
+        return _Node(kind="constant", start=self.toks[i].start, end=self.toks[i].end, ranged=True)
 
     def record(self) -> _Node:
         self.expect("[")
@@ -1187,3 +1209,154 @@ def _quoted(text: str) -> str:
         else:
             out.append(ch)
     return '"' + "".join(out) + '"'
+
+
+# --- Applied Steps -------------------------------------------------------------------------------------------
+
+@dataclass
+class Step:
+    """One applied step, as Power Query's editor lists it. Offsets are UTF-16 code units into the query's text."""
+    name: str                     # the variable's name, unescaped (#"Changed Type" -> Changed Type)
+    name_start: int
+    name_end: int
+    text: str                     # the step's expression as written; for a verbatim literal step, the text it holds
+    start: int                    # the expression's range in the query's text
+    end: int
+    description: str              # its leading comments (\r\n between them), "" for none
+    error: Optional[SourceError]  # the parse error of a verbatim literal step's text (the error icon), else None
+    navigation: bool              # the step shown for the run of navigation steps after the source, under its name
+    hidden: bool                  # an earlier step of that run: not listed
+
+
+@dataclass
+class QuerySteps:
+    """A query's applied steps, or none (``has_steps`` false: the list shows one item named after the query)."""
+    has_steps: bool
+    steps: list
+    selected: int                 # the step a query opens on: the first with an error, else the last; -1 with none
+    error: Optional[SourceError] = None   # with no steps, the one item's error: the text's own parse error
+
+
+def _to_text(units: str) -> str:
+    return units.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
+_NET_TRIM = set("\t\n\x0b\x0c\r \x85\xa0")
+
+
+def _net_trim(s: str) -> str:
+    """Trim as .NET's String.Trim does: its white space (not Python's, which also strips U+001C-U+001F)."""
+    def ws(c: str) -> bool:
+        return c in _NET_TRIM or unicodedata.category(c) in ("Zs", "Zl", "Zp")
+    a, b = 0, len(s)
+    while a < b and ws(s[a]):
+        a += 1
+    while b > a and ws(s[b - 1]):
+        b -= 1
+    return s[a:b]
+
+
+def _comment_text(comment: str) -> str:
+    """A comment's description text: ``//`` stripped and trimmed; a ``/* */`` comment's lines (split at CRLF) trimmed."""
+    if comment.startswith("//"):
+        return _net_trim(comment[2:])
+    if comment.startswith("/*") and comment.endswith("*/") and len(comment) >= 4:
+        return "\r\n".join(_net_trim(line) for line in comment[2:-2].split("\r\n"))
+    return ""
+
+
+def _leading_comment(toks: list, name_start: int, units: str) -> str:
+    """The comments directly before a step's name: back over whitespace and comments only, nearest last."""
+    at = next((k for k, t in enumerate(toks) if t.start == name_start and t.kind != BOF), None)
+    if at is None:
+        return ""
+    parts: list[str] = []
+    for t in reversed(toks[1:at]):
+        if t.kind != WHITESPACE:
+            break
+        piece = units[t.start:t.end]
+        if piece.startswith("/"):
+            parts.insert(0, _comment_text(piece))
+    return "\r\n".join(parts)
+
+
+def _is_navigation(node: _Node) -> bool:
+    """A navigation step: X{[k = v, ...]}[F] or X{constant}[F] with X a name, X[F] with X a name, or _{constant}."""
+    if node.kind == "field":
+        t = node.target
+        if t is not None and t.kind == "element":
+            return t.target is not None and t.target.kind == "identifier" and t.key is not None \
+                and t.key.kind in ("record", "constant")
+        return t is not None and t.kind == "identifier"
+    if node.kind == "element":
+        return node.key is not None and node.key.kind == "constant"
+    return False
+
+
+def query_steps(text: str) -> QuerySteps:
+    """The applied steps Power Query's editor lists for a query's text.
+
+    Only a ``let`` with at least one variable whose body is a plain name naming its last variable has steps; each is a
+    variable, in order. From the second step, a run of navigation steps shows as its last one, under the query's
+    navigation step name; the earlier ones are hidden. A step holding a verbatim literal ``#!"..."`` shows the text it
+    holds, with that text's parse error. The query opens on its first step with an error, else its last. A step is
+    looked up by name, so of two variables with one name the first answers for both (text, error, description).
+    With no steps, ``error`` is the one item's: the text's parse error, or a verbatim literal's text's.
+    Raises ``NoCheckResult`` where Power Query's editor gets no answer (a verbatim literal holding anything but text).
+    """
+    units = _utf16(text)
+    found, root = _read(units)
+    if found is not None:   # stored as a verbatim literal: one item, with the text's error
+        return QuerySteps(False, [], -1, _source_error(units, found.message, found.start, found.end))
+    if root.kind == "verbatim":
+        return QuerySteps(False, [], -1, _verbatim_error(root))
+    if root.kind != "let" or not root.names or not _has_parts(root):
+        return QuerySteps(False, [], -1)
+    toks = tokenize(units)
+    # A step is looked up by its name, the first variable of that name answering for every one of them
+    first_of: dict[str, int] = {}
+    for k, (name, _s, _e) in enumerate(root.names):
+        first_of.setdefault(name, k)
+    values = [root.children[first_of[name]] for name, _s, _e in root.names]
+    nav_end = len(values) - 1
+    for k in range(1, len(values)):
+        if not _is_navigation(values[k]):
+            nav_end = k - 1
+            break
+    steps = []
+    for k, ((name, name_start, name_end), value) in enumerate(zip(root.names, values)):
+        error = None
+        if value.kind == "verbatim":
+            step_text = _to_text(value.verbatim) if value.verbatim is not None else ""
+            error = _verbatim_error(value)
+        else:
+            step_text = _to_text(units[value.start:value.end])
+        named = root.names[first_of[name]]
+        steps.append(Step(
+            name=_to_text(name), name_start=name_start, name_end=name_end, text=step_text,
+            start=value.start, end=value.end,
+            description=_to_text(_leading_comment(toks, named[1], units)),
+            error=error,
+            navigation=k == nav_end and k != 0,
+            hidden=0 < k < nav_end,
+        ))
+    first_error = next((k for k, s in enumerate(steps) if s.error is not None), None)
+    chosen = first_error if first_error is not None else len(steps) - 1
+    return QuerySteps(True, steps, first_of[root.names[chosen][0]])   # selected by name too
+
+
+def _has_parts(root: _Node) -> bool:
+    """A let whose body is a plain (not @) name naming its last variable."""
+    body = root.children[-1]
+    return body.kind == "identifier" and not body.inclusive and body.ident == root.names[-1][0]
+
+
+def _verbatim_error(node: _Node) -> Optional[SourceError]:
+    """A verbatim literal's text's first parse error, or None. One holding anything but text has no text at all: Power
+    Query's editor fails outright (NoCheckResult)."""
+    if node.verbatim is None:
+        raise NoCheckResult("a verbatim literal holds a value that isn't text")
+    inner_found, _ = _read(node.verbatim)
+    if inner_found is None:
+        return None
+    return _source_error(node.verbatim, inner_found.message, inner_found.start, inner_found.end)
