@@ -26,6 +26,12 @@ Measured on a synthetic model over Desktop's loopback connection (EVALUATE only)
 - A measure whose text is not DAX (`1 +* 2`, `1 2`, `1 +`) answered 1, BLANK and 1. Desktop keeps it and compiles it as `SYNTAXERROR`: any query touching it, or a measure using it, fails with `MdxScript(Model) (1, 1) Failed to resolve name 'SYNTAXERROR'. It is not a valid table, variable, or function name.`; IFERROR catches it. The check is the query route's syntax recogniser; all 426 measures of 50 public samples pass it. A `dt"..."` literal is not checked.
 - `'T'[Measure]` where T is in no `tables` and the measure's home is unknown leaked a `(table, name)` marker, a silent BLANK: it is now the measure when the model names T (or there is no column list), an error otherwise; a column of T by that name stays the column.
 
+### Fixed — CALCULATE's filters compare types as Desktop does (Power BI Desktop 2.157, 2026-11-18)
+
+- `CALCULATE(..., T[c] IN <set>)` with a set of another type than the column is `Function 'CONTAINSROW' does not support comparing values of type <the set's> with values of type <the column's>. ...`, which IFERROR around the CALCULATE does not catch; KEEPFILTERS, NOT and CALCULATETABLE alike (`Opp[Rank] IN {1, "a"}`, `Opp[Name] IN {1}`, `Opp[Flag] IN {"a"}`). It answered as if each value compared. A date column against numbers compares them as date serials (`Opp[When] IN {46027}` keeps 2026-01-05; it kept nothing); a serial past any date matches nothing.
+- `CALCULATE(..., T[c] = <value>)` of text against a number is `DAX comparison operations do not support comparing values of type Text with values of type Integer. ...` (measured for `=`). It answered BLANK.
+- IN: TRUE / FALSE against text is CONTAINSROW's error (`TRUE() IN {"a"}`); a UNION mixing text with other values is a Text column, as a constructor is (`"a" IN UNION({1}, {"a"})` TRUE, `1 IN` the error). A model's own dates (`DAXDateTime`) are checked as dates.
+
 ### Fixed — answers that were silently wrong, measured on Power BI Desktop 2.157
 
 Every case was run in Power BI Desktop 2.157 (2026-11-12 and 2026-11-17) against its own engine over its loopback connection: on Microsoft's MIT sample `2026 Power BI Samples Revamp/Revenue Opportunities.pbix`, and on a synthetic model with a table holding no rows. On the second batch's 42 queries the engine matched Desktop on 9 before this change and on all 42 after it. Black-box observation only.

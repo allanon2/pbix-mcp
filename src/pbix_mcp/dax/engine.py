@@ -2449,6 +2449,42 @@ def _bool_number_clash(a, b, fn: Optional[str] = None) -> None:
         + ". Consider using the VALUE or FORMAT function to convert one of the values.")
 
 
+_TEXT_TABLE_HEAD_RE = re.compile(r'(?is)^\s*(?:\{|UNION\s*\()')
+
+
+def _in_text_column(values: list, table_text: str = '') -> list:
+    """IN's table as one column: a constructor's or UNION's text beside
+    values of other kinds makes a Text column, each of them as `&` writes it
+    (_ctor_text_columns). Power BI Desktop 2.157 (2026-11-18): {1, "a"},
+    UNION({1}, {"a"}) and UNION(VALUES(Opp[Rank]), VALUES(Opp[Name])) are
+    String columns ("1", "a"); "a" IN each is TRUE, 1 IN each "Function
+    'CONTAINSROW' does not support comparing values of type Text with values
+    of type Integer.". Any other table of mixed kinds (an expression's
+    Variant column) is not measured and compares as before."""
+    if not _TEXT_TABLE_HEAD_RE.match(table_text):
+        return values
+    if any(isinstance(v, str) for v in values) and any(
+            v is not None and not isinstance(v, str) for v in values):
+        return [v if v is None or isinstance(v, str) else _concat_str(v) for v in values]
+    return values
+
+
+def _kind_type_name(v) -> str:
+    """Desktop's name for a value's type in a comparison error, by kind (a
+    model's dates are DAXDateTime, a datetime subclass)."""
+    if isinstance(v, bool):
+        return 'True/False'
+    if isinstance(v, str):
+        return 'Text'
+    if isinstance(v, (datetime, date)):
+        return 'Date'
+    if isinstance(v, _Currency):
+        return 'Currency'
+    if isinstance(v, float):
+        return 'Number'
+    return 'Integer'
+
+
 def _in_kind(v) -> str:
     """The kind of value a table column holds, for IN's type check:
     numbers of any kind are one kind (_containsrow_clash)."""
@@ -2458,10 +2494,11 @@ def _in_kind(v) -> str:
         return 'number'
     if isinstance(v, (datetime, date)):
         return 'date'
+    if isinstance(v, str):
+        return 'text'
     return type(v).__name__
 
 
-_CONTAINSROW_TYPE_NAMES = {**_CMP_TYPE_NAMES, str: 'Text', datetime: 'Date', date: 'Date'}
 
 
 def _containsrow_clash(hay, needle) -> None:
@@ -2473,27 +2510,16 @@ def _containsrow_clash(hay, needle) -> None:
     against a number, "... values of type Integer with values of type
     True/False. ..." (TRUE() IN {1}); a date against text, "... values of
     type Text with values of type Date. ..." (DATE(2026,1,5) IN
-    {"1/5/2026"}). Numbers of any kind compare; a date against a number,
-    and TRUE / FALSE against text, are not measured and compare as
-    before."""
-    th, tn = type(hay), type(needle)
-    if th is tn:
+    {"1/5/2026"}); TRUE / FALSE against text, "... values of type Text with
+    values of type True/False. ..." (TRUE() IN {"a"}, #340). Numbers of any
+    kind compare, and so does a date against a number (DATE(2026,1,5) IN
+    {46027} is TRUE, #340)."""
+    kinds = [_in_kind(hay), _in_kind(needle)]
+    if any(k not in ('text', 'bool', 'number', 'date') for k in kinds):
         return
-    kinds = []
-    for t in (th, tn):
-        if t is str:
-            kinds.append('text')
-        elif t is bool:
-            kinds.append('bool')
-        elif t in (int, float, _Currency):
-            kinds.append('number')
-        elif t is datetime or t is date:
-            kinds.append('date')
-        else:
-            return
-    if kinds[0] == kinds[1] or set(kinds) in ({'date', 'number'}, {'bool', 'text'}):
+    if kinds[0] == kinds[1] or set(kinds) == {'date', 'number'}:
         return
-    names = [_CONTAINSROW_TYPE_NAMES[t] for t in (th, tn)]
+    names = [_kind_type_name(v) for v in (hay, needle)]
     raise _DAXEvaluationError(
         f"Function 'CONTAINSROW' does not support comparing values of type {names[0]} with values of "
         f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values.")
@@ -13934,18 +13960,11 @@ class DAXEngine:
         # "... Integer with values of type Text ..."; both answered TRUE or
         # FALSE. TRUE / FALSE against a number as before (#279), in 2.157's
         # words.
-        rt = right.strip()
-        if rt.startswith('{') and any(isinstance(v, str) for v in values):
-            # a constructor's text beside other values is a Text column
-            # (_ctor_text_columns): "a" IN {1, "a"} is TRUE, 1 IN {1, "a"}
-            # compares Text with Integer (Desktop 2.157, 2026-11-18). Here,
-            # not in _in_set_values: CALCULATE's filter route reads that too,
-            # and keeps its own comparison (not measured)
-            values = [v if v is None or isinstance(v, str) else _concat_str(v) for v in values]
-        # the check runs on a table of one kind of value (a constructor's is,
-        # unified above); a table of mixed kinds (UNION({1}, {"a"}), a
-        # Variant) compares as before: its column's type is not measured.
-        # One value of each type stands for the rest.
+        values = _in_text_column(values, right)
+        # the check runs on a table of one kind of value (a constructor's or
+        # UNION's text beside other kinds was made Text above); a table of
+        # mixed kinds compares as before (not measured). One value of each
+        # kind stands for the rest.
         kinds = {}
         for v in values:
             if v is not None:
@@ -18921,6 +18940,8 @@ class DAXEngine:
 
         if kind == 'cmp':
             val = self._eval_expr(val_text, ctx, var_scope)
+            if op == '=' and val is not None:
+                self._filter_cmp_clash(tbl, col, val, ctx)
             if negate:
                 op = {'=': '<>', '<>': '=', '>': '<=', '<=': '>',
                       '>=': '<', '<': '>='}[op]
@@ -18948,8 +18969,93 @@ class DAXEngine:
         vals = self._in_set_values(val_text, ctx, var_scope)
         if vals is None:
             return ()
+        vals = self._filter_in_values(tbl, col, vals, ctx, val_text)
         key = ctx.model_key(tbl, col)
         return (key, {"not_in" if negate else "in": vals}, keep)
+
+    @staticmethod
+    def _column_sample(tbl: str, col: str, ctx: DAXContext):
+        """A value standing for the model column ``tbl[col]``'s type, when
+        every value not BLANK is of one kind (_in_kind), else None: a filter's
+        type check needs the column's one type, and a column of mixed kinds
+        (none in a model, but a caller's tables may hold one) is not checked.
+        Memoized per model (_shield_cache: it reads no filter)."""
+        cache = ctx._shield_cache
+        key = ('column-sample', tbl, col)
+        if key in cache:
+            return cache[key]
+        sample = None
+        t = ctx.tables.get(tbl)
+        i = ctx._find_col_idx(t['columns'], col) if t is not None else -1
+        if i >= 0:
+            kind = None
+            for r in t.get('rows') or ():
+                v = r[i] if i < len(r) else None
+                if v is None:
+                    continue
+                k = _in_kind(v)
+                if kind is None:
+                    kind, sample = k, v
+                elif k != kind:
+                    sample = None
+                    break
+        cache[key] = sample
+        return sample
+
+    def _filter_in_values(self, tbl: str, col: str, vals: list, ctx: DAXContext,
+                          table_text: str = '') -> list:
+        """A CALCULATE filter's ``T[c] IN <table>`` set, checked as Desktop
+        checks it before anything runs. Power BI Desktop 2.157 (2026-11-18,
+        #340): a set of another type than the column is "Function
+        'CONTAINSROW' does not support comparing values of type <the set's>
+        with values of type <the column's>. ...", which IFERROR around the
+        CALCULATE does not catch (Opp[Rank] IN {1, "a"}, Opp[Name] IN {1},
+        Opp[Flag] IN {"a"}; KEEPFILTERS, NOT and CALCULATETABLE alike); it
+        answered as if each value compared. A date column against numbers
+        compares the numbers as date serials (Opp[When] IN {46027} keeps
+        2026-01-05; it kept nothing)."""
+        vals = _in_text_column(vals, table_text)
+        sample = self._column_sample(tbl, col, ctx)
+        if sample is None:
+            return vals
+        kinds = {}
+        for v in vals:
+            if v is not None:
+                kinds.setdefault(_in_kind(v), v)
+        if len(kinds) == 1:
+            try:
+                _containsrow_clash(next(iter(kinds.values())), sample)
+            except _DAXEvaluationError as e:
+                raise _uncatchable(e)
+            if _in_kind(sample) == 'date' and 'number' in kinds:
+                out = []
+                for v in vals:
+                    if v is not None and _in_kind(v) == 'number':
+                        try:
+                            v = _DAX_EPOCH_DT + timedelta(days=float(v))
+                        except (OverflowError, ValueError):
+                            continue        # no date: matches nothing, as FILTER's route
+                    out.append(v)
+                return out
+        return vals
+
+    def _filter_cmp_clash(self, tbl: str, col: str, val, ctx: DAXContext) -> None:
+        """A CALCULATE filter's ``T[c] = <value>`` of text against a number,
+        checked before anything runs. Power BI Desktop 2.157 (2026-11-18,
+        #340): CALCULATE([Total], Opp[Name] = 1) is "DAX comparison
+        operations do not support comparing values of type Text with values
+        of type Integer. ...", the column's type first; it answered BLANK.
+        Measured for = alone: the other operators compare as before."""
+        sample = self._column_sample(tbl, col, ctx)
+        if sample is None:
+            return
+        kinds = {_in_kind(sample), _in_kind(val)}
+        if kinds != {'text', 'number'}:
+            return
+        names = [_kind_type_name(v) for v in (sample, val)]
+        raise _uncatchable(_DAXEvaluationError(
+            f"DAX comparison operations do not support comparing values of type {names[0]} with values of "
+            f"type {names[1]}. Consider using the VALUE or FORMAT function to convert one of the values."))
 
     def _strip_parens(self, s: str) -> str:
         """``s`` without parentheses that wrap the whole of it."""
