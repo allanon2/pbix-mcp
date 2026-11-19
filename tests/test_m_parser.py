@@ -49,6 +49,7 @@ class TestTokens:
     def test_numbers(self):
         assert parse_expression("{0xff, 12, 1.5, .5, 1e3, 2E-2}").items == [
             num(255), num(12), num(1.5), num(0.5), num(1000.0), num(0.02)]
+        # the evaluator's convention (the old lexer's): a whole decimal or hexadecimal number an int, else a float
         assert type(parse_expression("12").value) is int and type(parse_expression("1e3").value) is float
 
     def test_every_space_separator_is_whitespace(self):
@@ -58,7 +59,8 @@ class TestTokens:
     def test_comments(self):
         assert parse_expression("1 // one\n+ /* two */ 2") == ast.Binary("+", num(1), num(2))
 
-    @pytest.mark.parametrize("text", ['"abc', "/* x", '#"x', '"#(zz)"', "1d", "0x"])
+    @pytest.mark.parametrize("text", ['"abc', "/* x", '#"x', '"#(zz)"', "1d", "0x",
+                                      '"#(0000D83D)"', '"#(00110000)"'])   # LiteralValue: no surrogate, <= U+10FFFF
     def test_unterminated_and_bad_literals(self, text):
         with pytest.raises(MSyntaxError):
             parse_expression(text)
@@ -97,6 +99,25 @@ class TestParser:
             assert parse_expression(f"a {op} b {op} c") == B(B(a, b), c)
             assert parse_expression(f"a {op} b {op} c {op} d") == B(B(a, b), B(c, d))
             assert parse_expression(f"a {op} b {op} c {op} d {op} e") == B(B(B(a, b), B(c, d)), e)
+
+    def test_ampersand_ranks_with_plus_and_minus(self):
+        # DocumentReader GetPrecedence: & with + and -, below * and /, above the comparisons
+        a, b, c = I("a"), I("b"), I("c")
+        assert parse_expression("a & b * c") == ast.Binary("&", a, ast.Binary("*", b, c))
+        assert parse_expression("a & b + c") == ast.Binary("+", ast.Binary("&", a, b), c)
+        assert parse_expression("a = b & c") == ast.Binary("=", a, ast.Binary("&", b, c))
+
+    def test_as_then_is(self):
+        # DocumentReader: is reads as-expressions
+        assert parse_expression("x as number is logical") == ast.Binary(
+            "is", ast.Binary("as", I("x"), ast.PrimitiveType("number")), ast.PrimitiveType("logical"))
+
+    @pytest.mark.parametrize("text", ["(a) + b", "x & (y)", "(a) and (b) and (c)", "(a) ?? b", "(x) meta (m)",
+                                      "(x) as number", "(1) = (2) * (3)"])
+    def test_binary_ranges_cover_their_parentheses(self, text):
+        # DocumentReader TokenRange(left, right): from the left operand's first token to the right one's last
+        n = parse_expression(text)
+        assert (n.start, n.end) == (0, len(text))
 
     def test_left_associative(self):
         n = parse_expression("a - b - c")
@@ -206,6 +227,9 @@ class TestParser:
         n = parse_document('[Version = "1.0"] section Section1;\nshared A = 1;\nB = A + 1;')
         assert isinstance(n, ast.Section) and n.name == "Section1"
         assert [(m.name, m.shared) for m in n.members] == [("A", True), ("B", False)]
+        assert n.attributes == ast.RecordExpr([ast.RecordField("Version", L("text", "1.0"))])
+        m = parse_document('section S; [Doc = {1, "a"}] shared M = 1;').members[0]
+        assert m.attributes == ast.RecordExpr([ast.RecordField("Doc", ast.ListExpr([num(1), L("text", "a")]))])
 
     def test_section_access_and_inclusive_identifier(self):
         assert parse_expression("Section1!Query") == ast.SectionAccess("Section1", "Query")
@@ -215,6 +239,7 @@ class TestParser:
         assert parse_expression("null") == ast.Literal("null", None)
         assert parse_expression("true") == ast.Literal("logical", True)
         assert parse_expression('#!"x"') == ast.Literal("verbatim", "x")
+        assert parse_expression("#!1") == ast.Literal("verbatim", None)   # read; the evaluator refuses any verbatim
         assert isinstance(parse_expression("..."), ast.NotImplementedExpr)
 
     def test_spans(self):

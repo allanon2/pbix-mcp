@@ -835,15 +835,25 @@ class _Reader:
         finally:
             self.pos = save
 
+    def spanned(self, read) -> tuple[_Node, tuple]:
+        """``read()``'s node, with its tree and its tokens' range (parentheses included)."""
+        first = self.pos
+        node = read()
+        return node, (node.tree, self.toks[first].start, self.toks[self.pos - 1].end)
+
     def chain(self, op: str, operand) -> _Node:
         """``operand (op operand)*``, as a balanced tree."""
-        node = _Node(children=[operand()])
+        first, span = self.spanned(operand)
+        node = _Node(children=[first])
+        spans = [span]
         while self.cur == op:
             self.read()
-            node.children.append(operand())
+            child, span = self.spanned(operand)
+            node.children.append(child)
+            spans.append(span)
         if len(node.children) == 1:
             return node.children[0]
-        node.tree = _balanced([c.tree for c in node.children], op)
+        node.tree = _balanced(spans, op)[0]
         return node
 
     def coalesce(self) -> _Node:
@@ -856,19 +866,19 @@ class _Reader:
         return self.chain("and", self.is_)
 
     def is_(self) -> _Node:
-        node = self.as_()
-        while self.cur == "is":
-            self.read()
-            t = self.nullable_primitive_type()
-            node = _Node(children=[node, t], tree=_binary("is", node.tree, t.tree))
-        return node
+        return self.typed("is", self.as_)
 
     def as_(self) -> _Node:
-        node = self.equality()
-        while self.cur == "as":
+        return self.typed("as", self.equality)
+
+    def typed(self, op: str, operand) -> _Node:
+        """``operand (op nullable-primitive-type)*``, to the left."""
+        node, left = self.spanned(operand)
+        while self.cur == op:
             self.read()
-            t = self.nullable_primitive_type()
-            node = _Node(children=[node, t], tree=_binary("as", node.tree, t.tree))
+            t, right = self.spanned(self.nullable_primitive_type)
+            left = _binary(op, left, right)
+            node = _Node(children=[node, t], tree=left[0])
         return node
 
     _BINARY = frozenset({"/", "*", "&", "-", "+", ">", ">=", "<", "<=", "=", "<>"})
@@ -876,8 +886,9 @@ class _Reader:
     def equality(self) -> _Node:
         """The arithmetic, comparison and equality operators, read as Power Query does: operands and operators
         on two stacks, an operator first combining every pending one as tight or tighter (so left to right)."""
-        node = _Node(children=[self.metadata()])
-        operands = [node.children[0].tree]
+        child, span = self.spanned(self.metadata)
+        node = _Node(children=[child])
+        operands = [span]
         operators: list[str] = []
         while self.cur in self._BINARY:
             op = self.cur
@@ -886,22 +897,24 @@ class _Reader:
                 operands.append(_binary(operators.pop(), left, right))
             operators.append(op)
             self.read()
-            node.children.append(self.metadata())
-            operands.append(node.children[-1].tree)
+            child, span = self.spanned(self.metadata)
+            node.children.append(child)
+            operands.append(span)
         while operators:
             right, left = operands.pop(), operands.pop()
             operands.append(_binary(operators.pop(), left, right))
         if len(node.children) == 1:
             return node.children[0]
-        node.tree = operands[0]
+        node.tree = operands[0][0]
         return node
 
     def metadata(self) -> _Node:
-        node = self.unary()
+        node, left = self.spanned(self.unary)
         while self.cur == "meta":
             self.read()
-            right = self.unary()
-            node = _Node(children=[node, right], tree=_binary("meta", node.tree, right.tree))
+            right_node, right = self.spanned(self.unary)
+            left = _binary("meta", left, right)
+            node = _Node(children=[node, right_node], tree=left[0])
         return node
 
     def unary(self) -> _Node:
@@ -1185,11 +1198,13 @@ class _Reader:
 _PRECEDENCE = {"/": 0, "*": 0, "&": 1, "-": 1, "+": 1, ">": 2, ">=": 2, "<": 2, "<=": 2, "=": 3, "<>": 3}
 
 
-def _binary(op: str, left: ast.Node, right: ast.Node) -> ast.Binary:
-    return ast.Binary(op, left, right, start=left.start, end=right.end)
+def _binary(op: str, left: tuple, right: tuple) -> tuple:
+    """Two operands (tree, start, end) joined by ``op``: the node, and its range from the left one's first token to
+    the right one's last, parentheses included (Power Query's TokenRange)."""
+    return ast.Binary(op, left[0], right[0], start=left[1], end=right[2]), left[1], right[2]
 
 
-def _balanced(operands: list, op: str) -> ast.Node:
+def _balanced(operands: list, op: str) -> tuple:
     """``a op b op c op d`` as Power Query's reader builds it: neighbours paired, level by level, an odd one out
     carried up: ``(a op b) op (c op d)``; ``a op b op c`` is ``(a op b) op c``."""
     level = list(operands)
