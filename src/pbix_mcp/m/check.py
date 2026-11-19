@@ -21,8 +21,10 @@ Messages are Power Query's English texts. Positions are offsets in UTF-16 code u
 the editor counts), with 0-based rows and columns; a row ends after ``\\n``, or after a
 ``\\r`` not followed by ``\\n``.
 
-This reader is separate from ``parser``: it only answers the editor's questions, token for
-token as Power Query reads, and builds no tree for evaluation.
+The same reader builds the tree the evaluator runs (``parse_document``, ``parse_expression``):
+``pbix_mcp.m.ast`` nodes, shaped as Power Query's reader shapes them (``and``, ``or`` and ``??``
+chains as balanced trees, the other binary operators by precedence, left to right), with offsets
+into the text as Python indexes.
 """
 from __future__ import annotations
 
@@ -30,6 +32,19 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
+
+from . import ast
+
+class MSyntaxError(ValueError):
+    """Text that isn't M, with Power Query's message. ``offset`` is where in the text (a Python index) the first
+    token it couldn't read starts; ``line`` and ``column`` count from 1."""
+
+    def __init__(self, message: str, text: str, offset: int):
+        line = text.count("\n", 0, offset) + 1
+        column = offset - (text.rfind("\n", 0, offset) + 1) + 1
+        super().__init__(f"{message} (line {line}, column {column})")
+        self.message, self.offset, self.line, self.column = message, offset, line, column
+
 
 # --- messages ------------------------------------------------------------------------
 
@@ -497,6 +512,7 @@ class _Node:
     key: Optional["_Node"] = None      # an item access's key
     ident: Optional[str] = None        # an identifier's name
     inclusive: bool = False            # an identifier written @name
+    tree: Optional[ast.Node] = None    # the evaluator's node (offsets in UTF-16 code units until parse_document)
 
 
 class _Reader:
@@ -538,6 +554,13 @@ class _Reader:
             return False
         self.read()
         return True
+
+    def mk(self, cls, first: int, *args, **kwargs):
+        """An evaluator node over the tokens from ``first`` to the last one read."""
+        n = cls(*args, **kwargs)
+        n.start = self.toks[first].start
+        n.end = self.toks[self.pos - 1].end if self.pos > first else n.start
+        return n
 
     def identifier(self) -> tuple[str, int, int]:
         i = self.expect(IDENTIFIER)
@@ -582,12 +605,17 @@ class _Reader:
         return node
 
     def section(self) -> _Node:
+        first = self.pos
         node = _Node(kind="section", dup="member")
+        attributes = None
         if self.cur == "[":
-            node.children.append(self.constant_record())
+            record = self.constant_record()
+            node.children.append(record)
+            attributes = record.tree
         self.expect("section")
-        self.identifier()
+        section_name = self.identifier()[0]
         self.expect(";")
+        members = []
         last = None
         while last != self.pos:
             last = self.pos
@@ -598,36 +626,43 @@ class _Reader:
                 break
             if self.cur == EOF:
                 break
-            self.try_read("shared")
+            shared = self.try_read("shared")
             name = self.identifier()
             self.expect("=")
             value = self.expression()
             self.expect(";")
             node.names.append(name)
             node.children.append(value)   # aligned with names; a constant attribute holds nothing to check
+            members.append(self.mk(ast.SectionMember, save, _to_text(name[0]), value.tree, shared,
+                                   None if attribute is None else attribute.tree))
         node.kind = "section"
+        node.tree = self.mk(ast.Section, first, _to_text(section_name), members, attributes)
         return node
 
     def constant_record(self) -> _Node:
-        self.expect("[")
+        first = self.expect("[")
         seen = set()
         last = None
         node = _Node()
+        fields = []
         while self.cur not in ("]", EOF) and last != self.pos:
             last = self.pos
             name = self.field_identifier()
             self.expect("=")
-            node.children.append(self.constant_expression())
+            value = self.constant_expression()
+            node.children.append(value)
+            fields.append(self.mk(ast.RecordField, last, _to_text(name[0]), value.tree))
             if name[0] in seen:
                 self.error_at(self.pos, _DUPLICATE_CONSTANT_FIELD.format(name[0]))
             seen.add(name[0])
             self.separator("]")
         self.expect("]")
+        node.tree = self.mk(ast.RecordExpr, first, fields)
         return node
 
     def constant_expression(self) -> _Node:
         if self.cur == "{":
-            self.expect("{")
+            first = self.expect("{")
             last = None
             node = _Node()
             while self.cur not in ("}", EOF) and last != self.pos:
@@ -635,6 +670,7 @@ class _Reader:
                 node.children.append(self.constant_expression())
                 self.separator("}")
             self.expect("}")
+            node.tree = self.mk(ast.ListExpr, first, [c.tree for c in node.children])
             return node
         if self.cur == "[":
             return self.constant_record()
@@ -656,13 +692,18 @@ class _Reader:
             self.error_at(self.pos, _TOO_DEEP)
         self.depth += 1
         try:
+            first = self.pos
             kind = self.cur
             if kind == "error":
                 self.read()
-                return _Node(children=[self.expression()])
+                value = self.expression()
+                return _Node(children=[value], tree=self.mk(ast.ErrorRaise, first, value.tree))
             if kind == "each":
                 self.read()
-                return _Node(children=[self.expression()])
+                body = self.expression()
+                at = self.toks[first].start
+                param = ast.Parameter("_", start=at, end=at)
+                return _Node(children=[body], tree=self.mk(ast.Function, first, [param], None, body.tree, each_=True))
             if kind == "(":
                 return self.function() if self.is_function() else self.coalesce()
             if kind == "let":
@@ -673,7 +714,8 @@ class _Reader:
                 self.expect("then")
                 b = self.expression()
                 self.expect("else")
-                return _Node(children=[a, b, self.expression()])
+                c = self.expression()
+                return _Node(children=[a, b, c], tree=self.mk(ast.If, first, a.tree, b.tree, c.tree))
             if kind == "try":
                 return self.try_()
             return self.coalesce()
@@ -681,49 +723,59 @@ class _Reader:
             self.depth -= 1
 
     def let(self) -> _Node:
-        self.expect("let")
+        first = self.expect("let")
         node = _Node(kind="let", dup="local")
+        bindings = []
         last = None
         while self.cur not in ("in", EOF) and last != self.pos:
             last = self.pos
             name = self.identifier()
             self.expect("=")
+            value = self.expression()
             node.names.append(name)
-            node.children.append(self.expression())
+            node.children.append(value)
+            bindings.append(self.mk(ast.Binding, last, _to_text(name[0]), value.tree))
             self.separator("in")
         self.expect("in")
-        node.children.append(self.expression())
+        body = self.expression()
+        node.children.append(body)
+        node.tree = self.mk(ast.Let, first, bindings, body.tree)
         return node
 
     def try_(self) -> _Node:
-        self.expect("try")
+        first = self.expect("try")
         protected = self.expression()
         if self.cur == "otherwise":
             self.read()
-            return _Node(children=[protected, self.expression()])
+            other = self.expression()
+            return _Node(children=[protected, other], tree=self.mk(ast.Try, first, protected.tree, otherwise=other.tree))
         if self.cur_is_word("catch"):
             self.read()
             params, min_count, has_return, body = self.function_parts()
             if len(params) > 1 or len(params) != min_count or has_return or len(params) == 1 and params[0][3]:
                 self.error_at(self.pos, _BAD_CATCH)
-            return _Node(children=[protected, body])
-        return _Node(children=[protected])
+            return _Node(children=[protected, body], tree=self.mk(ast.Try, first, protected.tree, catch=body.tree))
+        return _Node(children=[protected], tree=self.mk(ast.Try, first, protected.tree))
 
     def function_parts(self):
-        """``(params) [as type] => body``: the parameters (name, start, end, typed), required count, body."""
-        params, min_count, type_nodes = self.function_type_parameters(explicit=False)
+        """``(params) [as type] => body``: the parameters (name, start, end, typed), required count, whether a return
+        type is given, and the function's node."""
+        first = self.pos
+        params, min_count, type_nodes, parameters = self.function_type_parameters(explicit=False)
         has_return = self.return_type(required=False, into=type_nodes)
+        return_type = type_nodes[-1].tree if has_return else None
         self.expect("=>")
         body = self.expression()
-        return params, min_count, has_return, _Node(dup="parameter", names=[p[:3] for p in params],
-                                                       children=type_nodes + [body])
+        node = _Node(dup="parameter", names=[p[:3] for p in params], children=type_nodes + [body],
+                     tree=self.mk(ast.Function, first, parameters, return_type, body.tree))
+        return params, min_count, has_return, node
 
     def function(self) -> _Node:
         return self.function_parts()[3]
 
     def function_type_parameters(self, explicit: bool):
         self.expect("(")
-        params, type_nodes = [], []
+        params, type_nodes, parameters = [], [], []
         optional_seen = 0
         min_count = 0
         if self.cur != ")":
@@ -742,11 +794,13 @@ class _Reader:
                 else:
                     optional_seen += 1
                 params.append((name[0], name[1], name[2], typed))
+                parameters.append(self.mk(ast.Parameter, last, _to_text(name[0]),
+                                          type_nodes[-1].tree if typed else None, not required))
                 self.separator(")")
                 if self.cur in (")", EOF) or last == self.pos:
                     break
         self.expect(")")
-        return params, min_count, type_nodes
+        return params, min_count, type_nodes, parameters
 
     def _token_index_at(self, start: int) -> int:
         for k, t in enumerate(self.toks):
@@ -781,55 +835,73 @@ class _Reader:
         finally:
             self.pos = save
 
-    def coalesce(self) -> _Node:
-        node = _Node(children=[self.logical_or()])
-        while self.cur == "??":
+    def chain(self, op: str, operand) -> _Node:
+        """``operand (op operand)*``, as a balanced tree."""
+        node = _Node(children=[operand()])
+        while self.cur == op:
             self.read()
-            node.children.append(self.logical_or())
-        return node.children[0] if len(node.children) == 1 else node
+            node.children.append(operand())
+        if len(node.children) == 1:
+            return node.children[0]
+        node.tree = _balanced([c.tree for c in node.children], op)
+        return node
+
+    def coalesce(self) -> _Node:
+        return self.chain("??", self.logical_or)
 
     def logical_or(self) -> _Node:
-        node = _Node(children=[self.logical_and()])
-        while self.cur == "or":
-            self.read()
-            node.children.append(self.logical_and())
-        return node.children[0] if len(node.children) == 1 else node
+        return self.chain("or", self.logical_and)
 
     def logical_and(self) -> _Node:
-        node = _Node(children=[self.is_()])
-        while self.cur == "and":
-            self.read()
-            node.children.append(self.is_())
-        return node.children[0] if len(node.children) == 1 else node
+        return self.chain("and", self.is_)
 
     def is_(self) -> _Node:
         node = self.as_()
         while self.cur == "is":
             self.read()
-            node = _Node(children=[node, self.nullable_primitive_type()])
+            t = self.nullable_primitive_type()
+            node = _Node(children=[node, t], tree=_binary("is", node.tree, t.tree))
         return node
 
     def as_(self) -> _Node:
         node = self.equality()
         while self.cur == "as":
             self.read()
-            node = _Node(children=[node, self.nullable_primitive_type()])
+            t = self.nullable_primitive_type()
+            node = _Node(children=[node, t], tree=_binary("as", node.tree, t.tree))
         return node
 
     _BINARY = frozenset({"/", "*", "&", "-", "+", ">", ">=", "<", "<=", "=", "<>"})
 
     def equality(self) -> _Node:
+        """The arithmetic, comparison and equality operators, read as Power Query does: operands and operators
+        on two stacks, an operator first combining every pending one as tight or tighter (so left to right)."""
         node = _Node(children=[self.metadata()])
+        operands = [node.children[0].tree]
+        operators: list[str] = []
         while self.cur in self._BINARY:
+            op = self.cur
+            while operators and _PRECEDENCE[operators[-1]] <= _PRECEDENCE[op]:
+                right, left = operands.pop(), operands.pop()
+                operands.append(_binary(operators.pop(), left, right))
+            operators.append(op)
             self.read()
             node.children.append(self.metadata())
-        return node.children[0] if len(node.children) == 1 else node
+            operands.append(node.children[-1].tree)
+        while operators:
+            right, left = operands.pop(), operands.pop()
+            operands.append(_binary(operators.pop(), left, right))
+        if len(node.children) == 1:
+            return node.children[0]
+        node.tree = operands[0]
+        return node
 
     def metadata(self) -> _Node:
         node = self.unary()
         while self.cur == "meta":
             self.read()
-            node = _Node(children=[node, self.unary()])
+            right = self.unary()
+            node = _Node(children=[node, right], tree=_binary("meta", node.tree, right.tree))
         return node
 
     def unary(self) -> _Node:
@@ -837,13 +909,17 @@ class _Reader:
             self.error_at(self.pos, _TOO_DEEP)
         self.depth += 1
         try:
+            first = self.pos
             if self.cur in ("+", "-", "not"):
+                op = self.cur
                 self.read()
-                return _Node(children=[self.unary()])
+                operand = self.unary()
+                return _Node(children=[operand], tree=self.mk(ast.Unary, first, op, operand.tree))
             if self.cur == "type":
                 self.read()
                 found = self.type_constructor()
-                return _Node(children=[found if found is not None else self.primitive_type()])
+                t = found if found is not None else self.primitive_type()
+                return _Node(children=[t], tree=self.mk(ast.TypeExpr, first, t.tree))
             return self.primary()
         finally:
             self.depth -= 1
@@ -857,59 +933,84 @@ class _Reader:
         return None
 
     def primitive_type(self) -> _Node:
-        if self.try_primitive_type() is None:
+        first = self.pos
+        name = self.try_primitive_type()
+        if name is None:
             self.error_at(self.pos, _INVALID_TYPE)
-        return _Node()
+        return _Node(tree=self.mk(ast.PrimitiveType, first, name))
 
     def nullable_primitive_type(self) -> _Node:
+        first = self.pos
         if self.cur_is_word("nullable"):
             self.read()
+            inner = self.primitive_type()
+            return _Node(tree=self.mk(ast.NullableType, first, inner.tree))
         return self.primitive_type()
 
     def type_constructor(self) -> Optional[_Node]:
+        first = self.pos
         if self.cur == "[":
             return self.record_type()
         if self.cur == "{":
             self.expect("{")
             item = self.type_()
             self.expect("}")
-            return _Node(children=[item])
+            return _Node(children=[item], tree=self.mk(ast.ListType, first, item.tree))
         name = self.try_primitive_type()
         if name is not None:
             if name == "function" and self.cur == "(":
-                params, _min, type_nodes = self.function_type_parameters(explicit=True)
+                params, _min, type_nodes, parameters = self.function_type_parameters(explicit=True)
                 self.return_type(required=True, into=type_nodes)
-                return _Node(dup="parameter", names=[p[:3] for p in params], children=type_nodes)
+                return _Node(dup="parameter", names=[p[:3] for p in params], children=type_nodes,
+                             tree=self.mk(ast.FunctionType, first, parameters, type_nodes[-1].tree))
             if name == "table":
                 if self.cur == "[":
-                    return _Node(children=[self.record_type()])
+                    row = self.record_type()
+                    return _Node(children=[row], tree=self.mk(ast.TableType, first, row.tree))
                 if self.cur in (IDENTIFIER, "@", "("):
-                    return _Node(children=[self.primary()])
-            return _Node()
+                    row = self.primary()
+                    return _Node(children=[row], tree=self.mk(ast.TableType, first, row.tree))
+            return _Node(tree=self.mk(ast.PrimitiveType, first, name))
         if self.cur_is_word("nullable"):
             self.read()
-            return _Node(children=[self.type_()])
+            inner = self.type_()
+            return _Node(children=[inner], tree=self.mk(ast.NullableType, first, inner.tree))
         return None
 
     def type_(self) -> _Node:
+        first = self.pos
         found = self.type_constructor()
-        return found if found is not None else self.primary()
+        if found is not None:
+            return found
+        expr = self.primary()
+        return _Node(children=[expr], tree=self.mk(ast.ExprType, first, expr.tree))
 
     def record_type(self) -> _Node:
-        self.expect("[")
+        first = self.expect("[")
         node = _Node(dup="field")
+        specs = []
+        is_open = False
         last = None
         while self.cur not in ("]", EOF) and last != self.pos:
             last = self.pos
             if self.try_read("..."):
+                is_open = True
                 break
+            optional = False
             if self.cur_is_word("optional"):
                 self.read()
-            node.names.append(self.field_identifier())
+                optional = True
+            name = self.field_identifier()
+            node.names.append(name)
+            ftype = None
             if self.try_read("="):
-                node.children.append(self.type_())
+                t = self.type_()
+                node.children.append(t)
+                ftype = t.tree
+            specs.append(self.mk(ast.FieldSpec, last, _to_text(name[0]), ftype, optional))
             self.separator("]")
         self.expect("]")
+        node.tree = self.mk(ast.RecordType, first, specs, is_open)
         return node
 
     # primaries
@@ -918,20 +1019,20 @@ class _Reader:
         node = self.simple()
         while True:
             if self.cur == "(":
-                node = self.ranged(self.invocation(node), first)
+                node = self.ranged(self.invocation(node, first), first)
             elif self.cur == "[":
-                node = self.ranged(self.field_access(node), first)
+                node = self.ranged(self.field_access(node, first), first)
             elif self.cur == "{":
                 self.expect("{")
                 key = self.expression()
                 self.expect("}")
-                if self.cur == "?":
-                    self.read()
-                node = self.ranged(_Node(kind="element", children=[node, key], target=node, key=key), first)
+                optional = self.try_read("?")
+                node = self.ranged(_Node(kind="element", children=[node, key], target=node, key=key,
+                                         tree=self.mk(ast.ItemAccess, first, node.tree, key.tree, optional)), first)
             else:
                 return node
 
-    def invocation(self, target: _Node) -> _Node:
+    def invocation(self, target: _Node, first: int) -> _Node:
         node = _Node(kind="invoke", children=[target], target=target)
         self.expect("(")
         if self.cur != ")":
@@ -942,19 +1043,21 @@ class _Reader:
                 if self.cur in (")", EOF) or last == self.pos:
                     break
         self.expect(")")
+        node.tree = self.mk(ast.Invoke, first, target.tree, [c.tree for c in node.children[1:]])
         return node
 
     def is_field_projection(self) -> bool:
         return self.cur == "[" and self.toks[min(self.pos + 1, len(self.toks) - 1)].kind == "["
 
-    def field_access(self, target: _Node) -> _Node:
+    def field_access(self, target: _Node, first: int) -> _Node:
         kind = "projection" if self.is_field_projection() else "field"
+        names = []
         if kind == "projection":
             self.expect("[")
             while True:
                 last = self.pos
                 self.expect("[")
-                self.field_identifier()
+                names.append(_to_text(self.field_identifier()[0]))
                 self.expect("]")
                 self.separator("]")
                 if self.cur in (EOF, "]") or last == self.pos:
@@ -962,11 +1065,13 @@ class _Reader:
             self.expect("]")
         else:
             self.expect("[")
-            self.field_identifier()
+            names.append(_to_text(self.field_identifier()[0]))
             self.expect("]")
-        if self.cur == "?":
-            self.read()
-        return _Node(kind=kind, children=[target], target=target)
+        optional = self.try_read("?")
+        on = None if target.kind == "implicit" else target.tree
+        tree = self.mk(ast.FieldProjection, first, on, names, optional) if kind == "projection" \
+            else self.mk(ast.FieldAccess, first, on, names[0], optional)
+        return _Node(kind=kind, children=[target], target=target, tree=tree)
 
     def is_field_selection(self) -> bool:
         save = self.pos
@@ -987,70 +1092,136 @@ class _Reader:
         return self.ranged(self.simple_inner(), first)
 
     def simple_inner(self) -> _Node:
+        first = self.pos
         kind = self.cur
         if kind == "@":
             self.read()
-            return _Node(kind="identifier", ident=self.identifier()[0], inclusive=True)
+            name = self.identifier()[0]
+            return _Node(kind="identifier", ident=name, inclusive=True,
+                         tree=self.mk(ast.Identifier, first, _to_text(name), True))
         if kind == IDENTIFIER:
             name = self.identifier()[0]
             if self.try_read("!"):
-                self.identifier()
-                return _Node(kind="section_identifier")
-            return _Node(kind="identifier", ident=name)
+                member = self.identifier()[0]
+                return _Node(kind="section_identifier",
+                             tree=self.mk(ast.SectionAccess, first, _to_text(name), _to_text(member)))
+            return _Node(kind="identifier", ident=name, tree=self.mk(ast.Identifier, first, _to_text(name)))
         if kind == "(":
             self.expect("(")
             inner = self.expression()
             self.expect(")")
-            return _Node(kind="parens", children=[inner])
+            return _Node(kind="parens", children=[inner], tree=inner.tree)
         if kind == "[":
             if self.is_field_selection():
                 return _Node(kind="implicit")   # _, read by the field access that follows
             return self.record()
         if kind == "{":
             return self.list_()
-        if kind in ("...", "#shared", "#sections"):
+        if kind == "...":
             self.read()
-            return _Node(kind=kind)
+            return _Node(kind=kind, tree=self.mk(ast.NotImplementedExpr, first))
+        if kind in ("#shared", "#sections"):
+            self.read()
+            return _Node(kind=kind, tree=self.mk(ast.Identifier, first, kind))
         if kind == VERBATIM:
             start = self.toks[self.read()].start
             lit = self.pos
             self.literal()
             value = _string_value(self.tok_text(lit)) if self.tok_text(lit).startswith('"') else None
-            return _Node(kind="verbatim", verbatim=value, start=start, end=self.toks[lit].end, ranged=True)
+            return _Node(kind="verbatim", verbatim=value, start=start, end=self.toks[lit].end, ranged=True,
+                         tree=self.mk(ast.Literal, first, "verbatim", None if value is None else _to_text(value)))
         return self.literal()
 
     def literal(self) -> _Node:
         i = self.expect(LITERAL)
-        if not _literal_valid(self.tok_text(i)):
+        token = self.tok_text(i)
+        if not _literal_valid(token):
             self.error_at(i, _INVALID_LITERAL)
-        return _Node(kind="constant", start=self.toks[i].start, end=self.toks[i].end, ranged=True)
+        cls, *args = _literal_tree(token)
+        return _Node(kind="constant", start=self.toks[i].start, end=self.toks[i].end, ranged=True,
+                     tree=self.mk(cls, i, *args))
 
     def record(self) -> _Node:
-        self.expect("[")
+        first = self.expect("[")
         node = _Node(kind="record", dup="field")
+        fields = []
         last = None
         while self.cur not in ("]", EOF) and last != self.pos:
             last = self.pos
-            node.names.append(self.field_identifier())
+            name = self.field_identifier()
+            node.names.append(name)
             self.expect("=")
-            node.children.append(self.expression())
+            value = self.expression()
+            node.children.append(value)
+            fields.append(self.mk(ast.RecordField, last, _to_text(name[0]), value.tree))
             self.separator("]")
         self.expect("]")
+        node.tree = self.mk(ast.RecordExpr, first, fields)
         return node
 
     def list_(self) -> _Node:
-        self.expect("{")
+        first = self.expect("{")
         node = _Node()
+        items = []
         last = None
         while self.cur not in ("}", EOF) and last != self.pos:
             last = self.pos
-            node.children.append(self.expression())
+            item = self.expression()
+            node.children.append(item)
+            tree = item.tree
             if self.cur == "..":
                 self.read()
-                node.children.append(self.expression())
+                end = self.expression()
+                node.children.append(end)
+                tree = self.mk(ast.Range, last, item.tree, end.tree)
+            items.append(tree)
             self.separator("}")
         self.expect("}")
+        node.tree = self.mk(ast.ListExpr, first, items)
         return node
+
+
+# The arithmetic, comparison and equality operators' precedence, tightest first (Power Query's reader)
+_PRECEDENCE = {"/": 0, "*": 0, "&": 1, "-": 1, "+": 1, ">": 2, ">=": 2, "<": 2, "<=": 2, "=": 3, "<>": 3}
+
+
+def _binary(op: str, left: ast.Node, right: ast.Node) -> ast.Binary:
+    return ast.Binary(op, left, right, start=left.start, end=right.end)
+
+
+def _balanced(operands: list, op: str) -> ast.Node:
+    """``a op b op c op d`` as Power Query's reader builds it: neighbours paired, level by level, an odd one out
+    carried up: ``(a op b) op (c op d)``; ``a op b op c`` is ``(a op b) op c``."""
+    level = list(operands)
+    while len(level) > 1:
+        paired = [_binary(op, level[i], level[i + 1]) for i in range(0, len(level) - 1, 2)]
+        if len(level) % 2:
+            paired.append(level[-1])
+        level = paired
+    return level[0]
+
+
+def _number_value(token: str):
+    """A valid number literal's value: an int for a whole decimal or hexadecimal number, else a float."""
+    if len(token) > 2 and token[1] in "xX":
+        return int(token[2:], 16)
+    if "." in token or "e" in token or "E" in token:
+        return float(token)
+    return int(token)
+
+
+def _literal_tree(token: str) -> tuple:
+    """A valid literal token as the evaluator's node: (class, args...)."""
+    c = token[0]
+    if "0" <= c <= "9" or c == ".":
+        return ast.Literal, "number", _number_value(token)
+    if c == '"':
+        return ast.Literal, "text", _to_text(_string_value(token))
+    if token == "null":
+        return ast.Literal, "null", None
+    if token in ("true", "false"):
+        return ast.Literal, "logical", token == "true"
+    return ast.Identifier, token          # #date, #table, #infinity, ...
 
 
 class NoCheckResult(Exception):
@@ -1360,3 +1531,44 @@ def _verbatim_error(node: _Node) -> Optional[SourceError]:
     if inner_found is None:
         return None
     return _source_error(node.verbatim, inner_found.message, inner_found.start, inner_found.end)
+
+
+# --- the evaluator's tree ------------------------------------------------------------------------------------
+
+def parse_document(text: str) -> ast.Expr | ast.Section:
+    """A query's M as the evaluator's tree (``pbix_mcp.m.ast``): an expression, or a section document. Its offsets
+    are indexes into ``text``. Text that doesn't read raises ``MSyntaxError`` with Power Query's message, at the
+    first token it couldn't read; so does text nested too deeply for the reader."""
+    units = _utf16(text)
+    try:
+        found, root = _read(units)
+    except NoCheckResult:
+        raise MSyntaxError(_TOO_DEEP, text, 0) from None
+    index = _python_indexes(text, units)
+    if found is not None:
+        message = found.message.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        raise MSyntaxError(message, text, found.start if index is None else index[found.start])
+    tree = root.tree
+    if index is not None:
+        for node in ast.walk(tree):
+            node.start, node.end = index[node.start], index[node.end]
+    return tree
+
+
+def parse_expression(text: str) -> ast.Expr:
+    """``parse_document`` for an expression only: a section document is an ``MSyntaxError``."""
+    tree = parse_document(text)
+    if isinstance(tree, ast.Section):
+        raise MSyntaxError(_INVALID_EXPRESSION, text, 0)
+    return tree
+
+
+def _python_indexes(text: str, units: str) -> Optional[list[int]]:
+    """Each UTF-16 offset into ``units`` as an index into ``text``, or None where they are the same."""
+    if len(units) == len(text):
+        return None
+    out = []
+    for k, ch in enumerate(text):
+        out.extend([k, k] if ord(ch) > 0xFFFF else [k])
+    out.append(len(text))
+    return out

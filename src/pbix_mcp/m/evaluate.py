@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 from . import ast
 from .library import LIBRARY
-from .parser import parse_document
+from .check import parse_document
 from .values import ANY, CellError, Function, MError, MType, Record, Table, Thunk, force, kind_of
 
 Resolver = Callable[[str], Any]

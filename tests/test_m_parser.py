@@ -1,61 +1,82 @@
-"""The M lexer, parser and free-name analysis (pbix_mcp.m), against the M language
-specification's grammar. Cases are written fresh from the specification; the
-Enter-data documents come from this package's own builder."""
+"""The tree the M evaluator runs (pbix_mcp.m.parse_document), read by Power Query's reader (pbix_mcp.m.check), and
+free-name analysis. Cases are written fresh from the M language specification; where Power Query's reader reads
+otherwise, the case cites its code (Desktop 2.157's DocumentReader.cs, TextTokens.cs). The Enter-data documents come
+from this package's own builder."""
 import random
 
 import pytest
 
 from pbix_mcp.builder import _build_enter_data_m
-from pbix_mcp.m import MSyntaxError, ast, free_names, parse_document, parse_expression, tokenize, walk
+from pbix_mcp.m import MSyntaxError, ast, free_names, parse_document, parse_expression, walk
+from pbix_mcp.m.check import BOF, EOF, WHITESPACE, tokenize
+
+I, L = ast.Identifier, ast.Literal
 
 
-def kinds(text):
-    return [(t.kind, t.value) for t in tokenize(text)[:-1]]
+def num(v):
+    return L("number", v)
 
 
-class TestLexer:
-    def test_dotted_identifier_is_one_token(self):
-        assert kinds("Table.AddColumn") == [("identifier", "Table.AddColumn")]
+class TestTokens:
+    def test_dotted_identifier_is_one_name(self):
+        assert parse_expression("Table.AddColumn") == I("Table.AddColumn")
 
     def test_range_keeps_its_dots(self):
-        assert kinds("{1..3}") == [("punct", "{"), ("number", 1), ("punct", ".."), ("number", 3), ("punct", "}")]
+        assert parse_expression("{1..3}") == ast.ListExpr([ast.Range(num(1), num(3))])
 
-    def test_dot_needs_an_identifier_after_it(self):
-        assert kinds("Column1.1") == [("identifier", "Column1"), ("number", 0.1)]
+    def test_a_word_runs_on_across_a_dot(self):
+        # TextTokens: a word goes on through a dot not followed by a dot, so these are names, not a name and a number
+        assert parse_expression("Column1.1") == I("Column1.1")
+        assert parse_expression("not.5") == I("not.5")
 
     def test_quoted_identifier_and_escapes(self):
-        assert kinds('#"Changed ""Type"""') == [("quoted", 'Changed "Type"')]
+        assert parse_expression('#"Changed ""Type"""') == I('Changed "Type"')
 
     def test_text_escapes(self):
-        assert kinds('"a#(cr,lf)b#(tab)#(0041)#(#)"') == [("text", "a\r\nb\tA#(")]
+        # #(#) is the escape for "#" (the specification's escape-escape), so "#(#)(" is how "#(" is written
+        assert parse_expression('"a#(cr,lf)b#(tab)#(0041)#(#)"') == L("text", "a\r\nb\tA#")
+        assert parse_expression('"#(#)("') == L("text", "#(")
+        assert parse_expression('"#(0001F600)"') == L("text", "\U0001F600")
 
-    def test_hash_keywords(self):
-        assert kinds("#table #date #shared") == [("keyword", "#table"), ("keyword", "#date"), ("keyword", "#shared")]
+    def test_hash_words(self):
+        assert parse_expression("{#table, #date, #shared, #sections, #infinity}").items == [
+            I("#table"), I("#date"), I("#shared"), I("#sections"), I("#infinity")]
 
     def test_unknown_hash_word(self):
-        with pytest.raises(MSyntaxError):
-            tokenize("#foo")
+        with pytest.raises(MSyntaxError, match="Invalid literal"):
+            parse_expression("#foo")
 
     def test_numbers(self):
-        assert kinds("0xff 12 1.5 .5 1e3 2E-2") == [("number", 255), ("number", 12), ("number", 1.5),
-                                                    ("number", 0.5), ("number", 1000.0), ("number", 0.02)]
+        assert parse_expression("{0xff, 12, 1.5, .5, 1e3, 2E-2}").items == [
+            num(255), num(12), num(1.5), num(0.5), num(1000.0), num(0.02)]
+        assert type(parse_expression("12").value) is int and type(parse_expression("1e3").value) is float
 
     def test_every_space_separator_is_whitespace(self):
         # Desktop's editor can leave U+00A0 between tokens.
-        assert kinds("let a　= 1 in a") == kinds("let a = 1 in a")
+        assert parse_expression("let a\u3000= 1\u00a0in a") == parse_expression("let a = 1 in a")
 
     def test_comments(self):
-        assert kinds("1 // one\n+ /* two */ 2") == [("number", 1), ("punct", "+"), ("number", 2)]
+        assert parse_expression("1 // one\n+ /* two */ 2") == ast.Binary("+", num(1), num(2))
 
-    @pytest.mark.parametrize("text", ['"abc', "/* x", '#"x', '"#(zz)"'])
-    def test_unterminated(self, text):
+    @pytest.mark.parametrize("text", ['"abc', "/* x", '#"x', '"#(zz)"', "1d", "0x"])
+    def test_unterminated_and_bad_literals(self, text):
         with pytest.raises(MSyntaxError):
-            tokenize(text)
+            parse_expression(text)
 
     def test_error_position(self):
         with pytest.raises(MSyntaxError) as e:
             parse_expression("let\n  a = 1,\n  b = \nin a")
         assert (e.value.line, e.value.column) == (4, 1)
+        assert e.value.message == "Token Literal expected."
+
+    def test_offsets_are_python_indexes(self):
+        # the reader counts UTF-16 code units; the tree's offsets are indexes into the text as given
+        text = '"\U0001F600\U0001F600" & Source'
+        n = parse_expression(text)
+        assert text[n.right.start:n.right.end] == "Source"
+        with pytest.raises(MSyntaxError) as e:
+            parse_expression('"\U0001F600" & )')
+        assert e.value.offset == 6
 
 
 class TestParser:
@@ -67,6 +88,16 @@ class TestParser:
         eq = orr.left.left
         assert eq.op == "=" and eq.left.op == "+" and eq.left.right.op == "*"
 
+    def test_and_or_coalesce_chains_are_balanced(self):
+        # DocumentReader CreateBalancedTree: neighbours paired, level by level
+        a, b, c, d, e = (I(x) for x in "abcde")
+        for op in ("and", "or", "??"):
+            def B(x, y):
+                return ast.Binary(op, x, y)
+            assert parse_expression(f"a {op} b {op} c") == B(B(a, b), c)
+            assert parse_expression(f"a {op} b {op} c {op} d") == B(B(a, b), B(c, d))
+            assert parse_expression(f"a {op} b {op} c {op} d {op} e") == B(B(B(a, b), B(c, d)), e)
+
     def test_left_associative(self):
         n = parse_expression("a - b - c")
         assert n.left.op == "-" and n.left.left == ast.Identifier("a")
@@ -74,6 +105,16 @@ class TestParser:
     def test_meta_binds_tighter_than_arithmetic(self):
         n = parse_expression("a + b meta [x = 1]")
         assert n.op == "+" and n.right.op == "meta"
+
+    def test_meta_chains_to_the_left(self):
+        # DocumentReader ReadMetadataExpression loops
+        assert parse_expression("a meta b meta c") == ast.Binary("meta", ast.Binary("meta", I("a"), I("b")), I("c"))
+
+    def test_as_and_is_sit_above_the_comparisons(self):
+        # DocumentReader ReadAsExpression reads an equality expression, then "as"; so nothing compares its result
+        assert parse_expression("a = b as number").left == ast.Binary("=", I("a"), I("b"))
+        with pytest.raises(MSyntaxError, match="Token Eof expected"):
+            parse_expression("x as any > y")
 
     def test_let(self):
         n = parse_expression('let #"A b" = 1, c = #"A b" + 1 in c')
@@ -106,6 +147,8 @@ class TestParser:
 
     def test_generalized_field_names(self):
         assert parse_expression("x[Country Region]").name == "Country Region"
+        assert parse_expression("x[1]").name == "1"          # words as written, a digit first too
+        assert parse_expression("x[n .t]").name == "n .t"
         assert parse_expression("[Sales.Sales Person]") == ast.FieldAccess(None, "Sales.Sales Person")
         assert [f.name for f in parse_expression("[Item = 1, Serialized.Text = true]").fields] == \
             ["Item", "Serialized.Text"]
@@ -128,6 +171,21 @@ class TestParser:
         assert parse_expression("type [a = number, optional b, ...]").type.open
         assert parse_expression("type {number}").type == ast.ListType(ast.PrimitiveType("number"))
         assert isinstance(parse_expression("type function (x as number) as text").type, ast.FunctionType)
+
+    def test_types_power_query_reads(self):
+        # DocumentReader ReadTypeConstructor: a table type's row may be an expression; a function type's parameters
+        # and return take any type
+        assert parse_expression("type table T").type == ast.TableType(I("T"))
+        assert parse_expression("type table @T").type == ast.TableType(I("T", inclusive=True))
+        t = parse_expression("type function (p as {number}) as Int64.Type").type
+        assert t.parameters[0].type == ast.ListType(ast.PrimitiveType("number"))
+        assert t.return_type == ast.ExprType(I("Int64.Type"))
+
+    def test_optional_in_a_record_type_is_the_keyword(self):
+        # DocumentReader ReadFieldType: TryRead(optional), then the field's name
+        assert parse_expression("type [optional a]").type.fields == [ast.FieldSpec("a", None, True)]
+        with pytest.raises(MSyntaxError, match="Invalid identifier"):
+            parse_expression("type [optional]")
 
     def test_enter_data_type_idiom(self):
         n = parse_expression("let _t = ((type nullable text) meta [Serialized.Text = true]) in type table [ID = _t]")
@@ -165,9 +223,16 @@ class TestParser:
         call = n.bindings[0].value
         assert text[call.start:call.end] == 'Table.AddColumn(t, "x", each 1)'
 
+    def test_let_with_no_variables(self):
+        assert parse_expression("let in 1") == ast.Let([], num(1))
+
+    def test_required_parameter_after_optional(self):
+        with pytest.raises(MSyntaxError, match="required argument following an optional"):
+            parse_expression("(optional a, b) => a")
+
     @pytest.mark.parametrize("text", [
-        "let in 1", "1 +", "[a = ]", "(x) => ", "{1..}", "x{}", "if a then b", "a b", "1 2", "x.",
-        "type \"text\"", "type (text)", "1 + if a then b else c", "1 + each 1", "section S; A = 1",
+        "1 +", "[a = ]", "(x) => ", "{1..}", "x{}", "if a then b", "a b", "1 2", "x.",
+        "type \"text\"", "type (text)", "1 + if a then b else c", "1 + each 1", "section S; A = 1", "section; A = 1;",
         "type table [#\"A\" _t]", "",
     ])
     def test_rejects(self, text):
@@ -176,7 +241,7 @@ class TestParser:
 
     def test_depth(self):
         assert parse_expression("(" * 100 + "1" + ")" * 100) == ast.Literal("number", 1)
-        with pytest.raises(MSyntaxError, match="nested too deeply"):
+        with pytest.raises(MSyntaxError, match="too complicated to run"):
             parse_expression("(" * 5000 + "1" + ")" * 5000)
 
 
@@ -221,7 +286,7 @@ class TestBuilderOutput:
 
     def test_token_mutations_never_crash(self):
         m = _build_enter_data_m([{"name": "A b", "data_type": "Double"}], [{"A b": 1.5}, {"A b": 2}])
-        toks = tokenize(m)[:-1]
+        toks = [t for t in tokenize(m) if t.kind not in (BOF, EOF, WHITESPACE)]
         rng = random.Random(7)
         outcomes = set()
         for _ in range(500):
