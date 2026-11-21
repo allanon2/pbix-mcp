@@ -11387,16 +11387,12 @@ class DAXEngine:
                 # compiled as SYNTAXERROR (_measure_not_dax): before any of it runs
                 raise _DAXEvaluationError(_SYNTAXERROR)
             _bind = self._static_refusal(expr, ctx)
-            if _bind is None:
-                # a comparison or IN of clashing declared types (#381,
-                # _type_clash), refused as _static_refusal's errors are
-                _bind = self._type_clash_error(expr, ctx)
-                if _bind is not None and self._unbound_column_ref(expr, ctx):
-                    # Desktop binds names before it checks types: a missing
-                    # name is its own error, never pre-empted by a type
-                    # error (Power BI Desktop 2.157, #344; as _static_type_error
-                    # below)
-                    _bind = None
+            # (pivot-studio fork: upstream 0.9.154's _type_clash_error, its
+            # check of a comparison's or IN's types (#381), is not called: ours,
+            # _static_type_error below, answers each of its measured cases, and
+            # its error is uncatchable as Desktop's is (#344), where upstream's
+            # was caught by an IFERROR around a measure reference. Upstream's
+            # also types a VAR's value, which no capture measures.)
             if _bind is not None:
                 # Desktop refuses the measure before evaluating any of it
                 # (#284, _static_refusal)
@@ -21165,7 +21161,12 @@ class DAXEngine:
                     out.append(calendar.month_name[val.month])
             else:
                 lit = fmt_str[i:i + run]
-                out.append(lit.replace('/', date_sep) if date_sep != '/' else lit)
+                if (date_sep != '/' and '/' in lit and fmt_str[i - 1:i] != '\\'
+                        and fmt_str.count('"', 0, i) % 2 == 0):
+                    # the culture's separator, but for a "/" escaped or quoted
+                    # (those print as the picture holds them, as before)
+                    lit = lit.replace('/', date_sep)
+                out.append(lit)
                 i += run
                 continue                              # separators keep `prev`
             i += run
@@ -21822,11 +21823,10 @@ class DAXEngine:
         if len(args) < 2:
             return None
         row_expr = args[1].strip()
-        # an expression typed text, TRUE / FALSE or a date is Desktop 2.157's
-        # error, as MEDIAN's (build_b371.py medianx_*, #376)
-        if self._static_type(row_expr, ctx) in ('S', 'L', 'T'):
-            raise _DAXEvaluationError(
-                "MEDIANX does not support expressions of type string/Boolean/date.")
+        # (pivot-studio fork: upstream 0.9.154's static check of the row
+        # expression's type is not kept: it raised over an empty table and
+        # before the table's own error, which no capture measures; a row's
+        # value is checked below)
         table_ref = self._eval_expr(args[0].strip(), ctx)
         if not isinstance(table_ref, list):
             return None
@@ -23307,9 +23307,10 @@ class DAXEngine:
             return table_ref
         if not table_ref and isinstance(table_ref, _StaticRows):
             return self._static_columns(args[2::2], ctx, table_ref.num_kinds)
-        names = [str(self._eval_expr(args[i].strip(), ctx)) for i in range(1, len(args) - 1, 2)]
-        self._added_names_check('ADDCOLUMNS', names, table_ref[0] if table_ref else None)
-        added = frozenset(names)
+        # (upstream 0.9.154's _added_names_check is not called here: it raised
+        # a duplicate before an existing column, where ours, below, checks
+        # each name in turn, as before; which Desktop names first is not
+        # measured)
 
         # Parse name/expression pairs
         extended = []
@@ -23461,10 +23462,12 @@ class DAXEngine:
         return base
 
     def _fn_summarize(self, args_str: str, ctx: DAXContext, rows_filter: bool = True) -> Any:
-        """SUMMARIZE (_fn_summarize_rows), its extension columns marked as
-        its own (_mark_added_literals, #375)."""
-        return self._mark_added_literals(
-            self._fn_summarize_rows(args_str, ctx, rows_filter), args_str)
+        """SUMMARIZE (_fn_summarize_rows), which marks its own extension
+        columns __added__ (#375). Upstream 0.9.154's _mark_added_literals is
+        not applied: it marked every string literal, an extension's value
+        too, so SUMMARIZE(Opp, Opp[Name], "x", "Name") headed Opp[Name] as
+        [Name]."""
+        return self._fn_summarize_rows(args_str, ctx, rows_filter)
 
     def _mark_added_literals(self, out, args_str: str):
         """``out``'s rows with the columns named by the string literals among
@@ -23941,30 +23944,15 @@ class DAXEngine:
         SUMMARIZECOLUMNS(Opp[Name], TREATAS({1}, Opp[Rank]), "t", [Total]),
         and (a, 3), (b, 2) for a FILTER(ALL(Opp[Rank]), ..) filter
         (sumcols_filter). They were ignored (#383). NONVISUAL's filter is
-        applied by _fn_summarizecolumns_rows itself."""
-        args = self._split_args(args_str)
-        filters: list = []
-        rest: list = []
-        k = 0
-        while k < len(args) and (self._parse_column_ref(args[k]) is not None
-                                 or args[k].strip().upper().startswith(('ROLLUPADDISSUBTOTAL', 'ROLLUPGROUP'))):
-            rest.append(args[k])
-            k += 1
-        while k and k < len(args):
-            st = args[k].strip()
-            if st.startswith('"'):
-                rest.extend(args[k:])
-                break
-            if st.upper().startswith(('NONVISUAL', 'IGNORE')):
-                rest.append(args[k])
-            else:
-                filters.append(st)
-            k += 1
-        if filters:
-            inner = ", ".join(x.strip() for x in rest)
-            return self._eval_expr(
-                f"CALCULATETABLE(SUMMARIZECOLUMNS({inner}), {', '.join(filters)})", ctx)
-        return self._mark_added_literals(self._fn_summarizecolumns_rows(args_str, ctx), args_str)
+        applied by _fn_summarizecolumns_rows itself.
+
+        pivot-studio fork: _fn_summarizecolumns_rows applies the filter
+        tables itself, NONVISUAL's beside them, and marks its own columns
+        (#375); upstream 0.9.154's wrapper (filters lifted into
+        CALCULATETABLE, NONVISUAL's left inside, every string literal marked)
+        is not used: it answered otherwise for a NONVISUAL and a plain filter
+        on one column and headed a group column named by a literal value."""
+        return self._fn_summarizecolumns_rows(args_str, ctx)
 
     def _fn_summarizecolumns_rows(self, args_str: str, ctx: DAXContext) -> Any:
         """SUMMARIZECOLUMNS(groupBy1, ..., name, expression) — summarize with measures.
@@ -24976,22 +24964,9 @@ class DAXEngine:
         names that differ only in case (the second is named). The engine
         answered a column of no value, an empty table, or kept both."""
         args = self._split_args(args_str)
-        if len(args) < 2:
-            raise _DAXEvaluationError(
-                "Too few arguments were passed to the ROW function. "
-                "The minimum argument count for the function is 2.")
-        seen: set = set()
-        for k in range(0, len(args), 2):
-            if k + 1 >= len(args) or not args[k + 1].strip():
-                raise _DAXEvaluationError(f"Argument '{k + 2}' in ROW function is required.")
-            m = _FULL_STRING_LITERAL.match(args[k].strip())
-            if m:
-                nm = args[k].strip()[1:-1].replace('""', '"')
-                if nm.lower() in seen:
-                    raise _DAXEvaluationError(
-                        f"Function 'ROW' cannot add column [{nm}], as it has the same "
-                        "name with an existing column.")
-                seen.add(nm.lower())
+        # (pivot-studio fork: upstream 0.9.154's pre-check of these errors is
+        # not kept; it named a duplicate before a missing argument further on
+        # and before an argument's own error. They are raised below, in turn.)
         row = {'__table__': '__row__'}
         i = 0
         first_name = None
