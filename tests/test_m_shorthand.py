@@ -49,6 +49,13 @@ def test_anything_else_shows_as_written(expr):
     ('"false"', "'false"), ('"null"', "'null"), ('"=x"', "'=x"), ("\"'q\"", "''q"), ('"1/2/2020"', "'1/2/2020"),
     ('"2020-01-31"', "'2020-01-31"), ('"10:30"', "'10:30"), ('"P1D"', "'P1D"), ('"1.02:00:00"', "'1.02:00:00"),
     ('"NULL"', "NULL"), ('"Paris"', "Paris"), ('"t rue"', "'t rue"),
+    # NumberValue.TryParse's NumberStyles.Any: trailing signs, a currency symbol after, the percent search,
+    # a trailing group separator, NaN and the infinity symbols
+    ('"5-"', "'5-"), ('"5$"', "'5$"), ('"$5"', "'$5"), ('"(5)"', "'(5)"), ('"%5"', "'%5"), ('"5 %"', "'5 %"),
+    ('"-%5"', "'-%5"), ('"1,"', "'1,"), ('"NaN"', "'NaN"), ('"\u221e"', "'\u221e"), ('"-\u221e"', "'-\u221e"),
+    ('"1e999"', "'1e999"), ('",1"', ",1"), ('"5%%"', "5%%"), ('"(5"', "(5"), ('"5e"', "5e"),
+    # M's ISO forms with a zone
+    ('"2020-01-01T10:00:00+10:00"', "'2020-01-01T10:00:00+10:00"), ('"2020-01-01T10:00:00Z"', "'2020-01-01T10:00:00Z"),
 ])
 def test_text_that_reads_as_something_else_gets_a_tick(expr, text):
     assert bar(expr) == text
@@ -64,11 +71,30 @@ def test_the_culture_writes_dates_and_times():
     assert bar("#datetime(2020, 1, 5, 13, 5, 9)", "en-AU") == "5/01/2020 1:05:09 PM"
     assert bar("#datetime(2020, 1, 5, 13, 5, 9)", "") == "01/05/2020 13:05:09"
     assert bar('"5/01/2020"', "en-AU") == "'5/01/2020"
+    assert bar('"Infinity"', "") == "'Infinity"
+    assert bar('"\u00a45"', "") == "'\u00a45"
 
 
-def test_a_long_number_literal_is_refused_not_guessed():
-    assert bar("0.30000000000000004")[0] == "unsupported"
-    assert bar("1234567890123456789")[0] == "unsupported"
+@pytest.mark.parametrize("expr, text", [
+    # over 15 significant digits a literal keeps its decimal: .NET's decimal "G", digits and scale as written
+    ("0.30000000000000004", "0.30000000000000004"), ("1234567890123456789", "1234567890123456789"),
+    ("10000000000000000", "10000000000000000"), ("1.0000000000000001", "1.0000000000000001"),
+    ("1234567890.12345670", "1234567890.12345670"), ("-1234567890.12345670", "-1234567890.12345670"),
+    ("1e20", "100000000000000000000"),
+    # under a decimal's 28 places the decimal is 0: a double
+    ("1e-30", "1E-30"), ("0.000000000000000000000000000001", "1E-30"),
+    # past a decimal's range: a double
+    ("1e30", "1E+30"),
+])
+def test_a_long_number_literal_writes_its_decimal(expr, text):
+    assert bar(expr) == text
+
+
+def test_a_query_without_steps_shows_its_own_tokens():
+    assert query_steps("// note\n1 + 1").formula == "= 1 + 1"
+    assert query_steps("  1 + 1  ").formula == "= 1 + 1"
+    assert query_steps("1 + 1 // t").formula == "= 1 + 1"
+    assert query_steps("/* a */ 5 // b").formula == "5"
 
 
 @pytest.mark.parametrize("v, text", [
@@ -89,14 +115,15 @@ def test_a_duration_is_timespans_constant_format(td, text):
     assert duration_text(td) == text
 
 
-def test_a_datetime_rounds_half_a_second_up_only_without_milliseconds():
-    # whole milliseconds show ISO 8601; under a millisecond the text drops the fraction, rounding from half a second
+def test_a_datetime_under_a_millisecond_drops_the_fraction():
     assert value_text(dt.datetime(2020, 1, 1, 10, 0, 0, 999), "en-US") == "1/1/2020 10:00:00 AM"
 
 
 def params(text: str):
     q = query_steps(text)
-    return q.parameter_value if q.parameter_unsupported is None else ("unsupported", q.parameter_unsupported)
+    if q.parameter_unsupported is not None:
+        return ("unsupported", q.parameter_unsupported)
+    return q.parameter_value if q.is_parameter else "not a parameter"
 
 
 @pytest.mark.parametrize("text, value", [
@@ -109,7 +136,17 @@ def params(text: str):
     ('x meta [IsParameterQuery=true]', None),
     ('(5) meta [IsParameterQuery=true]', None),
     ('Foo meta [IsParameterQuery=true, BinaryIdentifier=Foo, Type="Binary"]', "Foo"),
-    ('5 meta [IsParameterQuery=false]', None), ('5 meta [a=1]', None), ('5', None),
+    ('@Foo meta [IsParameterQuery=true, BinaryIdentifier=Foo, Type="Binary"]', "Foo"),
+    ('5 meta [IsParameterQuery=false]', "5"),                            # a file loads it as one: the field is there
+    ('let X = 5 meta [IsParameterQuery=true, Type="Number"] in X', "5"),  # single-step, as Power BI allows
+    ('let X = 5 meta [IsParameterQuery=true] in Y', "not a parameter"),
+    ('let X = 5 meta [IsParameterQuery=true], Y = X in Y', "not a parameter"),
+    ('5 meta [a=1]', "not a parameter"), ('5', "not a parameter"),
 ])
 def test_a_parameters_value_as_the_queries_pane_shows_it(text, value):
     assert params(text) == value
+
+
+
+def test_a_binary_parameter_value_is_refused_not_dropped():
+    assert params('#binary("AQID") meta [IsParameterQuery=true]')[0] == "unsupported"

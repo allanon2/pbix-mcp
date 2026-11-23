@@ -9,8 +9,9 @@ Measured behaviour, read as rules (pivot-studio #352):
   not a constant (``(5)``), and so do a name (``#"#date"(...)``), an operator, ``type ...``, a list or a record. A
   constant whose value is a binary or a function isn't shown as shorthand either.
 - **The text.** A number in 15 significant digits, or 17 when 15 don't give the number back, with an exponent from
-  1E+15 and below 1E-05 ("1E+15", "1E-05"); a whole number past 999,999,999,999,999 in full digits ("1000000000000000"),
-  rounded to 15 significant digits past 2^63; ``#nan`` "NaN". A logical "TRUE"/"FALSE"; null "null". A date in the
+  1E-05 down and from 1E+15 up when not whole ("1E-05", "1.5E+300"); a whole number past 999,999,999,999,999 in full
+  digits ("1000000000000000"), rounded to 15 significant digits past 2^63; ``#nan`` "NaN". A literal of more than 15
+  significant digits keeps them as a decimal does, as written ("0.30000000000000004", "1234567890.12345670"). A logical "TRUE"/"FALSE"; null "null". A date in the
   culture's short date ("1/1/2020"; en-AU "1/01/2020"); a datetime with the culture's long time ("1/1/2020 1:05:09 PM")
   and a datetimezone with its offset after (" +10:00"); a time in the long time ("1:05:09 PM"); any of these with a
   millisecond as ISO 8601 with seven fractional digits ("2020-01-01T10:00:00.5000000", a time "10:00:00.5000000").
@@ -19,13 +20,14 @@ Measured behaviour, read as rules (pivot-studio #352):
   ``=`` (and longer than that), or ``'``, or reading as a number, a logical, ``null``, a date or time, or a duration
   ("'5", "'TRUE", "'1/1/2020", "'=x"). Text holding a control character (a line feed, a tab) shows as a formula,
   ``= "a#(lf)b"``.
-- **A parameter's value** is the left of its ``meta``, shown the same way but never with a ``'`` nor as a formula, and
-  not at all when it is null or not a constant (the pane then shows "Name (...)"). A binary parameter shows the name
-  its value refers to.
+- **A parameter** is a query whose text is ``value meta [IsParameterQuery = ...]`` (the field there, whatever its
+  value, as a file loads), or a ``let`` of one such step returning it. Its value shows the same way but never with a
+  ``'`` nor as a formula, and not at all when it is null or not a constant (the pane then shows "Name (...)"). A binary
+  parameter shows the name its value refers to.
 
-A culture is one of ``dtparse.CULTURE_DATA``'s. What isn't settled raises ``ShorthandUnsupported``: a number
-literal of more than 15 significant digits, a constant list, record or table, a binary parameter value, and text the
-date reader refuses (a zone or offset).
+A culture is one of ``dtparse.CULTURE_DATA``'s. What isn't settled raises ``ShorthandUnsupported``: a number literal
+of more than 28 significant digits, a constant list, record or table, a ``#binary`` parameter value, and text naming
+a zone the date reader refuses (other than M's ISO forms).
 """
 from __future__ import annotations
 
@@ -65,6 +67,20 @@ def _culture(culture: str) -> dtparse.DateCulture:
 _NOT_CONSTANT = object()
 
 
+class DoubleDecimal(float):
+    """A number literal of more than 15 significant digits: Power Query keeps its decimal beside the double, and
+    writes the decimal (its digits and scale, as .NET's decimal "G")."""
+    decimal: Decimal
+
+    def __new__(cls, value: float, d: Decimal) -> "DoubleDecimal":
+        obj = super().__new__(cls, value)
+        obj.decimal = d
+        return obj
+
+    def __neg__(self) -> "DoubleDecimal":
+        return DoubleDecimal(-float(self), -self.decimal)
+
+
 def constant_value(node: Any, units: str, culture: str = "en-US") -> Any:
     """The value of a constant expression (a check reader's node over ``units``), or ``_NOT_CONSTANT``.
     Raises ShorthandUnsupported for a number literal whose value isn't settled."""
@@ -84,7 +100,7 @@ def constant_value(node: Any, units: str, culture: str = "en-US") -> Any:
         v = constant_value(operand, units, culture)
         if v is _NOT_CONSTANT or kind_of(v) != "number":
             return _NOT_CONSTANT
-        return -v if tree.op == "-" else v
+        return -v if tree.op == "-" else v      # a DoubleDecimal negates as one
     if kind == "invoke":
         target = node.children[0]
         if target.kind != "constant" or not isinstance(target.tree, ast.Identifier):
@@ -100,9 +116,12 @@ def constant_value(node: Any, units: str, culture: str = "en-US") -> Any:
     return _NOT_CONSTANT
 
 
+_DECIMAL_MAX = Decimal("79228162514264337593543950335")
+
+
 def _number_literal(token: str, value: Any) -> Any:
-    """A number literal's value. Over 15 significant digits the literal keeps both a decimal and a double, and how
-    that prints isn't settled."""
+    """A number literal's value: over 15 significant digits (counted on the decimal .NET reads, at most 28 places) a
+    DoubleDecimal; past a decimal's range a double."""
     if len(token) > 2 and token[1] in "xX":
         return value
     if len(token) <= 9 and "e" not in token.lower():
@@ -111,8 +130,12 @@ def _number_literal(token: str, value: Any) -> Any:
         d = Decimal(token)
     except InvalidOperation:
         return value
-    if d.adjusted() > 28:                               # beyond a decimal: a double only
+    if abs(d) > _DECIMAL_MAX:                           # beyond a decimal: a double only
         return value
+    if d.as_tuple().exponent < -28:
+        d = d.quantize(Decimal(1).scaleb(-28))
+    if len(d.as_tuple().digits) > 28:
+        raise ShorthandUnsupported("A number literal of more than 28 significant digits isn't supported yet.")
     text = format(d, "f")
     if len(text) > 15:
         i = 0
@@ -126,7 +149,7 @@ def _number_literal(token: str, value: Any) -> Any:
         whole = (dot if dot >= 0 else last + 1) - i
         frac = last - dot if dot >= 0 else 0
         if whole + frac > 15:
-            raise ShorthandUnsupported("A number literal of more than 15 significant digits isn't supported yet.")
+            return DoubleDecimal(float(value), d)
     return value
 
 
@@ -155,6 +178,8 @@ def number_text(v: Any, culture: str) -> str:
     """A number's round-trip text, as the formula bar shows a constant."""
     if isinstance(v, int):
         return str(v)
+    if isinstance(v, DoubleDecimal):
+        return format(v.decimal, "f")
     if math.isnan(v):
         return "NaN"
     if math.isinf(v):
@@ -177,16 +202,6 @@ def _long_time(t: dt.time, c: dtparse.DateCulture) -> str:
 
 def _short_date(d: dt.date, culture: str) -> str:
     return library._date_text(d, culture)
-
-
-def _round_second(v: dt.datetime) -> dt.datetime:
-    """Desktop's rounding before showing a datetime without its fraction: half a second or more is the next second."""
-    if v.microsecond >= 500000:
-        try:
-            return v + dt.timedelta(microseconds=500000)
-        except OverflowError:
-            return v
-    return v
 
 
 def _fraction(us: int) -> str:
@@ -237,8 +252,8 @@ def value_text(v: Any, culture: str) -> str:
             iso = f"{v.year:04d}-{v.month:02d}-{v.day:02d}T{v.hour:02d}:{v.minute:02d}:{v.second:02d}" \
                   f".{_fraction(v.microsecond)}"
             return iso + (_offset(v) if kind == "datetimezone" else "")
-        r = _round_second(v)
-        text = f"{_short_date(r.date(), culture)} {_long_time(r.time(), c)}"
+        # (Desktop rounds from half a second before this, which a value without a millisecond never reaches)
+        text = f"{_short_date(v.date(), culture)} {_long_time(v.time(), c)}"
         return text + (" " + _offset(v) if kind == "datetimezone" else "")
     if kind == "duration":
         return duration_text(v)
@@ -276,16 +291,14 @@ def _reads_as_other(shorthand: str, culture: str) -> bool:
     if shorthand.startswith("'"):
         return True
     text = shorthand.lstrip()
-    if text:
-        try:
-            library.number_from_text(text, culture)
-            return True
-        except MError:
-            pass
+    if reads_as_number(text, culture):
+        return True
     squeezed = re.sub(r"\s", "", text)
     if squeezed.lower() in ("true", "false") or squeezed == "null":
         return True
     if text:
+        if _ISO_ZONED.fullmatch(text):                  # M's ISO forms with a zone (IsoDateTimeParser)
+            return True
         try:
             library._parse_datetime(text, culture)
             return True
@@ -293,6 +306,100 @@ def _reads_as_other(shorthand: str, culture: str) -> bool:
             if "isn't supported" in e.message:
                 raise ShorthandUnsupported(e.message) from None
     return _reads_as_duration(text)
+
+
+_ISO_ZONED = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d{1,7})?)?(Z|[+-]\d{2}:\d{2})")
+
+# .NET's number text for these cultures (Windows' data): signs, separators, the currency symbol (the invariant
+# culture's is "¤"), NaN; the infinity symbols as above
+_CURRENCY = {"": "\u00a4"}
+
+
+def _parse_number(s: str, currency: str) -> bool:
+    """Whether .NET's ParseNumber reads all of ``s`` under NumberStyles.Any (leading and trailing white space, a sign
+    before or after, parentheses, a currency symbol once, "," between digits after the first, ".", an exponent),
+    with "-", "+", "," and "." as these cultures write them, and negative pattern 1."""
+    i, n = 0, len(s)
+    white = lambda ch: ch == " " or "\t" <= ch <= "\r"   # noqa: E731
+    sign = parens = cur = False
+    while i < n:
+        ch = s[i]
+        if white(ch) and not sign:
+            i += 1
+        elif not sign and ch in "+-":
+            sign = True
+            i += 1
+        elif ch == "(" and not sign:
+            sign = parens = True
+            i += 1
+        elif not cur and s.startswith(currency, i):
+            cur = True
+            i += len(currency)
+        else:
+            break
+    digits = decimal = False
+    while i < n:
+        ch = s[i]
+        if "0" <= ch <= "9":
+            digits = True
+        elif ch == "." and not decimal:
+            decimal = True
+        elif ch == "," and digits and not decimal:
+            pass
+        else:
+            break
+        i += 1
+    if not digits:
+        return False
+    if i < n and s[i] in "eE":
+        j = i + 1
+        if j < n and s[j] in "+-":
+            j += 1
+        if j < n and "0" <= s[j] <= "9":
+            while j < n and "0" <= s[j] <= "9":
+                j += 1
+            i = j
+    while i < n:
+        ch = s[i]
+        if white(ch):
+            i += 1
+        elif not sign and ch in "+-":
+            sign = True
+            i += 1
+        elif ch == ")" and parens:
+            parens = False
+            i += 1
+        elif not cur and s.startswith(currency, i):
+            cur = True
+            i += len(currency)
+        else:
+            break
+    return i == n and not parens
+
+
+def reads_as_number(text: str, culture: str) -> bool:
+    """NumberValue.TryParse(text, NumberStyles.Any, culture): .NET's double or decimal parse (an overflow is still a
+    number, an infinity), the culture's NaN and infinity symbols, or a percent: one "%" and at most one "-" among
+    white space at either end, around such a number."""
+    currency = _CURRENCY.get(culture, "$")
+    if _parse_number(text, currency):
+        return True
+    if text.strip(" \t\n\v\f\r") in ("NaN", *_INFINITY.get(culture, _DEFAULT_INFINITY)):
+        return True
+    i, j, percents, negatives = 0, len(text) - 1, 0, 0
+    while i <= j:
+        if text[i] in "%-":
+            percents, negatives = percents + (text[i] == "%"), negatives + (text[i] == "-")
+        elif not text[i].isspace():
+            break
+        i += 1
+    while j >= i:
+        if text[j] in "%-":
+            percents, negatives = percents + (text[j] == "%"), negatives + (text[j] == "-")
+        elif not text[j].isspace():
+            break
+        j -= 1
+    return j >= i and percents == 1 and negatives <= 1 and _parse_number(text[i:j + 1], currency)
 
 
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -326,20 +433,39 @@ def _metadata_field(record: Any, name: str) -> Any:
     return None
 
 
+def _parameter_meta(root: Any) -> Any:
+    """A parameter's ``meta`` node: the query's own, or a one-step ``let`` returning it (Power BI allows single-step
+    parameters); None for a query that isn't one."""
+    node = root
+    if root.kind == "let" and len(root.names) == 1:
+        body = root.children[1]
+        if body.kind == "identifier" and not body.inclusive and body.ident == root.names[0][0]:
+            node = root.children[0]
+    tree = node.tree
+    if (isinstance(tree, ast.Binary) and tree.op == "meta" and len(node.children) == 2
+            and node.children[1].kind == "record" and _metadata_field(node.children[1], "IsParameterQuery") is not None):
+        return node
+    return None
+
+
+def is_parameter(root: Any) -> bool:
+    """Whether a query is a parameter, as Power Query decides when a file loads: its ``meta`` record names
+    IsParameterQuery, whatever the value."""
+    return _parameter_meta(root) is not None
+
+
 def parameter_label_value(root: Any, units: str, culture: str) -> Optional[str]:
-    """What the Queries pane shows in a parameter's "Name (value)" (a check reader's root node), None for "...".
-    Not a parameter (no ``meta [IsParameterQuery = true]`` at the top) is None too."""
-    tree = root.tree
-    if not (isinstance(tree, ast.Binary) and tree.op == "meta" and len(root.children) == 2
-            and root.children[1].kind == "record"):
+    """What the Queries pane shows in a parameter's "Name (value)" (a check reader's root node), None for "..." (or
+    for a query that isn't a parameter: ``is_parameter`` tells them apart)."""
+    node = _parameter_meta(root)
+    if node is None:
         return None
-    record = root.children[1]
-    flag = _metadata_field(record, "IsParameterQuery")
-    if flag is None or flag.kind != "constant" or flag.tree.value is not True:
-        return None
-    left = root.children[0]
-    if _metadata_field(record, "BinaryIdentifier") is not None:
-        return left.ident if left.kind == "identifier" and not left.inclusive else None
+    left = node.children[0]
+    if _metadata_field(node.children[1], "BinaryIdentifier") is not None:
+        return left.ident if left.kind == "identifier" else None
+    if left.kind == "invoke" and left.children[0].kind == "constant" and getattr(left.children[0].tree, "name", "") \
+            in ("#binary", "#table"):
+        raise ShorthandUnsupported(f"The shorthand of a {left.children[0].tree.name} parameter value isn't supported yet.")
     v = constant_value(left, units, culture)
     if v is _NOT_CONSTANT:
         return None

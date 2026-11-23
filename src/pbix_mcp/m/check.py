@@ -1425,6 +1425,7 @@ class QuerySteps:
     error: Optional[SourceError] = None   # with no steps, the one item's error: the text's own parse error
     formula: Optional[str] = None  # with no steps, the formula bar's text for the whole query (as a step's)
     formula_unsupported: Optional[str] = None
+    is_parameter: bool = False    # a parameter query, as Power Query decides when a file loads
     parameter_value: Optional[str] = None   # a parameter's value as the Queries pane shows it, None for "..."
     parameter_unsupported: Optional[str] = None
 
@@ -1507,9 +1508,11 @@ def query_steps(text: str, culture: str = "en-US") -> QuerySteps:
         held = _to_text(root.verbatim) if root.verbatim is not None else ""
         return QuerySteps(False, [], -1, _verbatim_error(root), formula="= " + held)
     parameter, parameter_unsupported = _shorthand_or_reason(shorthand.parameter_label_value, root, units, culture)
+    is_parameter = shorthand.is_parameter(root)
     if root.kind != "let" or not root.names or not _has_parts(root):
-        formula, unsupported = _shorthand_or_reason(shorthand.formula_text, root, units, text, culture)
-        return QuerySteps(False, [], -1, formula=formula, formula_unsupported=unsupported,
+        written = _to_text(units[root.start:root.end])   # its own tokens: no comment or white space around
+        formula, unsupported = _shorthand_or_reason(shorthand.formula_text, root, units, written, culture)
+        return QuerySteps(False, [], -1, formula=formula, formula_unsupported=unsupported, is_parameter=is_parameter,
                           parameter_value=parameter, parameter_unsupported=parameter_unsupported)
     toks = tokenize(units)
     # A step is looked up by its name, the first variable of that name answering for every one of them
@@ -1548,7 +1551,7 @@ def query_steps(text: str, culture: str = "en-US") -> QuerySteps:
     first_error = next((k for k, s in enumerate(steps) if s.error is not None), None)
     chosen = first_error if first_error is not None else len(steps) - 1
     return QuerySteps(True, steps, first_of[root.names[chosen][0]],   # selected by name too
-                      parameter_value=parameter, parameter_unsupported=parameter_unsupported)
+                      is_parameter=is_parameter, parameter_value=parameter, parameter_unsupported=parameter_unsupported)
 
 
 def _shorthand_or_reason(fn, *args) -> tuple[Optional[str], Optional[str]]:
