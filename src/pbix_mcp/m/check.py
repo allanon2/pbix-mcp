@@ -33,7 +33,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Optional
 
-from . import ast
+from . import ast, shorthand
 
 class MSyntaxError(ValueError):
     """Text that isn't M, with Power Query's message. ``offset`` is where in the text (a Python index) the first
@@ -1412,6 +1412,8 @@ class Step:
     error: Optional[SourceError]  # the parse error of a verbatim literal step's text (the error icon), else None
     navigation: bool              # the step shown for the run of navigation steps after the source, under its name
     hidden: bool                  # an earlier step of that run: not listed
+    formula: Optional[str] = None  # the formula bar's text: a constant's shorthand, else "= " and the text (#352)
+    formula_unsupported: Optional[str] = None   # why ``formula`` is None: a shorthand not settled yet
 
 
 @dataclass
@@ -1421,6 +1423,10 @@ class QuerySteps:
     steps: list
     selected: int                 # the step a query opens on: the first with an error, else the last; -1 with none
     error: Optional[SourceError] = None   # with no steps, the one item's error: the text's own parse error
+    formula: Optional[str] = None  # with no steps, the formula bar's text for the whole query (as a step's)
+    formula_unsupported: Optional[str] = None
+    parameter_value: Optional[str] = None   # a parameter's value as the Queries pane shows it, None for "..."
+    parameter_unsupported: Optional[str] = None
 
 
 def _to_text(units: str) -> str:
@@ -1479,7 +1485,7 @@ def _is_navigation(node: _Node) -> bool:
     return False
 
 
-def query_steps(text: str) -> QuerySteps:
+def query_steps(text: str, culture: str = "en-US") -> QuerySteps:
     """The applied steps Power Query's editor lists for a query's text.
 
     Only a ``let`` with at least one variable whose body is a plain name naming its last variable has steps; each is a
@@ -1488,16 +1494,23 @@ def query_steps(text: str) -> QuerySteps:
     holds, with that text's parse error. The query opens on its first step with an error, else its last. A step is
     looked up by name, so of two variables with one name the first answers for both (text, error, description).
     With no steps, ``error`` is the one item's: the text's parse error, or a verbatim literal's text's.
+    ``formula`` is the formula bar's text in ``culture`` (``shorthand``): a constant's shorthand, else "= " and the
+    text; ``parameter_value`` a parameter's value as the Queries pane shows it.
     Raises ``NoCheckResult`` where Power Query's editor gets no answer (a verbatim literal holding anything but text).
     """
     units = _utf16(text)
     found, root = _read(units)
     if found is not None:   # stored as a verbatim literal: one item, with the text's error
-        return QuerySteps(False, [], -1, _source_error(units, found.message, found.start, found.end))
+        return QuerySteps(False, [], -1, _source_error(units, found.message, found.start, found.end),
+                          formula="= " + text)
     if root.kind == "verbatim":
-        return QuerySteps(False, [], -1, _verbatim_error(root))
+        held = _to_text(root.verbatim) if root.verbatim is not None else ""
+        return QuerySteps(False, [], -1, _verbatim_error(root), formula="= " + held)
+    parameter, parameter_unsupported = _shorthand_or_reason(shorthand.parameter_label_value, root, units, culture)
     if root.kind != "let" or not root.names or not _has_parts(root):
-        return QuerySteps(False, [], -1)
+        formula, unsupported = _shorthand_or_reason(shorthand.formula_text, root, units, text, culture)
+        return QuerySteps(False, [], -1, formula=formula, formula_unsupported=unsupported,
+                          parameter_value=parameter, parameter_unsupported=parameter_unsupported)
     toks = tokenize(units)
     # A step is looked up by its name, the first variable of that name answering for every one of them
     first_of: dict[str, int] = {}
@@ -1512,11 +1525,15 @@ def query_steps(text: str) -> QuerySteps:
     steps = []
     for k, ((name, name_start, name_end), value) in enumerate(zip(root.names, values)):
         error = None
+        formula: Optional[str]
+        unsupported = None
         if value.kind == "verbatim":
             step_text = _to_text(value.verbatim) if value.verbatim is not None else ""
             error = _verbatim_error(value)
+            formula = "= " + step_text
         else:
             step_text = _to_text(units[value.start:value.end])
+            formula, unsupported = _shorthand_or_reason(shorthand.formula_text, value, units, step_text, culture)
         named = root.names[first_of[name]]
         steps.append(Step(
             name=_to_text(name), name_start=name_start, name_end=name_end, text=step_text,
@@ -1525,10 +1542,20 @@ def query_steps(text: str) -> QuerySteps:
             error=error,
             navigation=k == nav_end and k != 0,
             hidden=0 < k < nav_end,
+            formula=formula,
+            formula_unsupported=unsupported,
         ))
     first_error = next((k for k, s in enumerate(steps) if s.error is not None), None)
     chosen = first_error if first_error is not None else len(steps) - 1
-    return QuerySteps(True, steps, first_of[root.names[chosen][0]])   # selected by name too
+    return QuerySteps(True, steps, first_of[root.names[chosen][0]],   # selected by name too
+                      parameter_value=parameter, parameter_unsupported=parameter_unsupported)
+
+
+def _shorthand_or_reason(fn, *args) -> tuple[Optional[str], Optional[str]]:
+    try:
+        return fn(*args), None
+    except shorthand.ShorthandUnsupported as e:
+        return None, str(e)
 
 
 def _has_parts(root: _Node) -> bool:
