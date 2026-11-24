@@ -58,7 +58,11 @@ def test_differs_from_the_round_trip():
     (0.5, "Percentage.Type", "", "50.00 %"),
     (1234.5, "Currency.Type", "en-US", "1,234.50"), (-1234567.125, "Currency.Type", "en-AU", "-1,234,567.13"),
     (1.5, "Int64.Type", "en-US", "1.5"),
+    # past Decimal's default 28 digits (a second review found these raised InvalidOperation)
+    (1e30, "Percentage.Type", "en-US", "1" + "0" * 32 + ".00%"), (1e30, "Currency.Type", "en-US", "1" + ",000" * 10 + ".00"),
+    (-1.7976931348623157e308, "Currency.Type", "en-US", "-179,769,313,486,232" + ",000" * 98 + ".00"),
 ])
+
 def test_column_facets(value, facet, culture, text):
     assert display_text(value, culture, facet) == text
 
@@ -78,3 +82,10 @@ def test_time_rule_and_round_trip_kinds(value, text):
 def test_an_unknown_culture_is_refused():
     with pytest.raises(ShorthandUnsupported):
         display_text(1.5, "xx-ZZ")
+
+
+def test_ten_decimals_less_the_rounded_digits():
+    # the digit count is of the magnitude rounded to a whole number, as Desktop's ToString("0").Length: 9.876543219
+    # rounds to 10, two digits, eight decimals
+    assert display_text(9.876543219, "en-US") == "9.87654322"
+    assert display_text(9.476543219, "en-US") == "9.476543219"

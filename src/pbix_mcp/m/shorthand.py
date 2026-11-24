@@ -34,7 +34,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 from typing import Any, Optional
 
 from . import ast, dtparse, library
@@ -265,9 +265,9 @@ def value_text(v: Any, culture: str) -> str:
 # Power Query's data preview shows a cell's display string, not its round-trip text (pivot-studio #361): the engine's
 # DisplayString as .NET Framework formats it in the culture. Rules, read as behaviour:
 #
-# - A number from 0.0001 to 99,999,999,999 in magnitude (or zero) in at most 10 significant integer-and-fraction digits:
-#   10 less its integer digits, at most 9 decimals, trailing zeros dropped ("0.333333333", "0.3" for 0.1 + 0.2,
-#   "1234567891" for 1234567890.5); outside that, scientific with one to five decimals ("1.0E-07", "1.23457E+11").
+# - A number from 0.0001 to 99,999,999,999 in magnitude (or zero) with 10 decimals less the digits of its magnitude
+#   rounded to a whole number, at most 9, trailing zeros dropped ("0.333333333", "0.3" for 0.1 + 0.2, "1234567891" for
+#   1234567890.5; 9.876543219 rounds to 10, two digits, so "9.87654322"); outside that, scientific with one to five decimals ("1.0E-07", "1.23457E+11").
 #   Digits are taken to 15 significant first, then rounded half away from zero. NaN "NaN", the infinities
 #   "Infinity" and "-Infinity" whatever the culture.
 # - In a Percentage.Type column: times 100 in two decimals with no grouping ("50.00%"); a Currency.Type column: grouped
@@ -316,6 +316,12 @@ def _scientific(d: Decimal) -> str:
 def number_display_text(v: Any, culture: str, facet: Optional[str] = None) -> str:
     """A number's display string in the culture, ``facet`` its column's type (Percentage.Type, Currency.Type)."""
     _culture(culture)
+    with localcontext() as ctx:
+        ctx.prec = 400          # every double's whole digits and two decimals (1.8E+308 times 100), past the default 28
+        return _number_display_text(v, culture, facet)
+
+
+def _number_display_text(v: Any, culture: str, facet: Optional[str]) -> str:
     if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
         return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
     d = v if isinstance(v, Decimal) else (Decimal(v) if isinstance(v, int) and abs(v) < 10 ** 15 else _digits15(float(v)))
