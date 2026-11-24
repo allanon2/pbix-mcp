@@ -322,7 +322,7 @@ def number_display_text(v: Any, culture: str, facet: Optional[str] = None) -> st
 
 
 def _number_display_text(v: Any, culture: str, facet: Optional[str]) -> str:
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) or isinstance(v, Decimal) and not v.is_finite():
         return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
     d = v if isinstance(v, Decimal) else (Decimal(v) if isinstance(v, int) and abs(v) < 10 ** 15 else _digits15(float(v)))
     if facet == "Percentage.Type":

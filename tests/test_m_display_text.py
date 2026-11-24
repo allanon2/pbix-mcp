@@ -89,3 +89,9 @@ def test_ten_decimals_less_the_rounded_digits():
     # rounds to 10, two digits, eight decimals
     assert display_text(9.876543219, "en-US") == "9.87654322"
     assert display_text(9.476543219, "en-US") == "9.476543219"
+
+
+@pytest.mark.parametrize("facet", [None, "Currency.Type", "Percentage.Type"])
+def test_a_non_finite_decimal(facet):
+    # a second review: these raised InvalidOperation (the float guard didn't cover Decimal)
+    assert [display_text(Decimal(x), "en-US", facet) for x in ("NaN", "Infinity", "-Infinity")] == ["NaN", "Infinity", "-Infinity"]
