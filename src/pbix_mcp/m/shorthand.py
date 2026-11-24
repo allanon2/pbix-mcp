@@ -34,7 +34,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Optional
 
 from . import ast, dtparse, library
@@ -258,6 +258,106 @@ def value_text(v: Any, culture: str) -> str:
     if kind == "duration":
         return duration_text(v)
     raise ShorthandUnsupported(f"The shorthand of a {kind} value isn't supported yet.")
+
+
+# --- a value's display text (a preview cell) ----------------------------------------------------------------------
+#
+# Power Query's data preview shows a cell's display string, not its round-trip text (pivot-studio #361): the engine's
+# DisplayString as .NET Framework formats it in the culture. Rules, read as behaviour:
+#
+# - A number from 0.0001 to 99,999,999,999 in magnitude (or zero) in at most 10 significant integer-and-fraction digits:
+#   10 less its integer digits, at most 9 decimals, trailing zeros dropped ("0.333333333", "0.3" for 0.1 + 0.2,
+#   "1234567891" for 1234567890.5); outside that, scientific with one to five decimals ("1.0E-07", "1.23457E+11").
+#   Digits are taken to 15 significant first, then rounded half away from zero. NaN "NaN", the infinities
+#   "Infinity" and "-Infinity" whatever the culture.
+# - In a Percentage.Type column: times 100 in two decimals with no grouping ("50.00%"); a Currency.Type column: grouped
+#   in two decimals ("1,234.50").
+# - A datetime as the culture's short date and long time, a datetimezone with its offset after, a time in the long
+#   time; any of them from half a second up rounds to the next second (no fraction is shown).
+# - A duration, a logical, null and text as their round-trip text.
+#
+# The cultures are dtparse's; the number formats are theirs on Windows (en-US, en-AU: "-n", "n%"; invariant "n %").
+_PERCENT_SPACE = {"": True}
+
+
+def _digits15(v: float) -> Decimal:
+    """A double's 15 significant digits, as .NET Framework's formatting takes them before rounding to a format."""
+    return Decimal(f"{v:.14e}")
+
+
+def _fixed(d: Decimal, decimals: int, group: bool = False, keep: bool = False) -> str:
+    """``d`` rounded half away from zero to ``decimals`` places; trailing zeros dropped unless ``keep``."""
+    q = d.quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP) if decimals else \
+        d.quantize(Decimal(1), rounding=ROUND_HALF_UP)
+    sign = "-" if q < 0 else ""
+    text = format(abs(q), f"{',' if group else ''}.{decimals}f")
+    if not keep and "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return sign + text if text.strip("0.,") else text      # a value rounding to zero has no sign
+
+
+def _scientific(d: Decimal) -> str:
+    """.NET's custom "0.0####E+00": one integer digit, one to five decimals, a signed exponent of two digits at least."""
+    if d == 0:
+        return "0.0E+00"
+    sign = "-" if d < 0 else ""
+    d = abs(d)
+    exponent = d.adjusted()
+    mantissa = (d.scaleb(-exponent)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
+    if mantissa >= 10:
+        exponent += 1
+        mantissa = (d.scaleb(-exponent)).quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
+    text = format(mantissa, ".5f").rstrip("0")
+    if text.endswith("."):
+        text += "0"
+    return f"{sign}{text}E{'+' if exponent >= 0 else '-'}{abs(exponent):02d}"
+
+
+def number_display_text(v: Any, culture: str, facet: Optional[str] = None) -> str:
+    """A number's display string in the culture, ``facet`` its column's type (Percentage.Type, Currency.Type)."""
+    _culture(culture)
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return "NaN" if v != v else ("Infinity" if v > 0 else "-Infinity")
+    d = v if isinstance(v, Decimal) else (Decimal(v) if isinstance(v, int) and abs(v) < 10 ** 15 else _digits15(float(v)))
+    if facet == "Percentage.Type":
+        text = _fixed(d * 100, 2, keep=True)
+        return text + (" %" if _PERCENT_SPACE.get(culture) else "%")
+    if facet == "Currency.Type":
+        return _fixed(d, 2, group=True, keep=True)
+    a = abs(d)
+    if a != 0 and not (Decimal("0.0001") <= a <= Decimal("99999999999")):
+        return _scientific(d)
+    length = len(str(a.quantize(Decimal(1), rounding=ROUND_HALF_UP)))
+    return _fixed(d, min(9, max(0, 10 - length)))
+
+
+def _round_second(v: Any) -> Any:
+    """Half a second and up rounds to the next second, as the preview shows a time; the fraction then dropped."""
+    if v.microsecond >= 500_000:
+        try:
+            v = v + dt.timedelta(microseconds=500_000)
+        except OverflowError:
+            pass
+    return v.replace(microsecond=0)
+
+
+def display_text(v: Any, culture: str, facet: Optional[str] = None) -> str:
+    """A primitive value's display string in the culture, as Power Query's data preview shows a cell (#361);
+    ``facet`` is the column's type facet. What isn't settled raises ``ShorthandUnsupported``."""
+    c = _culture(culture)
+    if isinstance(v, Decimal):
+        return number_display_text(v, culture, facet)
+    kind = kind_of(v)
+    if kind == "number":
+        return number_display_text(v, culture, facet)
+    if kind == "time":
+        t = _round_second(dt.datetime.combine(dt.date(2000, 1, 1), v)).time()
+        return _long_time(t, c)
+    if kind in ("datetime", "datetimezone"):
+        r = _round_second(v)
+        text = f"{_short_date(r.date(), culture)} {_long_time(r.time(), c)}"
+        return text + (" " + _offset(r) if kind == "datetimezone" else "")
+    return value_text(v, culture)
 
 
 # --- what text reads back as --------------------------------------------------------------------------------------
