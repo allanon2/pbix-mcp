@@ -10,6 +10,9 @@ from pbix_mcp.m import MError, evaluate
 from pbix_mcp.m.evaluate import force_table
 from pbix_mcp.m.values import ANY, MType, Table
 
+# By hand: the median of rows 0, 8, 16 (all k 0) is row 8, swapped to 15; the scan swaps 1-14, 2-12, 3-10, 4-6 and
+# stops at 5, which takes the pivot; rows 6-16 and 0-4 are then insertion-sorted (stable).
+EXPECTED_17 = [0, 14, 12, 10, 6, 8, 4, 2, 16, 7, 15, 9, 3, 11, 13, 1, 5]
 T3 = '#table({"k", "v"}, {{2, "b"}, {1, "a"}, {3, "c"}})'
 
 
@@ -122,6 +125,39 @@ class TestSortOrder:
         t = '#table({"k", "v"}, {{1, "x"}, {0, "y"}, {1, "z"}, {0, "w"}})'
         assert col(f'Table.Sort({t}, "k")', "v") == ["y", "w", "x", "z"]
 
+    def test_three_tied_rows_by_compare_and_swap(self):
+        # .NET's three-item case: swap-if-greater (0, 1), (0, 2), (1, 2); x and y tie, so z, y, x
+        t = '#table({"k", "v"}, {{2, "x"}, {2, "y"}, {1, "z"}})'
+        assert col(f'Table.Sort({t}, "k")', "v") == ["z", "y", "x"]
+
+    def test_a_larger_table_by_median_of_three(self):
+        # 17 rows, k = i mod 2 (v = i): the pivot is row 8 (k 0); traced by hand through .NET's partition, then an
+        # insertion sort of each side
+        t = "#table({\"k\", \"v\"}, {" + ", ".join(f"{{{i % 2}, {i}}}" for i in range(17)) + "})"
+        assert col(f'Table.Sort({t}, "k")', "v") == EXPECTED_17
+
+    # Measured: Desktop 2.157's refresh (pivot-studio tools/oracle/m_probes.py sort_ties_16 / sort_ties_40, 2026-11-26),
+    # rows {k = i * 7 mod 3, v = i}; v in the order Desktop gave them.
+    @pytest.mark.parametrize("n, measured", [
+        (16, [0, 3, 6, 9, 12, 15, 1, 4, 7, 10, 13, 2, 5, 8, 11, 14]),
+        (40, [0, 36, 33, 30, 27, 24, 21, 18, 15, 12, 39, 9, 3, 6, 25, 37, 1, 34, 31, 28, 4, 10, 19, 16, 13, 7, 22, 14,
+              35, 8, 2, 32, 23, 29, 38, 26, 20, 5, 17, 11])])
+    def test_ties_as_desktop_ordered_them(self, n, measured):
+        t = '#table({"k", "v"}, {' + ", ".join(f"{{{(i * 7) % 3}, {i}}}" for i in range(n)) + "})"
+        assert col(f'Table.Sort({t}, "k")', "v") == measured
+
+    def test_which_side_a_list_lands_on(self):
+        # two rows: .NET compares (row 0, row 1); a list on the left fails, on the right orders by kind
+        assert col('Table.Sort(#table({"k"}, {{1}, {{1}}}), "k")') == [1, [1]]
+        e = err('Table.Sort(#table({"k"}, {{{1}}, {1}}), "k")')
+        assert e.message == "We cannot apply operator < to types List and Number."
+
+    def test_a_later_criterion_is_read_only_when_reached(self):
+        t = '#table({"a", "b"}, {{2, error "x"}, {1, 3}})'
+        out = evaluate(f'Table.Sort({t}, {{"a", "b"}})')
+        assert [r[0] for r in out.rows] == [1, 2]
+        assert evaluate(f'Table.RowCount(Table.Buffer(Table.Sort({t}, {{"a", each [b] + 1}})))') == 2
+
     def test_a_structured_key_fails_the_sort(self):
         # a list as the left operand always fails (as the right one, which side depends on the sort: a NUC probe)
         t = '#table({"k"}, {{{1}}, {{2}}})'
@@ -188,6 +224,9 @@ class TestDistinct:
         e = err(f'Table.Distinct({self.T}, {criteria})')
         assert (e.reason, e.message) == ("Expression.Error", "The specified distinct criteria is invalid.")
 
+    def test_a_non_text_name_is_a_cast_inside(self):
+        assert err(f'Table.Distinct({self.T}, {{1}})').__cause__.message == "We cannot convert the value 1 to type Text."
+
     def test_a_custom_comparer_is_refused(self):
         e = err(f'Table.Distinct({self.T}, each [id])')
         assert e.__cause__.message == "A custom comparer cannot be used in this context."
@@ -230,7 +269,16 @@ class TestBuffer:
         assert err('Table.Buffer(#table({"k"}, {}), [BufferMode = 3])').message == \
             "The value for a 'BufferMode.Type' enumeration was not one of the allowed values: " \
             "'BufferMode.Eager, BufferMode.Delayed'."
-        assert evaluate('Table.RowCount(Table.Buffer(#table({"k"}, {{1}}), [BufferMode = null]))') == 1
+        # measured: an explicit null is a cast error, not the default
+        assert err('Table.Buffer(#table({"k"}, {{1}}), [BufferMode = null])').message == \
+            "We cannot convert the value null to type Number."
+        assert evaluate('Table.RowCount(Table.Buffer(#table({"k"}, {{1}}), []))') == 1
+        assert err('Table.Buffer(#table({"k"}, {}), [BufferMode = "x"])').message == \
+            "This function doesn't support the query option 'BufferMode' with value '\"x\"'."
+        assert err('Table.Buffer(#table({"k"}, {}), [Foo = "a""b"])').message == \
+            "This function doesn't support the query option 'Foo' with value '\"a\"\"b\"'."
+        # in the record's order
+        assert "'BufferMode'" in err('Table.Buffer(#table({"k"}, {}), [BufferMode = "x", Foo = 1])').message
 
 
 class TestAddIndexColumn:
@@ -249,6 +297,11 @@ class TestAddIndexColumn:
         assert col(f'Table.AddIndexColumn({t}, "i", 0, 0.1)', "i") == \
             [0, 0.1, 0.2, 0.30000000000000004, 0.4, 0.5, 0.6, 0.7, 0.7999999999999999, 0.8999999999999999]
 
+    def test_added_as_doubles(self):
+        # 2^53 + 1 isn't a double: it rounds to 2^53
+        assert col(f'Table.AddIndexColumn({T3}, "i", 9007199254740992, 1)', "i")[:2] == \
+            [9007199254740992, 9007199254740992]
+
     def test_the_type_is_ascribed(self):
         t = evaluate(f'Table.AddIndexColumn({T3}, "i", 0, 1, type text)')
         assert t.types[2].kind == "text" and [r[2] for r in t.rows] == [0, 1, 2]
@@ -262,6 +315,12 @@ class TestAddIndexColumn:
     def test_a_failed_cell_keeps_its_index(self):
         t = evaluate('Table.AddIndexColumn(#table({"k"}, {{error "bad"}}), "i")')
         assert t.rows[0][1] == 0
+
+
+class TestColumnNames:
+    def test_in_order(self):
+        assert evaluate(f'Table.ColumnNames({T3})') == ["k", "v"]
+        assert err('Table.ColumnNames({1})').message.startswith("Table.ColumnNames needs a table")
 
 
 class TestRowCount:
@@ -310,6 +369,9 @@ class TestExpandRecordColumn:
             "We cannot convert the value null to type List."
         assert err(f'Table.ExpandRecordColumn({self.T}, "r", {{1}})').message == \
             "We cannot convert the value 1 to type Text."
+        # field i, then new name i: the new name 2 fails before the field 1
+        assert err(f'Table.ExpandRecordColumn({self.T}, "r", {{"x", 1}}, {{2, "b"}})').message == \
+            "We cannot convert the value 2 to type Text."
 
     def test_a_record_type_gives_the_field_types(self):
         t = evaluate('Table.ExpandRecordColumn(#table(type table [r = [x = number, y = text]], {{[x = 1, y = "a"]}}), '

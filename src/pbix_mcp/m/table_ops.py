@@ -8,14 +8,17 @@ NaN below every number, text by UTF-16 code units, datetimezones by their instan
 ``=`` operator's): different kinds are never equal, text is case-sensitive, datetimezones at one instant are equal, NaN
 equals nothing.
 
-Known differences, each to be measured: Power Query's sort is not stable (a .NET introsort; below 17 rows an insertion
-sort, which is), this one is, so rows with equal keys in a larger table may come out in another order; a key that is a
-list, record, table or function, and a binary key, are refused rather than ordered; Table.Distinct with a comparer
-(Comparer.*) isn't supported yet.
+The sort is .NET's introsort (Array.Sort's ArraySortHelper, which Power Query's sort calls), ported step for step, so
+rows with equal keys come out in its order: it isn't stable (three rows already: {2 x, 2 y, 1 z} sorts z, y, x), and
+which of two values is the left operand of a comparison, which decides whether a list key fails, is its choice too.
+
+Known differences: a binary key is refused rather than ordered; Table.Distinct with a comparer (Comparer.*) isn't
+supported yet; an optional field of a record type doesn't make its expanded column nullable (the evaluator's record
+types don't keep "optional" yet); an unknown Table.Buffer option holding a list, record, table or function is named by
+its kind, not its M source.
 """
 from __future__ import annotations
 
-import functools
 import math
 from typing import Any, Callable
 
@@ -151,13 +154,13 @@ def _sort_rows(source: Table, order: list[tuple[Any, bool]]) -> Table:
     if len(rows) < 2:                              # a lone row is never compared, so its keys aren't read
         return Table(list(source.columns), [list(r) for r in rows], list(source.types))
     records = [row_record(source, r) for r in rows]
+    keys: dict[tuple[int, int], Any] = {}          # a key is read when a comparison first reaches its criterion
 
-    def key_of(key: Any, i: int) -> Any:
-        if isinstance(key, int):
-            return force(rows[i][key])
-        return key.invoke([records[i]])
-
-    keys = [[None if isinstance(k, tuple) else key_of(k, i) for k, _ in order] for i in range(len(rows))]
+    def key_of(n: int, i: int) -> Any:
+        if (n, i) not in keys:
+            key = order[n][0]
+            keys[n, i] = force(rows[i][key]) if isinstance(key, int) else key.invoke([records[i]])
+        return keys[n, i]
 
     def compare(i: int, j: int) -> int:
         for n, (key, ascending) in enumerate(order):
@@ -165,13 +168,100 @@ def _sort_rows(source: Table, order: list[tuple[Any, bool]]) -> Table:
                 c = _int32(force(key[1].invoke([records[i], records[j]])))
                 c = (c > 0) - (c < 0)
             else:
-                c = lax_compare(keys[i][n], keys[j][n])
+                c = lax_compare(key_of(n, i), key_of(n, j))
             if c:
                 return c if ascending else -c
         return 0
 
-    ordered = sorted(range(len(rows)), key=functools.cmp_to_key(compare))
+    ordered = list(range(len(rows)))
+    introsort(ordered, compare)
     return Table(list(source.columns), [list(rows[i]) for i in ordered], list(source.types))
+
+
+def introsort(a: list[Any], compare: Callable[[Any, Any], int]) -> None:
+    """.NET's Array.Sort with a comparison (ArraySortHelper's IntrospectiveSort), in place, with its comparisons in
+    its order: partitions of up to 16 items by insertion sort (2 and 3 items by compare-and-swap), else a
+    median-of-three pivot; heapsort past a depth of 2 * (floor(log2 n) + 1)."""
+    n = len(a)
+    if n < 2:
+        return
+
+    def swap_if_greater(i: int, j: int) -> None:
+        if i != j and compare(a[i], a[j]) > 0:
+            a[i], a[j] = a[j], a[i]
+
+    def insertion(lo: int, hi: int) -> None:
+        for i in range(lo, hi):
+            j, t = i, a[i + 1]
+            while j >= lo and compare(t, a[j]) < 0:
+                a[j + 1] = a[j]
+                j -= 1
+            a[j + 1] = t
+
+    def down_heap(i: int, size: int, lo: int) -> None:
+        d = a[lo + i - 1]
+        while i <= size // 2:
+            child = 2 * i
+            if child < size and compare(a[lo + child - 1], a[lo + child]) < 0:
+                child += 1
+            if not compare(d, a[lo + child - 1]) < 0:
+                break
+            a[lo + i - 1] = a[lo + child - 1]
+            i = child
+        a[lo + i - 1] = d
+
+    def heapsort(lo: int, hi: int) -> None:
+        size = hi - lo + 1
+        for i in range(size // 2, 0, -1):
+            down_heap(i, size, lo)
+        for i in range(size, 1, -1):
+            a[lo], a[lo + i - 1] = a[lo + i - 1], a[lo]
+            down_heap(1, i - 1, lo)
+
+    def partition(lo: int, hi: int) -> int:
+        mid = lo + ((hi - lo) >> 1)
+        swap_if_greater(lo, mid)
+        swap_if_greater(lo, hi)
+        swap_if_greater(mid, hi)
+        pivot = a[mid]
+        a[mid], a[hi - 1] = a[hi - 1], a[mid]
+        left, right = lo, hi - 1
+        while left < right:
+            left += 1
+            while compare(a[left], pivot) < 0:
+                left += 1
+            right -= 1
+            while compare(pivot, a[right]) < 0:
+                right -= 1
+            if left >= right:
+                break
+            a[left], a[right] = a[right], a[left]
+        if left != hi - 1:
+            a[left], a[hi - 1] = a[hi - 1], a[left]
+        return left
+
+    def sort(lo: int, hi: int, depth: int) -> None:
+        while hi > lo:
+            size = hi - lo + 1
+            if size <= 16:
+                if size == 2:
+                    swap_if_greater(lo, hi)
+                elif size == 3:
+                    swap_if_greater(lo, hi - 1)
+                    swap_if_greater(lo, hi)
+                    swap_if_greater(hi - 1, hi)
+                else:
+                    insertion(lo, hi)
+                return
+            if depth == 0:
+                heapsort(lo, hi)
+                return
+            depth -= 1
+            p = partition(lo, hi)
+            sort(p + 1, hi, depth)
+            hi = p - 1
+
+    sort(0, n - 1, 2 * n.bit_length())
 
 
 # --- Table.Distinct ---------------------------------------------------------------------------------------------------
@@ -193,7 +283,7 @@ def _distinct_columns(table: Table, criteria: Any) -> list[int]:
         out = []
         for c in items:
             if not isinstance(c, str):
-                raise _error("The specified column selector is invalid.")
+                raise _cast(c, "Text")
             out.append(table.index(c))
         return out
     raise _error("The specified column selector is invalid.")
@@ -247,14 +337,15 @@ def _buffer(table: Any, options: Any = None) -> Table:
     if options is not None:
         if not isinstance(options, Record):
             raise _cast(options, "Record")
-        for name in options.fields:
-            if name != "BufferMode":
-                value = options[name]
+        value = None
+        for name in options.fields:                # in the record's order: an unknown option, or one of the wrong kind
+            value = options[name]
+            if name != "BufferMode" or not (value is None or _is_number(value)):
+                shown = '"' + value.replace('"', '""') + '"' if isinstance(value, str) else value_source(value)
                 raise _error(f"This function doesn't support the query option '{name}' with value "
-                             f"'{value_source(value) or kind_of(value)}'.")
-        value = options["BufferMode"] if "BufferMode" in options else None
-        if value is not None:
-            if not _is_number(value):
+                             f"'{shown or kind_of(value)}'.")
+        if "BufferMode" in options:
+            if value is None:                      # a Desktop refresh: an explicit null isn't the default
                 raise _cast(value, "Number")
             if value not in (BUFFER_EAGER, BUFFER_DELAYED):
                 raise _error("The value for a 'BufferMode.Type' enumeration was not one of the allowed values: "
@@ -290,7 +381,9 @@ def _add_index_column(table: Any, name: Any, initial: Any = None, increment: Any
     rows = []
     for i, r in enumerate(t.rows):
         if i:
-            value = value + step
+            value = _as_double(value) + _as_double(step)        # as doubles: 2^53 + 1 is 2^53
+            if value.is_integer() and abs(value) <= 2 ** 53:
+                value = int(value)
         rows.append([*r, value])
     return Table([*t.columns, name], rows, [*t.types, column_type or MType("number", False)])
 
@@ -303,6 +396,10 @@ def _row_count(table: Any) -> int:
     while isinstance(t, SortedTable):
         t = t.source
     return len(t.rows)
+
+
+def _column_names(table: Any) -> list[str]:
+    return list(_need_table(table, "Table.ColumnNames").columns)
 
 
 # --- Table.ExpandRecordColumn -----------------------------------------------------------------------------------------
@@ -356,8 +453,11 @@ def _expand_record_column(table: Any, column: Any, field_names: Any, new_names: 
     at = t.index(column)
     if new_names is not None and len(new_names) != len(field_names):
         raise _error("We expected newColumnNames to have the same number of items as fieldNames.", new_names)
-    fields = _texts(field_names)
-    names = fields if new_names is None else _texts(new_names)
+    if new_names is None:
+        fields = names = _texts(field_names)
+    else:                                          # field i, then new name i
+        pairs = [_texts([f, nn]) for f, nn in zip(field_names, new_names)]
+        fields, names = [f for f, _ in pairs], [nn for _, nn in pairs]
     others = [c for i, c in enumerate(t.columns) if i != at]
     for group in (fields, names + others):
         dup = next((n for n in group if group.count(n) > 1), None)
@@ -378,6 +478,7 @@ TABLE_OPS: dict[str, Any] = {
     "Table.Buffer": _fn("Table.Buffer", _buffer, 1, 2),
     "Table.AddIndexColumn": _fn("Table.AddIndexColumn", _add_index_column, 2, 5),
     "Table.RowCount": _fn("Table.RowCount", _row_count, 1, 1),
+    "Table.ColumnNames": _fn("Table.ColumnNames", _column_names, 1, 1),
     "Table.ExpandRecordColumn": _fn("Table.ExpandRecordColumn", _expand_record_column, 3, 4),
     "Order.Ascending": ASCENDING,
     "Order.Descending": DESCENDING,
