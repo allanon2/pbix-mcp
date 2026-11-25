@@ -28,6 +28,7 @@ into the text as Python indexes.
 """
 from __future__ import annotations
 
+import dataclasses
 import sys
 import unicodedata
 from dataclasses import dataclass, field
@@ -1610,6 +1611,90 @@ def compile_document(text: str) -> ast.Expr | ast.Section:
         name = first[1].encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
         raise MError("Expression.Error", _SOURCE_DUPLICATE.format(name))
     return tree
+
+
+def referenced_document(text: str) -> ast.Expr | ast.Section:
+    """A query another query reads, as Desktop's evaluator holds it: only the evaluated query's own source errors
+    are raised (SourceErrorExceptionService), so here each duplicate is rewritten into an error raised only where it
+    is read (AstCheckingRewriter): a duplicated let variable or section member keeps one entry at its first place,
+    which raises "Duplicate initializer named '{0}'."; a function or function type with a duplicate parameter
+    raises "Duplicate parameter named '{0}'."; a record or record type with a duplicate field, "Duplicate field
+    named '{0}'." (#354)."""
+    tree, root = _parse(text)
+    first, _verbatims = _duplicate_walk(root)
+    return tree if first is None else _rewritten(tree)
+
+
+_SEMANTIC_INITIALIZER = "Duplicate initializer named '{0}'."
+_SEMANTIC_PARAMETER = "Duplicate parameter named '{0}'."
+_SEMANTIC_FIELD = "Duplicate field named '{0}'."
+
+
+def _first_repeat(names) -> Optional[str]:
+    seen: set[str] = set()
+    for name in names:
+        if name in seen:
+            return name
+        seen.add(name)
+    return None
+
+
+def _raise_node(message: str, node: ast.Node) -> ast.ErrorRaise:
+    return ast.ErrorRaise(ast.Literal("text", message, start=node.start, end=node.end), start=node.start, end=node.end)
+
+
+def _type_repeat(node: ast.Node) -> Optional[str]:
+    """The first duplicate (pre-order) in a type's record and function types, as its message."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.RecordType) and (name := _first_repeat(f.name for f in n.fields)) is not None:
+            return _SEMANTIC_FIELD.format(name)
+        if isinstance(n, ast.FunctionType) and (name := _first_repeat(p.name for p in n.parameters)) is not None:
+            return _SEMANTIC_PARAMETER.format(name)
+    return None
+
+
+def _kept_entries(entries: list) -> list:
+    counts: dict[str, int] = {}
+    for e in entries:
+        counts[e.name] = counts.get(e.name, 0) + 1
+    out, done = [], set()
+    for e in entries:
+        if e.name in done:
+            continue
+        done.add(e.name)
+        if counts[e.name] > 1:
+            out.append(dataclasses.replace(e, value=_raise_node(_SEMANTIC_INITIALIZER.format(e.name), e)))
+        else:
+            out.append(_rewritten(e))
+    return out
+
+
+def _rewritten(node):
+    """``node`` with AstCheckingRewriter's replacements (``referenced_document``); unchanged nodes are kept."""
+    if isinstance(node, list):
+        out = [_rewritten(n) for n in node]
+        return node if all(a is b for a, b in zip(out, node)) else out
+    if not isinstance(node, ast.Node):
+        return node
+    if isinstance(node, ast.Let) and _first_repeat(b.name for b in node.bindings) is not None:
+        return dataclasses.replace(node, bindings=_kept_entries(node.bindings), body=_rewritten(node.body))
+    if isinstance(node, ast.Section) and _first_repeat(m.name for m in node.members) is not None:
+        return dataclasses.replace(node, members=_kept_entries(node.members))
+    if isinstance(node, ast.Function) and (name := _first_repeat(p.name for p in node.parameters)) is not None:
+        return _raise_node(_SEMANTIC_PARAMETER.format(name), node)
+    if isinstance(node, ast.RecordExpr) and (name := _first_repeat(f.name for f in node.fields)) is not None:
+        return _raise_node(_SEMANTIC_FIELD.format(name), node)
+    if isinstance(node, ast.TypeExpr) and (message := _type_repeat(node.type)) is not None:
+        return _raise_node(message, node)
+    changed = {}
+    for f in dataclasses.fields(node):
+        if f.name in ("start", "end"):
+            continue
+        value = getattr(node, f.name)
+        new = _rewritten(value)
+        if new is not value:
+            changed[f.name] = new
+    return dataclasses.replace(node, **changed) if changed else node
 
 
 def _parse(text: str) -> tuple[ast.Expr | ast.Section, _Node]:

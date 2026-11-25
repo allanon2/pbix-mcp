@@ -615,3 +615,42 @@ class TestDuplicateNames:
     def test_parse_document_still_reads_it(self):
         from pbix_mcp.m import parse_document
         assert parse_document("let a = 1, a = 2 in a") is not None
+
+
+class TestReferencedDuplicates:
+    """A query another reads keeps its tree with each duplicate rewritten into an error raised where it is read
+    (AstCheckingRewriter; Desktop raises only the evaluated query's own source errors, #354)."""
+
+    @staticmethod
+    def _value(text):
+        from pbix_mcp.m import referenced_document
+        return evaluate(referenced_document(text))
+
+    def _error(self, text):
+        with pytest.raises(MError) as e:
+            self._value(text)
+        return e.value.reason, e.value.message
+
+    def test_what_isnt_read_still_evaluates(self):
+        assert self._value("let a = 1, a = 2, b = 3 in b") == 3
+        assert self._value("let a = 1, b = 2, a = 3 in b") == 2
+        assert self._value("let f = (x, x) => x, b = 1 in b") == 1
+        assert self._value("let r = [q = 1, q = 2], b = 1 in b") == 1
+        assert self._value("let t = type [q = number, q = text], b = 1 in b") == 1
+        assert self._value("let a = 1, b = let c = 1, c = 2 in 5 in b") == 5
+
+    def test_a_read_duplicate_raises_its_semantic_error(self):
+        assert self._error("let a = 1, a = 2 in a") == ("Expression.Error", "Duplicate initializer named 'a'.")
+        assert self._error("let f = (x, y, x) => x in f(1, 2, 3)") == ("Expression.Error", "Duplicate parameter named 'x'.")
+        assert self._error("[q = 1, q = 2][q]") == ("Expression.Error", "Duplicate field named 'q'.")
+        assert self._error("type [q = number, q = text]") == ("Expression.Error", "Duplicate field named 'q'.")
+        assert self._error("type function (x as number, x as text) as any") == (
+            "Expression.Error", "Duplicate parameter named 'x'.")
+
+    def test_one_slot_at_the_first_place(self):
+        # the duplicated variable keeps its first place: b, defined between, still reads its own value
+        assert self._value("let a = 1, b = 10, a = 2, c = b + 1 in c") == 11
+
+    def test_no_duplicate_is_the_parse_tree_unchanged(self):
+        from pbix_mcp.m import parse_document, referenced_document
+        assert referenced_document("let a = 1, b = [c = 2] in b") == parse_document("let a = 1, b = [c = 2] in b")

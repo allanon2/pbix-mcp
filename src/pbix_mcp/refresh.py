@@ -38,7 +38,16 @@ import tempfile
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
-from pbix_mcp.m import MError, MSyntaxError, ScriptNotRun, Table, UnmappedSource, evaluate
+from pbix_mcp.m import (
+    MError,
+    MSyntaxError,
+    ScriptNotRun,
+    Table,
+    UnmappedSource,
+    compile_document,
+    evaluate,
+    referenced_document,
+)
 from pbix_mcp.m.load import load_rows
 
 # AMO Column data type -> pbix_mcp.m.load's names, and the calc-column materializer's.
@@ -121,7 +130,7 @@ def _unimplemented(tree: Any, meta: "_Metadata") -> list[str]:
                     for t in meta.m[name]:
                         try:
                             todo.append(parse_document(t))
-                        except (MSyntaxError, MError):
+                        except MSyntaxError:
                             pass   # its own evaluation reports it
             elif name not in LIBRARY:
                 out.setdefault(name, None)
@@ -136,7 +145,7 @@ def preview_step(alias: str, text: str, step: Optional[str] = None, *, limit: in
     ``let`` is re-rooted at the step as a tree (its variables, with the step's name as the body); its text is never
     edited. Nothing is installed: the model's data is unchanged."""
     from pbix_mcp import server
-    from pbix_mcp.m import ast, compile_document
+    from pbix_mcp.m import ast, compile_document, referenced_document
 
     info = server._ensure_open(alias)
     meta = _Metadata(info)
@@ -147,8 +156,8 @@ def preview_step(alias: str, text: str, step: Optional[str] = None, *, limit: in
             texts = meta.m.get(name)
             if not texts:
                 raise MError("Expression.Error", f"The name '{name}' wasn't recognized.")
-            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files, python=python)
-                                   for t in texts], name)
+            cache[name] = _append([evaluate(referenced_document(t), resolve=resolve, culture=meta.m_culture,
+                                            files=files, python=python) for t in texts], name)
         return cache[name]
 
     try:
@@ -209,16 +218,18 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
     work: dict[str, dict] = dict(ctx["tables"])
 
     # 1. Every named table's data, before anything calculated reads it.
-    cache: dict[str, Any] = {}
+    cache: dict[tuple[str, bool], Any] = {}
 
-    def resolve(name: str) -> Any:
-        if name not in cache:
+    def resolve(name: str, own: bool = False) -> Any:
+        # own: the table being refreshed, whose source errors (#354: a duplicate name) fail it before it runs
+        if (name, own) not in cache:
             texts = meta.m.get(name)
             if not texts:
                 raise MError("Expression.Error", f"The name '{name}' wasn't recognized.")
-            cache[name] = _append([evaluate(t, resolve=resolve, culture=meta.m_culture, files=files, python=python)
-                                   for t in texts], name)
-        return cache[name]
+            read = compile_document if own else referenced_document
+            cache[name, own] = _append([evaluate(read(t), resolve=resolve, culture=meta.m_culture, files=files,
+                                                 python=python) for t in texts], name)
+        return cache[name, own]
 
     for name in names:
         if name not in meta.partition_m:
@@ -227,7 +238,7 @@ def _refresh(alias: str, names: list[str], files: Optional[Callable[[str], bytes
             raise RefreshError(name, "it has partitions that aren't M as well")
         data = meta.data_columns(name)
         try:
-            value = resolve(name)
+            value = resolve(name, True)
             if not isinstance(value, Table):
                 raise MError("Expression.Error", "The query doesn't return a table.")
             rows = load_rows(value, [(src, _LOAD_TYPE.get(t, "string")) for _, src, t in data],

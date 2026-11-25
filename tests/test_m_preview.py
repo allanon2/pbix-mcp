@@ -98,3 +98,31 @@ def test_a_duplicate_name_fails_every_step_before_it_runs(model):
     for step in ("S", "T", None):
         p = preview_step(model, "let S = 1, T = 2, S = 3 in T", step)
         assert (p.kind, p.reason, p.message) == ("error", "Expression.Error", "The name 'S' is defined more than once.")
+
+
+
+def test_a_duplicate_in_a_query_read_fails_only_where_it_is_read(model):
+    from pbix_mcp import server
+    m = 'let a = 1, a = 2, b = #table({"n"}, {{5}}) in b'
+    assert json.loads(server.pbix_set_partition_m(model, "Other", m))["success"]
+    p = preview_step(model, "let S = Other in S", "S")
+    assert p.kind == "table" and rows(p) == [[5]]
+    p = preview_step(model, "let S = Other in S", None)
+    assert p.kind == "table" and rows(p) == [[5]]
+
+
+def test_a_refreshed_tables_own_duplicate_fails_its_refresh(model):
+    from pbix_mcp import server
+    from pbix_mcp.refresh import RefreshError, refresh_tables
+    m = 'let a = 1, a = 2, b = #table({"n"}, {{5}}) in b'
+    assert json.loads(server.pbix_set_partition_m(model, "Other", m))["success"]
+    with pytest.raises(RefreshError, match="The name 'a' is defined more than once."):
+        refresh_tables(model, ["Other"])
+
+
+def test_a_refresh_reads_a_query_with_a_duplicate_it_never_reads(model):
+    from pbix_mcp import server
+    from pbix_mcp.refresh import refresh_tables
+    assert json.loads(server.pbix_set_partition_m(model, "Other", 'let a = 1, a = 2, b = #table({"n"}, {{5}}) in b'))["success"]
+    assert json.loads(server.pbix_set_partition_m(model, "Sales", 'if Other{0}[n] = 5 then #table({"a"}, {{1}}) else error "not read"'))["success"]
+    assert refresh_tables(model, ["Sales"]).tables == {"Sales": 1}
