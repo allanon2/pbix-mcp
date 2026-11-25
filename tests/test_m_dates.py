@@ -115,6 +115,13 @@ class TestDateToText:
         m = fmt.replace('"', '""')            # M text: a quote doubled, a backslash literal
         assert evaluate(f'Date.ToText(#date(2024, 3, 5), "{m}")', culture="en-US") == text
 
+    def test_long_time_and_the_general_pattern(self):       # Desktop's answers, #105's NUC probe 2026-11-26
+        assert evaluate('Date.ToText(#date(2024, 9, 5), "T", "en-US")') == "12:00:00 AM"
+        assert evaluate('Date.ToText(#date(2024, 9, 5), "", "en-US")') == "9/5/2024 12:00:00 AM"
+        assert evaluate('Date.ToText(#date(2024, 9, 5), "", "en-AU")') == "5/09/2024 12:00:00 AM"
+        assert evaluate('Date.ToText(#date(2024, 9, 5), "T", "")') == "00:00:00"
+        assert evaluate('Date.ToText(#date(2024, 9, 5), "", "")') == "09/05/2024 00:00:00"
+
     def test_the_culture_argument_and_the_default(self):
         assert evaluate('Date.ToText(#date(2024, 3, 5))', culture="en-AU") == "5/03/2024"
         assert evaluate('Date.ToText(#date(2024, 3, 5), null, "en-AU")', culture="en-US") == "5/03/2024"
@@ -133,7 +140,7 @@ class TestDateToText:
 
     def test_refusals_name_what_is_missing(self):
         assert "isn't supported yet" in err('Date.ToText(#date(2024, 3, 5), [Format = "yyyy"])').message
-        assert "isn't supported yet" in err('Date.ToText(#date(2024, 3, 5), "T")').message
+        assert "isn't supported yet" in err('Date.ToText(#date(2024, 3, 5), "t")').message
         assert "isn't supported yet" in err('Date.ToText(#date(2024, 3, 5), "zzz")').message
         assert "isn't supported yet" in err('Date.ToText(#date(2024, 3, 5), "MMMM", "fr-FR")').message
 
@@ -161,9 +168,7 @@ class TestDurationsAndLists:
         assert err("List.Dates(#date(2024, 1, 1), 2, 1)").message == "We cannot convert the value 1 to type Duration."
         assert err("List.Dates(null, 2, #duration(1, 0, 0, 0))").message == \
             "We cannot convert the value null to type Date."
-        items = evaluate("List.Dates(#date(9999, 12, 30), 3, #duration(1, 0, 0, 0))")
-        assert items[:2] == [D(9999, 12, 30), D(9999, 12, 31)]
-        assert isinstance(items[2], CellError) and items[2].error.message == (
+        assert err("List.Dates(#date(9999, 12, 30), 3, #duration(1, 0, 0, 0))").message == (
             "The Date operation failed because the resulting value falls outside the range of allowed values.")
 
 
@@ -183,10 +188,10 @@ class TestText:
         assert evaluate('Text.PadStart("123", 2, "0")') == "123"
         assert evaluate('Text.PadStart("a", 3)') == "  a"
         assert evaluate('Text.PadStart(null, 3, "0")') is None
-        assert evaluate('Text.PadStart("abc", 2, "xy")') == "abc"       # the character is checked only to pad
 
     def test_pad_start_errors(self):
         assert err('Text.PadStart("a", 3, "xy")').message == "The value isn't a single-character string."
+        assert err('Text.PadStart("abc", 2, "xy")').message == "The value isn't a single-character string."
         assert err('Text.PadStart("a", -1)').message == "The 'count' argument is out of range."
         assert err('Text.PadStart("a", 2.5)').message == "The number is out of range of a 32 bit integer value."
         assert err('Text.PadStart("a", null)').message == "We cannot convert the value null to type Number."

@@ -39,6 +39,7 @@ class DateCulture:
     eras: tuple[str, ...] = ("A.D.",)
     abbr_eras: tuple[str, ...] = ("AD",)
     first_day: int = 0          # DateTimeFormatInfo.FirstDayOfWeek, .NET's DayOfWeek (0 is Sunday)
+    long_time: str = "h:mm:ss tt"   # LongTimePattern (Date.ToText "T": en-US, en-AU "12:00:00 AM", #105's probe)
     _tokens: list = field(default_factory=list, compare=False, repr=False)
 
 
@@ -47,7 +48,8 @@ CULTURE_DATA: dict[str, DateCulture] = {
     "en-AU": DateCulture("en-AU", "d/MM/yyyy", "dddd, d MMMM yyyy", "d MMMM", "MMMM yyyy", first_day=1),
     # The invariant culture, which M names "" (.NET's invariant data; its date text is measured, #189). Its
     # two-digit years aren't measured, so they are refused.
-    "": DateCulture("", "MM/dd/yyyy", "dddd, dd MMMM yyyy", "MMMM dd", "yyyy MMMM", two_digit_year_max=None),
+    "": DateCulture("", "MM/dd/yyyy", "dddd, dd MMMM yyyy", "MMMM dd", "yyyy MMMM", two_digit_year_max=None,
+                      long_time="HH:mm:ss"),
 }
 
 

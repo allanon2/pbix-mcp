@@ -230,7 +230,7 @@ _INVARIANT_STANDARD = {      # culture-free patterns, written with the invariant
     "r": "ddd, dd MMM yyyy HH':'mm':'ss 'GMT'", "R": "ddd, dd MMM yyyy HH':'mm':'ss 'GMT'",
     "s": "yyyy'-'MM'-'dd'T'HH':'mm':'ss", "u": "yyyy'-'MM'-'dd HH':'mm':'ss'Z'",
 }
-_TIME_STANDARD = "fFgGtTU"   # need the culture's time patterns (U, the machine's zone too): not held here
+_TIME_STANDARD = "fFgtU"     # the short time pattern isn't measured here; U needs the machine's zone
 
 
 class _BadFormat(Exception):
@@ -349,14 +349,14 @@ def format_date(d: dt.date, fmt: str, c: dtparse.DateCulture) -> str:
         if fmt in _INVARIANT_STANDARD:
             return _custom(_INVARIANT_STANDARD[fmt], v, dtparse.CULTURE_DATA[""])
         pattern = {"d": c.short_date, "D": c.long_date, "m": c.month_day, "M": c.month_day, "y": c.year_month,
-                   "Y": c.year_month}.get(fmt)
+                   "Y": c.year_month, "T": c.long_time, "G": f"{c.short_date} {c.long_time}"}.get(fmt)
         if pattern is None:
             if fmt in _TIME_STANDARD:
                 raise _Unsupported(f"Date.ToText: the standard format '{fmt}' isn't supported yet.")
             raise _BadFormat
         return _custom(pattern, v, c)
     if fmt == "":
-        raise _Unsupported("Date.ToText: an empty format (the general pattern) isn't supported yet.")
+        return _custom(f"{c.short_date} {c.long_time}", v, c)          # .NET reads "" as "G"
     return _custom(fmt, v, c)
 
 
@@ -394,8 +394,9 @@ def _total_days(v: Any) -> Optional[float]:
 
 def _list_dates(start: Any, count: Any, step: Any) -> list[Any]:
     """``count`` dates from ``start``, ``step`` apart: item i is start + step × i while i < count (so a fractional
-    count rounds up); a step's time of day is dropped from each date. An item past 9999-12-31 is an error when read."""
-    from .values import CellError
+    count (so a fractional
+    count rounds up); a step's time of day is dropped from each date. A date past the calendar's range fails the
+    list: Desktop raises it as the list is read, so a table made from it fails whole (#105's probe)."""
     if kind_of(start) != "date":
         raise cast_error(start, "Date")
     if kind_of(count) != "number":
@@ -419,8 +420,8 @@ def _list_dates(start: Any, count: Any, step: Any) -> list[Any]:
                 raise OverflowError
             out.append((base + dt.timedelta(microseconds=total // 10)).date())
         except OverflowError:
-            out.append(CellError(_error("The Date operation failed because the resulting value falls outside the "
-                                        "range of allowed values.")))
+            raise _error("The Date operation failed because the resulting value falls outside the range of allowed "
+                         "values.") from None
     return out
 
 
@@ -438,7 +439,8 @@ def _text_from(evaluator: Any) -> Function:
 
 
 def _pad_start(text: Any, count: Any, character: Any = None) -> Optional[str]:
-    """Pads on the left to ``count`` characters (Unicode characters, not UTF-16 units)."""
+    """Pads on the left to ``count`` characters (Unicode characters, not UTF-16 units); the padding character must be
+    one character even when the text is long enough."""
     if count is None or kind_of(count) != "number":
         raise cast_error(count, "Number")
     if text is not None and not isinstance(text, str):
@@ -450,11 +452,11 @@ def _pad_start(text: Any, count: Any, character: Any = None) -> Optional[str]:
     n = _int32(count)
     if n < 0:
         raise MError("Expression.Error", "The 'count' argument is out of range.", count)
+    pad = " " if character is None else character
+    if len(pad) != 1:          # checked even when nothing is padded (a Desktop refresh, #105's probe)
+        raise _error("The value isn't a single-character string.")
     if len(text) >= n:
         return text
-    pad = " " if character is None else character
-    if len(pad) != 1:
-        raise _error("The value isn't a single-character string.")
     return pad * (n - len(text)) + text
 
 
