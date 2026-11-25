@@ -37,7 +37,7 @@ from .values import ANY, CellError, Function, LazyTable, MError, MType, Record, 
 # Enumerations, from Microsoft's reference pages.
 QUOTE_NONE, QUOTE_CSV = 0, 1
 CSV_QUOTE_AFTER_DELIMITER, CSV_QUOTE_ALWAYS = 0, 1
-EXTRA_LIST, EXTRA_ERROR, EXTRA_IGNORE = 0, 1, 2
+from .tables import EXTRA_ERROR, EXTRA_IGNORE, EXTRA_LIST  # noqa: E402,F401  (ExtraValues.Type: Table.FromList's too)
 ENCODINGS = {65001: "utf-8", 1252: "cp1252", 1200: "utf-16-le", 1201: "utf-16-be", 20127: "ascii"}
 
 
@@ -584,9 +584,6 @@ SOURCES: dict[str, Any] = {
     "QuoteStyle.Csv": QUOTE_CSV,
     "CsvStyle.QuoteAfterDelimiter": CSV_QUOTE_AFTER_DELIMITER,
     "CsvStyle.QuoteAlways": CSV_QUOTE_ALWAYS,
-    "ExtraValues.List": EXTRA_LIST,
-    "ExtraValues.Error": EXTRA_ERROR,
-    "ExtraValues.Ignore": EXTRA_IGNORE,
     "TextEncoding.Utf8": 65001,
     "TextEncoding.Utf16": 1200,
     "TextEncoding.Unicode": 1200,

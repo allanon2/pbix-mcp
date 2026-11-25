@@ -573,10 +573,12 @@ LIBRARY: dict[str, Any] = {
 
 # Tier 1 above; tier 2, the table functions a query's steps use; tier 3, local files; tier 5, Python scripts
 # (pivot-studio ADR-0020; 4 is the web, not built).
+from .dates import DATES  # noqa: E402  (tier 1 too: dates, durations, List.Dates, Text.From, Text.PadStart)
 from .python import PYTHON  # noqa: E402
 from .sources import SOURCES  # noqa: E402  (they import this module's conversions lazily)
 from .tables import TABLES  # noqa: E402
 
+LIBRARY.update(DATES)
 TIERS: dict[str, int] = {**{k: 1 for k in LIBRARY}, **{k: 2 for k in TABLES}, **{k: 3 for k in SOURCES},
                          **{k: 5 for k in PYTHON}}
 LIBRARY.update(TABLES)

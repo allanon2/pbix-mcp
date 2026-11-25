@@ -241,9 +241,15 @@ class TestTables:
             "Binary.FromText", "BinaryEncoding.Base64", "BinaryEncoding.Hex", "Binary.Decompress", "Compression.GZip",
             "Compression.Deflate", "Json.Document", "Table.FromRows", "#table", "Table.TransformColumnTypes",
             "Table.Combine", "Int64.Type", "Currency.Type", "Percentage.Type", "#infinity", "#nan", "#date", "#datetime",
-            "#datetimezone", "#time", "#duration"}
+            "#datetimezone", "#time", "#duration",
+            # #105: a date table's functions (pbix_mcp.m.dates)
+            "Date.Year", "Date.Month", "Date.Day", "Date.QuarterOfYear", "Date.DayOfWeek", "Date.WeekOfYear",
+            "Date.StartOfWeek", "Date.EndOfWeek", "Date.ToText", "Duration.TotalDays", "List.Dates", "Text.From",
+            "Text.PadStart", "Int8.Type", "Day.Sunday", "Day.Monday", "Day.Tuesday", "Day.Wednesday", "Day.Thursday",
+            "Day.Friday", "Day.Saturday"}
         assert {"Table.RenameColumns", "Table.RemoveColumns", "Table.SelectColumns", "Table.AddColumn",
-                "Table.PromoteHeaders", "Text.BeforeDelimiter"} <= tier(2)
+                "Table.PromoteHeaders", "Text.BeforeDelimiter", "Table.FromList", "Splitter.SplitByNothing",
+                "ExtraValues.List", "ExtraValues.Error", "ExtraValues.Ignore"} <= tier(2)
         assert {"File.Contents", "Csv.Document", "Excel.Workbook", "Parquet.Document"} <= tier(3)
         assert LIBRARY_NAMES == set(TIERS)
         # The enumerations' values, from Microsoft's reference pages.
