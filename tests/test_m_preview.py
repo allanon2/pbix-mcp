@@ -70,8 +70,8 @@ def test_an_error_step_and_an_error_cell(model):
 
 
 def test_functions_not_implemented_yet_are_named(model):
-    p = preview_step(model, 'let S = Other, T = Table.SelectRows(S, each [n] > 10), U = Table.Sort(T, {"n"}) in U', "U")
-    assert (p.kind, p.names) == ("unsupported", ["Table.SelectRows", "Table.Sort"])
+    p = preview_step(model, 'let S = Other, T = Table.SelectRows(S, each [n] > 10), U = Table.Group(T, {"n"}, {}) in U', "U")
+    assert (p.kind, p.names) == ("unsupported", ["Table.SelectRows", "Table.Group"])
     assert preview_step(model, 'let S = Other, T = Table.SelectRows(S, each [n] > 10) in T', "S").kind == "table"
 
 

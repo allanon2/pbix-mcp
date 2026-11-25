@@ -577,6 +577,9 @@ from .dates import DATES  # noqa: E402  (tier 1 too: dates, durations, List.Date
 from .python import PYTHON  # noqa: E402
 from .sources import SOURCES  # noqa: E402  (they import this module's conversions lazily)
 from .tables import TABLES  # noqa: E402
+from .table_ops import TABLE_OPS  # noqa: E402  (tier 2 too: sort, distinct, buffer, index, count, expand)
+
+TABLES = {**TABLES, **TABLE_OPS}
 
 LIBRARY.update(DATES)
 TIERS: dict[str, int] = {**{k: 1 for k in LIBRARY}, **{k: 2 for k in TABLES}, **{k: 3 for k in SOURCES},
