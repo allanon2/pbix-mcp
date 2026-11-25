@@ -66,6 +66,8 @@ _DUPLICATE = {
     "field": "The field named '{0}' is already defined in this scope.",
     "member": "The member named '{0}' is already defined in this scope.",
 }
+# What an evaluation raises for any duplicate (SourceError.TryGetErrorReason: Section_Exists, #354)
+_SOURCE_DUPLICATE = "The name '{0}' is defined more than once."
 _VERBATIM_READS = ("Consider removing the verbatim literal brackets ( #!\" ... \" ) to enable evaluation of the "
                    "bracketed expression.")
 _INVALID_NAME_SEQUENCE = "There is an invalid sequence in identifier."
@@ -1264,7 +1266,7 @@ def _first_duplicate_of(node: _Node) -> Optional[tuple[str, int, int]]:
     seen = set()
     for name, start, end in node.names:
         if name in seen:
-            return _DUPLICATE[node.dup].format(name), start, end
+            return name, start, end
         seen.add(name)
     return None
 
@@ -1278,7 +1280,23 @@ def _compile_checks(root: _Node) -> Optional[tuple[str, int, int]]:
     duplicated. A verbatim literal left after that holding anything but text fails the check outright
     (``NoCheckResult``), even after an error was found; one holding text that reads as an expression
     is an error."""
-    first: Optional[tuple[str, int, int]] = None
+    first, verbatims = _duplicate_walk(root)
+    for node in verbatims:
+        if node.verbatim is None:
+            raise NoCheckResult("a verbatim literal holds a value that isn't text")
+    if first is not None:
+        return _DUPLICATE[first[0]].format(first[1]), first[2], first[3]
+    for node in verbatims:
+        found, inner = _read(node.verbatim)
+        if found is None and inner.kind != "section":
+            return _VERBATIM_READS, node.start, node.end
+    return None
+
+
+def _duplicate_walk(root: _Node) -> tuple[Optional[tuple[str, str, int, int]], list[_Node]]:
+    """The first duplicate in Power Query's order (its kind, name and range), and the verbatim literals the
+    duplicate check leaves (``_compile_checks``)."""
+    first: Optional[tuple[str, str, int, int]] = None
     verbatims: list[_Node] = []
     stack = [root]
     while stack:
@@ -1288,7 +1306,7 @@ def _compile_checks(root: _Node) -> Optional[tuple[str, int, int]]:
             dup = _first_duplicate_of(node)
             if dup is not None:
                 if first is None:
-                    first = dup
+                    first = (node.dup, *dup)
                 if node.dup in ("parameter", "field"):
                     kids = []
                 else:
@@ -1300,16 +1318,7 @@ def _compile_checks(root: _Node) -> Optional[tuple[str, int, int]]:
         if node.kind == "verbatim":
             verbatims.append(node)
         stack.extend(reversed(kids))
-    for node in verbatims:
-        if node.verbatim is None:
-            raise NoCheckResult("a verbatim literal holds a value that isn't text")
-    if first is not None:
-        return first
-    for node in verbatims:
-        found, inner = _read(node.verbatim)
-        if found is None and inner.kind != "section":
-            return _VERBATIM_READS, node.start, node.end
-    return None
+    return first, verbatims
 
 
 def check_query(text: str) -> CheckResult:
@@ -1583,7 +1592,27 @@ def _verbatim_error(node: _Node) -> Optional[SourceError]:
 def parse_document(text: str) -> ast.Expr | ast.Section:
     """A query's M as the evaluator's tree (``pbix_mcp.m.ast``): an expression, or a section document. Its offsets
     are indexes into ``text``. Text that doesn't read raises ``MSyntaxError`` with Power Query's message, at the
-    first token it couldn't read; so does text nested too deeply for the reader."""
+    first token it couldn't read; so does text nested too deeply for the reader. A tree is returned for text the
+    compiler would refuse (a duplicate name): ``compile_document`` is what an evaluation reads."""
+    return _parse(text)[0]
+
+
+def compile_document(text: str) -> ast.Expr | ast.Section:
+    """``parse_document`` with the compiler's source errors an evaluation raises before it runs anything: the first
+    duplicate name (a variable, parameter, field, member or section member, in ``check_query``'s order) is an
+    ``MError`` ``Expression.Error`` "The name '{0}' is defined more than once." (#354: Desktop's evaluator throws a
+    source error of the query's partition this way, with that one message for every kind). A verbatim literal isn't
+    one: it is an error only where it is evaluated."""
+    tree, root = _parse(text)
+    first, _verbatims = _duplicate_walk(root)
+    if first is not None:
+        from .values import MError
+        name = first[1].encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+        raise MError("Expression.Error", _SOURCE_DUPLICATE.format(name))
+    return tree
+
+
+def _parse(text: str) -> tuple[ast.Expr | ast.Section, _Node]:
     units = _utf16(text)
     try:
         found, root = _read(units)
@@ -1597,7 +1626,7 @@ def parse_document(text: str) -> ast.Expr | ast.Section:
     if index is not None:
         for node in ast.walk(tree):
             node.start, node.end = index[node.start], index[node.end]
-    return tree
+    return tree, root
 
 
 def parse_expression(text: str) -> ast.Expr:

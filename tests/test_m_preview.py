@@ -91,3 +91,10 @@ def test_the_model_is_unchanged(model):
     preview_step(model, QUERY, "Doubled")
     out = json.loads(server.pbix_evaluate_dax(model, "Total"))
     assert [(r["name"], r["value"]) for r in out["results"]] == [("Total", 7)]
+
+
+def test_a_duplicate_name_fails_every_step_before_it_runs(model):
+    # #354: the query's partition is compiled first, so even a step that doesn't read the duplicate fails
+    for step in ("S", "T", None):
+        p = preview_step(model, "let S = 1, T = 2, S = 3 in T", step)
+        assert (p.kind, p.reason, p.message) == ("error", "Expression.Error", "The name 'S' is defined more than once.")

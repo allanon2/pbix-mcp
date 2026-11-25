@@ -573,3 +573,45 @@ class TestSecondReview:
                  "-\uff15": -65253, " \uff15 ": 65253, "\u0967": 2359, "\u00b2": 130,
                  "\uff15" + "\uff10" * 14: 7250277777777770528}
         assert {v: model_value(v, "int64") for v in cases} == cases
+
+
+class TestDuplicateNames:
+    """A duplicate name is a source error: Desktop's evaluator (SimpleDocumentEvaluator.GetResult) compiles the
+    query's partition and throws its first duplicate before evaluating anything, as Expression.Error with
+    "The name '{0}' is defined more than once." for every kind (SourceError.TryGetErrorReason; #354)."""
+
+    @staticmethod
+    def _error(text):
+        with pytest.raises(MError) as e:
+            evaluate(text)
+        return e.value.reason, e.value.message
+
+    @pytest.mark.parametrize("text, name", [
+        ("let a = 1, a = 2 in a", "a"),
+        ("((a, a) => a)(1, 2)", "a"),
+        ("[a = 1, a = 2][a]", "a"),
+        ('[a = 1, #"a" = 2][a]', "a"),
+        ("let x = 1, y = 2, x = 3 in y", "x"),
+    ])
+    def test_each_kind_is_an_expression_error(self, text, name):
+        assert self._error(text) == ("Expression.Error", f"The name '{name}' is defined more than once.")
+
+    def test_found_before_evaluation_even_where_laziness_would_skip_it(self):
+        assert self._error("let a = 1, a = 2, b = 3 in b")[1] == "The name 'a' is defined more than once."
+        assert self._error("let f = (x) => let y = 1, y = 2 in y in 1")[1] == "The name 'y' is defined more than once."
+        assert self._error('let r = [p = 1, p = 2], b = 3 in b')[1] == "The name 'p' is defined more than once."
+
+    def test_the_first_in_the_checks_order_outermost_first(self):
+        assert self._error("let b = (x, x) => x, a = 1, a = 2 in 1")[1] == "The name 'a' is defined more than once."
+        assert self._error("let a = (x, x) => x, b = [q = 1, q = 2] in 1")[1] == "The name 'x' is defined more than once."
+
+    def test_a_verbatim_literal_is_not_a_source_error(self):
+        assert evaluate('let a = #!"x", b = 1 in b') == 1
+
+    def test_distinct_names_still_evaluate(self):
+        assert evaluate("let a = 1, b = 2 in a + b") == 3
+        assert evaluate("((a, b) => a + b)(1, 2)") == 3
+
+    def test_parse_document_still_reads_it(self):
+        from pbix_mcp.m import parse_document
+        assert parse_document("let a = 1, a = 2 in a") is not None

@@ -121,7 +121,7 @@ def _unimplemented(tree: Any, meta: "_Metadata") -> list[str]:
                     for t in meta.m[name]:
                         try:
                             todo.append(parse_document(t))
-                        except MSyntaxError:
+                        except (MSyntaxError, MError):
                             pass   # its own evaluation reports it
             elif name not in LIBRARY:
                 out.setdefault(name, None)
@@ -136,7 +136,7 @@ def preview_step(alias: str, text: str, step: Optional[str] = None, *, limit: in
     ``let`` is re-rooted at the step as a tree (its variables, with the step's name as the body); its text is never
     edited. Nothing is installed: the model's data is unchanged."""
     from pbix_mcp import server
-    from pbix_mcp.m import ast, parse_document
+    from pbix_mcp.m import ast, compile_document
 
     info = server._ensure_open(alias)
     meta = _Metadata(info)
@@ -152,7 +152,7 @@ def preview_step(alias: str, text: str, step: Optional[str] = None, *, limit: in
         return cache[name]
 
     try:
-        tree = parse_document(text)
+        tree = compile_document(text)
         if step is not None:
             if not isinstance(tree, ast.Let) or not any(b.name == step for b in tree.bindings):
                 raise MError("Expression.Error", f"The query has no step named '{step}'.")

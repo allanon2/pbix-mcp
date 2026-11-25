@@ -16,7 +16,7 @@ from typing import Any, Callable, Optional
 
 from . import ast
 from .library import LIBRARY
-from .check import parse_document
+from .check import compile_document
 from .values import ANY, CellError, Function, MError, MType, Record, Table, Thunk, force, kind_of
 
 Resolver = Callable[[str], Any]
@@ -28,7 +28,7 @@ def evaluate(source: str | ast.Node, *, resolve: Optional[Resolver] = None, cult
     """The value of an M expression. A section document evaluates to a record of its members. ``files`` reads a
     file File.Contents names (the caller's mapping; it raises sources.UnmappedSource for one it doesn't map).
     ``python`` runs a Python.Execute script (python.Runner; without one the step raises python.ScriptNotRun)."""
-    tree = parse_document(source) if isinstance(source, str) else source
+    tree = compile_document(source) if isinstance(source, str) else source
     ev = _Evaluator(resolve, culture, files, python)
     if isinstance(tree, ast.Section):
         scope = _Scope({}, None)
