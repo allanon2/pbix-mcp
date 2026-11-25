@@ -228,6 +228,11 @@ def _before_delimiter(text: Any, delimiter: Any, index: Any = None) -> Any:
     return text[:pos]
 
 
+def _cast(value: Any, type_name: str) -> MError:
+    from .dates import cast_error
+    return cast_error(value, type_name)
+
+
 def _split_by_nothing() -> Function:
     """Splitter.SplitByNothing(): a splitter that keeps each value whole, as a one-item list (null too)."""
     return Function("Splitter.SplitByNothing", lambda value: [value], 1, 1)
@@ -239,19 +244,24 @@ def _from_list_columns(columns: Any, splitter: Function, items: list[Any]) -> tu
     isn't a text splitter gives columns of type any."""
     columns = force(columns)
     if isinstance(columns, MType):
-        if columns.kind != "table" or columns.fields is None:
+        if columns.kind != "table":
             raise _error(_COLUMNS_ERROR)
-        return [n for n, _ in columns.fields], [t for _, t in columns.fields]
+        fields = columns.fields or ()
+        return [n for n, _ in fields], [t for _, t in fields]
     if columns is None:
         width = 0
         if items:
             first = splitter.invoke([force(items[0])])
-            width = len(first) if isinstance(first, list) else 0
+            if not isinstance(first, list):
+                raise _cast(first, "List")
+            width = len(first)
         names = [f"Column{i + 1}" for i in range(width)]
     elif isinstance(columns, (int, float)) and not isinstance(columns, bool):
-        if isinstance(columns, float) and not (columns == columns and columns.is_integer()) or columns < 0:
+        from .dates import _int32
+        n = _int32(columns)                       # 2.5: "out of range of a 32 bit integer value"
+        if n < 0:
             raise _error(_COLUMNS_ERROR)
-        names = [f"Column{i + 1}" for i in range(int(columns))]
+        names = [f"Column{i + 1}" for i in range(n)]
     elif isinstance(columns, list):
         names = [force(c) for c in columns]
         if not all(isinstance(n, str) for n in names):
@@ -266,16 +276,19 @@ def _from_list(items: Any, splitter: Any = None, columns: Any = None, default: A
     more values than columns fail that row (ExtraValues.Error, the default) or are dropped (ExtraValues.Ignore). The
     columns' type is ascribed, the values are what the splitter gave."""
     if not isinstance(items, list):
-        raise _error(f"Table.FromList needs a list, not {kind_of(items)}.")
+        raise _cast(items, "List")
+    if splitter is not None and not isinstance(splitter, Function):
+        raise _cast(splitter, "Function")
+    if extra is not None and (isinstance(extra, bool) or not isinstance(extra, (int, float))):
+        raise _cast(extra, "Number")
+    if extra is not None and extra not in (EXTRA_LIST, EXTRA_ERROR, EXTRA_IGNORE):
+        raise MError("Expression.Error", "The value for a 'ExtraValues.Type' enumeration was not one of the allowed "
+                     "values: 'ExtraValues.List, ExtraValues.Error, ExtraValues.Ignore'.", extra)
     if splitter is None:
         raise _error("Table.FromList: the default splitter (Splitter.SplitByComma) isn't supported yet.")
-    if not isinstance(splitter, Function):
-        raise _error(f"Table.FromList's splitter must be a function, not {kind_of(splitter)}.")
     extra = EXTRA_ERROR if extra is None else extra
     if extra == EXTRA_LIST:
         raise _error("Table.FromList: ExtraValues.List isn't supported yet.")
-    if extra not in (EXTRA_ERROR, EXTRA_IGNORE) or isinstance(extra, bool):
-        raise _error("Table.FromList: unknown ExtraValues.")
     names, types = _from_list_columns(columns, splitter, items)
     if len(set(names)) != len(names):
         raise _error(f"The field '{next(n for n in names if names.count(n) > 1)}' already exists in the record.")
@@ -285,13 +298,15 @@ def _from_list(items: Any, splitter: Any = None, columns: Any = None, default: A
         try:
             values = splitter.invoke([force(item)])
             if not isinstance(values, list):
-                raise _error(f"A splitter must give a list, not {kind_of(values)}.")
+                raise _cast(values, "List")
             if len(values) > width and extra == EXTRA_ERROR:
                 raise MError("DataFormat.Error", "There were more columns in the result than expected.",
                              Record({"Count": Thunk.of(width)}))
             row = list(values[:width]) + [default] * (width - len(values))
         except MError as e:
-            row = [CellError(e)] * width             # the row fails: each of its cells is the error when read
+            # Desktop makes the row itself the error; a table here holds cells, so each cell is it (the row reads
+            # as failed wherever a cell is read; a whole-row read of it, t{0}, isn't a failure yet: #105's notes).
+            row = [CellError(e)] * width
         rows.append(row)
     return Table(names, rows, types)
 

@@ -76,7 +76,7 @@ def conforms(value: Any, m_type: Optional[MType]) -> bool:
         return False
     if m_type.facet == "Int64.Type":
         return math.isfinite(value) and float(value).is_integer()
-    if m_type.facet == "Int8.Type":     # hypothesis: as Int64.Type's, within Int8's range (#105, D29: the NUC probe)
+    if m_type.facet == "Int8.Type":     # as Int64.Type's, within Int8's range: 2.5, 300, -129 fail (#105's NUC probe)
         return math.isfinite(value) and float(value).is_integer() and -128 <= value <= 127
     return True
 

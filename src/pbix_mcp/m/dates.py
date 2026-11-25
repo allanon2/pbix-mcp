@@ -36,14 +36,37 @@ _KIND_NAME = {"null": "Null", "logical": "Logical", "number": "Number", "text": 
               "function": "Function"}
 
 
-def _seconds_source(td: dt.timedelta) -> str:
-    s = td.seconds % 60 + td.microseconds / 1_000_000
-    return str(int(s)) if float(s).is_integer() else repr(s)
+def _trunc_div(a: int, b: int) -> int:
+    """C#'s integer division (toward zero)."""
+    q = abs(a) // abs(b)
+    return q if (a >= 0) == (b > 0) else -q
+
+
+def number_source(v: float) -> str:
+    """A number's M source (DoubleNumberValue.ToString): a whole number past 15 digits as the decimal .NET converts
+    the double to (15 significant digits), else .NET's round-trip "R" text (15 digits, or 17 when 15 don't give
+    the number back; an exponent from 1E+15 or below 1E-05)."""
+    if float(v).is_integer() and abs(v) > 999999999999999.0 and abs(v) < 7.9228162514264337593543950335e28:
+        from decimal import Decimal
+        d = Decimal(float(v))
+        return str(int(Decimal(f"{d:.15g}" if d == d else "0")))
+    text = "%.15G" % v
+    return text if float(text) == v else "%.17G" % v
+
+
+def _duration_source(td: dt.timedelta) -> str:
+    """#duration(days, hours, minutes, seconds) of TimeSpan's own signed parts (#duration(0, -1, 0, 0), never
+    Python's normalised #duration(-1, 23, 0, 0))."""
+    ticks = (td.days * 86400 + td.seconds) * 10_000_000 + td.microseconds * 10
+    days = _trunc_div(ticks, 864_000_000_000)
+    hours = _trunc_div(ticks, 36_000_000_000) - days * 24
+    minutes = _trunc_div(ticks, 600_000_000) - _trunc_div(ticks, 36_000_000_000) * 60
+    rest = ticks - _trunc_div(ticks, 600_000_000) * 600_000_000
+    return f"#duration({days}, {hours}, {minutes}, {number_source(rest / 10_000_000)})"
 
 
 def value_source(v: Any) -> Optional[str]:
     """A scalar as a cast error writes it (its M source, invariant), or None for a value written by its kind."""
-    from .library import to_text
     if v is None:
         return "null"
     if isinstance(v, bool):
@@ -53,10 +76,7 @@ def value_source(v: Any) -> Optional[str]:
             return "#nan"
         if isinstance(v, float) and math.isinf(v):
             return "#infinity" if v > 0 else "-#infinity"
-        try:
-            return to_text(v, "en-US")
-        except MError:
-            return None
+        return number_source(v)
     if isinstance(v, dt.datetime):
         parts = [v.year, v.month, v.day, v.hour, v.minute, v.second]
         if v.tzinfo is None:
@@ -71,7 +91,7 @@ def value_source(v: Any) -> Optional[str]:
     if isinstance(v, dt.time):
         return f"#time({v.hour}, {v.minute}, {v.second})"
     if isinstance(v, dt.timedelta):
-        return f"#duration({v.days}, {v.seconds // 3600}, {v.seconds // 60 % 60}, {_seconds_source(v)})"
+        return _duration_source(v)
     return None
 
 
@@ -114,6 +134,12 @@ def _first_day(first: Any, default: int) -> int:
     return n
 
 
+def _day_type(first: Any) -> None:
+    """A Day.Type argument is a number or null (its range is checked where the function reads it)."""
+    if first is not None and (isinstance(first, bool) or not isinstance(first, (int, float))):
+        raise cast_error(first, "Number")
+
+
 def _clr_day(d: dt.date) -> int:
     """.NET's DayOfWeek: 0 is Sunday."""
     return (d.weekday() + 1) % 7
@@ -125,7 +151,7 @@ def _date_part(v: Any) -> Optional[dt.date]:
         return None
     if isinstance(v, (dt.date, dt.datetime)) and not isinstance(v, bool):
         return v if not isinstance(v, dt.datetime) else v.date()
-    raise _error("The Date value must contain the Date component.")
+    raise MError("Expression.Error", "The Date value must contain the Date component.", v)
 
 
 # --- Date.Year, Date.Month, Date.Day, Date.QuarterOfYear --------------------------------------------------------
@@ -187,30 +213,36 @@ def _week_functions(evaluator: Any) -> dict[str, Function]:
         return _first_day(first, default)  # type: ignore[arg-type]
 
     def day_of_week(v: Any, first: Any = None) -> Optional[int]:
+        _day_type(first)
         if v is None:
             return None
+        day = first_of(first)                       # read before the kind is checked, as Desktop does
         if not isinstance(v, dt.date):
-            raise _error("We expected a Date value with a Days part.")
+            raise MError("Expression.Error", "We expected a Date value with a Days part.", v)
         d = v.date() if isinstance(v, dt.datetime) else v
-        return (_clr_day(d) - first_of(first) + 7) % 7
+        return (_clr_day(d) - day + 7) % 7
 
     def week(v: Any, first: Any = None) -> Optional[int]:
+        _day_type(first)
         d = _date_part(v)
         if d is None:
             return None
         return week_of_year(d, first_of(first))
 
     def start(v: Any, first: Any = None) -> Any:
-        d = _date_part(v)
-        if d is None:
+        _day_type(first)
+        if v is None:
             return None
-        return _shift(v, -((_clr_day(d) - first_of(first) + 7) % 7), end=False)
+        day = first_of(first)                       # before the kind is checked, as Desktop does
+        d = _date_part(v)
+        return _shift(v, -((_clr_day(d) - day + 7) % 7), end=False)
 
     def end(v: Any, first: Any = None) -> Any:
-        d = _date_part(v)
-        if d is None:
+        _day_type(first)
+        if v is None:
             return None
         last = first_of(first) - 1
+        d = _date_part(v)
         return _shift(v, (last - _clr_day(d) + 7) % 7, end=True)
 
     return {"Date.DayOfWeek": Function("Date.DayOfWeek", day_of_week, 1, 2),
@@ -362,16 +394,16 @@ def format_date(d: dt.date, fmt: str, c: dtparse.DateCulture) -> str:
 
 def _date_to_text(evaluator: Any) -> Function:
     def call(date: Any, options: Any = None, culture: Any = None) -> Optional[str]:
+        if date is not None and kind_of(date) != "date":
+            raise cast_error(date, "Date")
+        if culture is not None and not isinstance(culture, str):
+            raise cast_error(culture, "Text")          # every parameter is converted before the body runs
         if date is None:
             return None
-        if kind_of(date) != "date":
-            raise cast_error(date, "Date")
         if isinstance(options, Record):
             raise _error("Date.ToText: an options record isn't supported yet.")
         if options is not None and not isinstance(options, str):
             raise cast_error(options, "Text")
-        if culture is not None and not isinstance(culture, str):
-            raise cast_error(culture, "Text")
         c = _culture_data(culture, evaluator.culture)
         fmt = c.short_date if options is None else options
         try:
@@ -415,10 +447,9 @@ def _list_dates(start: Any, count: Any, step: Any) -> list[Any]:
     ticks = (step.days * 86400 + step.seconds) * 10_000_000 + step.microseconds * 10
     for i in range(int(n)):
         try:
-            total = ticks * i
-            if abs(total) > dt.timedelta.max.days * 86400 * 10_000_000:
-                raise OverflowError
-            out.append((base + dt.timedelta(microseconds=total // 10)).date())
+            # Read in order, a date leaves the calendar before step × i can leave TimeSpan's range, so the Date
+            # error is the one a reader meets.
+            out.append((base + dt.timedelta(microseconds=ticks * i // 10)).date())
         except OverflowError:
             raise _error("The Date operation failed because the resulting value falls outside the range of allowed "
                          "values.") from None
@@ -441,10 +472,10 @@ def _text_from(evaluator: Any) -> Function:
 def _pad_start(text: Any, count: Any, character: Any = None) -> Optional[str]:
     """Pads on the left to ``count`` characters (Unicode characters, not UTF-16 units); the padding character must be
     one character even when the text is long enough."""
-    if count is None or kind_of(count) != "number":
-        raise cast_error(count, "Number")
     if text is not None and not isinstance(text, str):
         raise cast_error(text, "Text")
+    if count is None or kind_of(count) != "number":
+        raise cast_error(count, "Number")
     if character is not None and not isinstance(character, str):
         raise cast_error(character, "Text")
     if text is None:

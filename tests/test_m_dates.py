@@ -272,3 +272,57 @@ def test_the_date_table_query():
     assert [r[2:4] for r in au.rows] == [["202353", D(2023, 12, 25)], ["202353", D(2023, 12, 25)],
                                          ["202401", D(2024, 1, 1)]]
     assert evaluate(f"({q})(#date(2024, 1, 2), #date(2024, 1, 1))").rows == []
+
+
+class TestReviewedRules:
+    """Rules a review of the port against Desktop's engine code settled (#105): parameters are converted before a
+    function's body runs, Desktop's own error texts, and how a value writes itself in a cast error."""
+
+    def test_parameters_are_checked_before_null_returns_null(self):
+        assert err('Date.DayOfWeek(null, "x")').message == 'We cannot convert the value "x" to type Number.'
+        assert err('Date.StartOfWeek(null, "x")').message == 'We cannot convert the value "x" to type Number.'
+        assert err('Date.EndOfWeek(null, "x")').message == 'We cannot convert the value "x" to type Number.'
+        assert err('Date.WeekOfYear(null, "x")').message == 'We cannot convert the value "x" to type Number.'
+        assert err("Date.ToText(null, null, 5)").message == "We cannot convert the value 5 to type Text."
+        assert err("Date.ToText(#date(2024, 1, 1), 5, 7)").message == "We cannot convert the value 7 to type Text."
+        assert err("Text.PadStart(5, null)").message == "We cannot convert the value 5 to type Text."
+
+    def test_the_first_day_is_read_before_the_kind(self):
+        assert err('Date.StartOfWeek("x", 9)').message == "The Day value provided is invalid."
+        assert err("Date.DayOfWeek(#time(1, 0, 0), 9)").message == "The Day value provided is invalid."
+        assert err('Date.WeekOfYear("x", 9)').message == "The Date value must contain the Date component."
+        assert err('Date.Year("2024")').detail == "2024"
+
+    def test_values_in_cast_errors(self):
+        assert err('Text.PadStart("a", 3, #duration(0, -1, 0, 0))').message == \
+            "We cannot convert the value #duration(0, -1, 0, 0) to type Text."
+        assert err('Text.PadStart("a", 3, #duration(1, 2, 3, 4.5))').message == \
+            "We cannot convert the value #duration(1, 2, 3, 4.5) to type Text."
+        assert err('Text.PadStart("a", 3, #duration(0, -1, -30, 0))').message == \
+            "We cannot convert the value #duration(0, -1, -30, 0) to type Text."
+        assert err("List.Dates(#date(2024, 1, 1), 1, 1e300)").message == \
+            "We cannot convert the value 1E+300 to type Duration."
+        assert err("List.Dates(#date(2024, 1, 1), 1, 1e20)").message == \
+            "We cannot convert the value 100000000000000000000 to type Duration."
+        assert err("List.Dates(#date(2024, 1, 1), 1, 0.1)").message == \
+            "We cannot convert the value 0.1 to type Duration."
+
+    def test_list_dates_a_huge_step_fails_on_the_calendar_first(self):
+        assert err("List.Dates(#date(2024, 1, 1), 3, #duration(10000000, 0, 0, 0))").message == (
+            "The Date operation failed because the resulting value falls outside the range of allowed values.")
+
+    def test_from_list_argument_errors(self):
+        assert err('Table.FromList("x", Splitter.SplitByNothing())').message == \
+            'We cannot convert the value "x" to type List.'
+        assert err("Table.FromList({1}, 5)").message == "We cannot convert the value 5 to type Function."
+        assert err('Table.FromList({1}, Splitter.SplitByNothing(), null, null, "x")').message == \
+            'We cannot convert the value "x" to type Number.'
+        assert err("Table.FromList({1}, Splitter.SplitByNothing(), null, null, 7)").message == (
+            "The value for a 'ExtraValues.Type' enumeration was not one of the allowed values: "
+            "'ExtraValues.List, ExtraValues.Error, ExtraValues.Ignore'.")
+        assert err('Table.FromList({1}, each "x")').message == 'We cannot convert the value "x" to type List.'
+        assert err("Table.FromList({1}, Splitter.SplitByNothing(), 2.5)").message == \
+            "The number is out of range of a 32 bit integer value."
+        cell = evaluate('Table.FromList({1}, each "x", 1)').rows[0][0]
+        assert cell.error.message == 'We cannot convert the value "x" to type List.'
+        assert evaluate("Table.FromList({1}, Splitter.SplitByNothing(), type table)").columns == []
